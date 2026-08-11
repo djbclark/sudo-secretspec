@@ -11,7 +11,7 @@ const MAX_ATTRIBUTE_LINE_BYTES: usize = 65_535;
 #[derive(Parser)]
 #[command(
     name = "git-credential-secretspec",
-    about = "Retrieve Git HTTPS credentials through SecretSpec providers",
+    about = "Retrieve Git HTTP(S) credentials through SecretSpec providers",
     version
 )]
 struct Args {
@@ -134,9 +134,9 @@ impl Request {
     }
 }
 
-fn validate_target(target: &Url) -> Result<()> {
+pub(crate) fn validate_target(target: &Url) -> Result<()> {
     if !matches!(target.scheme(), "http" | "https") {
-        return Err(miette!("Git credential URL must use http or https"));
+        return Err(miette!("Git credential URL must use HTTP or HTTPS"));
     }
     if target.host().is_none() {
         return Err(miette!("Git credential URL must include a host"));

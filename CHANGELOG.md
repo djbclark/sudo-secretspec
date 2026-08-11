@@ -25,7 +25,9 @@ as in 0.19.0.
   native binary.
 - A read-only `git-credential-secretspec` helper lets Git retrieve HTTPS
   usernames and tokens through SecretSpec providers without duplicating them in
-  Git's credential store (0.20+).
+  Git's credential store. `secretspec git configure` and `unconfigure` safely
+  manage repository or global Git configuration without replacing existing
+  helpers (0.20+).
 
 ### Fixed
 
@@ -74,6 +76,7 @@ as in 0.19.0.
   in effect, so an embedding application can describe itself without discarding
   the reason its own caller supplied through `with_reason` or
   `SECRETSPEC_REASON`.
+- Secrets can set `prompt = true` to request a hidden value from the controlling
   terminal when `secretspec run` finds no stored value. Writable providers save
   the answer for later runs; the `null` provider keeps it invocation-only.
 - Profiles can opt out of inheriting `[profiles.default]` by setting

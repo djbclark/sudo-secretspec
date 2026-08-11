@@ -202,6 +202,50 @@ Run 'secretspec check --provider bws' to verify authentication.
 
 A read-only source provider is rejected. An alias that declares no credentials reports that there is nothing to store.
 
+### git configure (0.20+)
+
+Configure Git to retrieve an HTTP or HTTPS password or token through SecretSpec.
+Repository-local configuration is the default.
+
+```bash
+$ secretspec git configure --url <URL> --token-secret <KEY> [OPTIONS]
+```
+
+**Options:**
+
+- `--url <URL>` - HTTP or HTTPS URL this credential may authenticate; a path
+  limits it to that part of the host
+- `--token-secret <KEY>` - Declared SecretSpec key containing the password or
+  token
+- `--username <USERNAME>` - Non-secret username to keep in the managed Git
+  configuration
+- `--username-secret <KEY>` - Declared SecretSpec key containing the username;
+  conflicts with `--username`
+- `-P, --profile <PROFILE>` - Profile the helper should use
+- `-p, --provider <PROVIDER>` - Provider override the helper should use
+- `--global` - Configure the current user's global Git settings instead
+- `-y, --yes` - Confirm a global change non-interactively; requires `--global`
+
+The command records the manifest's absolute path and resolved profile. Global
+changes prompt with a default of **No**. Existing helpers and unrelated Git
+configuration are not replaced. See [Git credentials](/integrations/git/) for
+setup examples and the ownership model.
+
+### git unconfigure (0.20+)
+
+Remove one or all Git credentials configured by SecretSpec in the selected
+scope.
+
+```bash
+$ secretspec git unconfigure --url <URL>
+$ secretspec git unconfigure --all
+$ secretspec git unconfigure --all --global
+```
+
+Use `--global` to select global configuration and `--yes` to confirm that
+global change non-interactively. `--all` removes only entries SecretSpec owns;
+it does not remove existing helpers, usernames, or unrelated includes.
+
 ### check
 Check if all required secrets are available, with interactive prompting for missing secrets.
 

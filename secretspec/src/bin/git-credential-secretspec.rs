@@ -1,5 +1,5 @@
 use miette::Result;
 
 fn main() -> Result<()> {
-    secretspec::git_credential::main()
+    secretspec::integration::git::main()
 }

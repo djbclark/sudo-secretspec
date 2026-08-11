@@ -63,7 +63,7 @@ pub mod cli;
 
 #[cfg(feature = "cli")]
 #[doc(hidden)]
-pub mod git_credential;
+pub mod integration;
 
 // Re-export only the types needed by users and generated code
 pub use config::Resolved;

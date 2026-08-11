@@ -9,6 +9,10 @@ use std::io::{IsTerminal, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+mod git;
+
+use git::GitAction;
+
 /// Main CLI structure for the secretspec application.
 ///
 /// This is the entry point for the command-line interface, parsing user commands
@@ -181,6 +185,11 @@ enum Commands {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    #[command(about = "Configure Git HTTP(S) credentials through SecretSpec (0.20+)")]
+    Git {
+        #[command(subcommand)]
+        action: GitAction,
     },
     /// Import secrets from a provider to another provider
     Import {
@@ -965,6 +974,7 @@ pub fn main() -> Result<()> {
             );
             Ok(())
         }
+        Commands::Git { action } => git::run(action, &cli.file, &cli.reason),
         // Handle configuration management commands
         Commands::Config { action } => match normalize_config_action(action) {
             ConfigAction::Global { .. } => unreachable!("global action was normalized"),
