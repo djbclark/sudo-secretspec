@@ -59,6 +59,7 @@ SecretSpec fixes this by separating secret **declaration** from secret **storage
 - **Composed Secrets (0.16+)**: Derive read-only values such as DSNs from declared secrets with strict, order-independent `${UPPERCASE_NAME}` references
 - **[Configuration Inheritance](https://secretspec.dev/concepts/inheritance/)**: Extend and override shared configurations using the `extends` feature
 - **[Audit Logging](https://secretspec.dev/concepts/audit/)**: Every secret access recorded locally (who, when, why, outcome) — on by default, secret values never logged
+- **[Git credential helper](https://secretspec.dev/integrations/git/)** (0.20+): Authenticate Git HTTPS operations through any SecretSpec provider
 - **[Discovery](https://secretspec.dev/reference/cli#init)**: `secretspec init` to discover secrets from existing `.env` files
 
 ## Quick Start

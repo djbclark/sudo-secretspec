@@ -61,6 +61,10 @@ pub(crate) mod provider;
 #[cfg(feature = "cli")]
 pub mod cli;
 
+#[cfg(feature = "cli")]
+#[doc(hidden)]
+pub mod git_credential;
+
 // Re-export only the types needed by users and generated code
 pub use config::Resolved;
 
