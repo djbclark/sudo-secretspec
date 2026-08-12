@@ -51,6 +51,11 @@ token. It records the manifest's absolute path and resolved profile, then
 registers `git-credential-secretspec` for this repository. Other configured
 helpers and usernames remain untouched.
 
+Git configuration stores the manifest path, profile, provider alias, reason,
+and secret names needed to invoke the helper, but never the resolved secret
+values. If you move or delete the manifest, run `secretspec git configure`
+again for each affected URL to record its new path.
+
 To retrieve the username from a SecretSpec provider as well, declare it and use
 `--username-secret` instead of `--username`:
 
@@ -64,6 +69,12 @@ $ secretspec git configure \
 The helper checks `--url` independently before returning credentials. A token
 configured for `https://github.com` is therefore not returned for another host
 or for an HTTP remote.
+
+::::danger[Use HTTPS for credentials]
+Although the helper accepts `http://` URLs for trusted local or test systems,
+HTTP does not encrypt the credential in transit. Use `https://` for remote
+services.
+::::
 
 To limit a credential to part of a host, include the path in the URL:
 
