@@ -5219,6 +5219,7 @@ dependencies = [
  "data-encoding",
  "detect-coding-agent",
  "dotenvy",
+ "dunce",
  "etcetera",
  "google-cloud-secretmanager-v1",
  "inquire",

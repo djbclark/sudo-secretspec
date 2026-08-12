@@ -391,7 +391,7 @@ fn manifest_path(file: &Option<PathBuf>) -> Result<PathBuf> {
         Some(path) => path.clone(),
         None => crate::secrets::find_config_file().into_diagnostic()?,
     };
-    let path = fs::canonicalize(&path)
+    let path = dunce::canonicalize(&path)
         .into_diagnostic()
         .wrap_err_with(|| format!("Failed to resolve SecretSpec manifest {}", path.display()))?;
     require_utf8_path(path, "SecretSpec manifest")
@@ -450,7 +450,7 @@ fn managed_path(scope: Scope) -> Result<PathBuf> {
             } else {
                 std::env::current_dir().into_diagnostic()?.join(path)
             };
-            fs::canonicalize(&path)
+            dunce::canonicalize(&path)
                 .into_diagnostic()
                 .wrap_err_with(|| format!("Failed to resolve Git directory {}", path.display()))?
                 .join("secretspec-credentials")

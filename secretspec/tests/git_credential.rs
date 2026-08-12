@@ -44,6 +44,8 @@ GITHUB_TOKEN = { description = "GitHub token", default = "token=value", provider
         .env("HOME", temp.path())
         .env("XDG_CONFIG_HOME", temp.path().join("config"))
         .env("XDG_STATE_HOME", temp.path().join("state"))
+        .env("APPDATA", temp.path().join("config"))
+        .env("LOCALAPPDATA", temp.path().join("state"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("PATH", path)
