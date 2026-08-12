@@ -9,6 +9,8 @@ use std::io::{IsTerminal, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+mod docker;
+
 /// Main CLI structure for the secretspec application.
 ///
 /// This is the entry point for the command-line interface, parsing user commands
@@ -181,6 +183,11 @@ enum Commands {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// Manage Docker registry credential integration (0.20+)
+    Docker {
+        #[command(subcommand)]
+        action: docker::DockerAction,
     },
     /// Import secrets from a provider to another provider
     Import {
@@ -819,6 +826,7 @@ pub fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Docker { action } => docker::run(action, &cli.file, &cli.reason),
         // Initialize a new secretspec.toml configuration file
         Commands::Init {
             from,

@@ -202,6 +202,48 @@ Run 'secretspec check --provider bws' to verify authentication.
 
 A read-only source provider is rejected. An alias that declares no credentials reports that there is nothing to store.
 
+### docker configure (0.20+)
+
+Configure Docker to retrieve credentials for one registry through SecretSpec.
+
+```bash
+$ secretspec docker configure --registry <REGISTRY> --token-secret <KEY> [OPTIONS]
+```
+
+**Options:**
+
+- `--registry <REGISTRY>` - Registry hostname, optionally including a port;
+  Docker Hub aliases are normalized to Docker's canonical registry key
+- `--token-secret <KEY>` - Declared SecretSpec key containing the password or
+  access token
+- `--username <USERNAME>` - Required unless `--username-secret` is used;
+  non-secret username to keep in SecretSpec's managed integration configuration
+- `--username-secret <KEY>` - Declared SecretSpec key containing the username;
+  required unless `--username` is used
+- `-P, --profile <PROFILE>` - Profile the helper should use
+- `-p, --provider <PROVIDER>` - Provider override the helper should use
+- `-y, --yes` - Confirm the Docker configuration change non-interactively
+
+The command records the manifest's absolute path and resolved profile, then
+adds a registry-specific `credHelpers` entry to Docker's `config.json`. It
+prompts with a default of **No** and refuses to replace an existing helper.
+See [Docker credentials](/integrations/docker/) for setup examples and the
+ownership model.
+
+### docker unconfigure (0.20+)
+
+Remove one or all Docker credentials configured by SecretSpec in the active
+Docker configuration.
+
+```bash
+$ secretspec docker unconfigure --registry <REGISTRY>
+$ secretspec docker unconfigure --all
+```
+
+Use `--yes` to confirm the change non-interactively. `--all` removes only
+entries SecretSpec owns; it preserves the default credential store, other
+registry helpers, stored authentication entries, and unrelated Docker options.
+
 ### check
 Check if all required secrets are available, with interactive prompting for missing secrets.
 

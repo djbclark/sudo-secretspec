@@ -23,6 +23,10 @@ as in 0.19.0.
   checksum. The static installer keeps selecting the x86_64 build on Windows
   ARM64, which runs under emulation, so download the archive directly for a
   native binary.
+- A read-only `docker-credential-secretspec` helper lets Docker retrieve
+  registry usernames and tokens through any SecretSpec provider.
+  `secretspec docker configure` and `unconfigure` safely manage per-registry
+  Docker credential-helper settings without replacing existing helpers (0.20+).
 
 ### Fixed
 
