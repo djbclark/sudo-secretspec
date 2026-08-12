@@ -84,6 +84,14 @@ During the initial clone, the destination repository and its manifest do not
 exist yet. Put the declaration in a separate manifest and configure it
 globally:
 
+::::danger[This changes your global Git configuration]
+Using `--global` enables this credential helper for matching URLs in every Git
+repository owned by your user. Review the URL and manifest path before
+confirming. To roll back the example below, run
+`secretspec git unconfigure --url https://github.com --global`; see
+[Remove the configuration](#remove-the-configuration) for all removal options.
+::::
+
 ```bash
 $ secretspec \
   --file ~/.config/secretspec/git/secretspec.toml \
