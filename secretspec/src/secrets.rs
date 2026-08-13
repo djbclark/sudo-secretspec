@@ -824,6 +824,15 @@ impl Secrets {
     /// * `path` - Path to the `secretspec.toml` file
     pub fn load_from(path: &Path) -> Result<Self> {
         let project_config = Config::try_from(path)?;
+        Self::load_config(
+            project_config,
+            path.parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(".")),
+        )
+    }
+
+    pub(crate) fn load_config(project_config: Config, config_dir: PathBuf) -> Result<Self> {
         // Semantic validation (required vs default, ref coordinate rules,
         // generate consistency) runs here so every CLI and SDK entry point
         // enforces the same rules the config documents. The compiled manifest it
@@ -840,16 +849,6 @@ impl Secrets {
                 .and_then(|g| g.audit.clone())
                 .unwrap_or_default(),
         );
-        // Directory the config lives in, used to resolve relative provider
-        // paths (e.g. `dotenv:.config/.env`) against the project root instead
-        // of the current working directory. Kept logical (not canonicalized) so
-        // a relative `--file` stays relative to the CWD and Windows extended
-        // (`\\?\`) prefixes are never introduced.
-        let config_dir = path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-
         Ok(Self {
             require_reason: project_config.project.require_reason.unwrap_or_default(),
             config: project_config,

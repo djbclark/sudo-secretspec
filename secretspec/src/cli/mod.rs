@@ -22,7 +22,7 @@ use git::GitAction;
 #[command(about = "A declarative interface for every secret provider. https://secretspec.dev", long_about = None)]
 #[command(version)]
 struct Cli {
-    /// Path to secretspec.toml (default: auto-detect by walking up from current directory)
+    /// Explicit secretspec.toml path (default: auto-detect for manifest commands)
     #[arg(short = 'f', long, global = true, env = "SECRETSPEC_FILE")]
     file: Option<PathBuf>,
 
@@ -186,7 +186,7 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    #[command(about = "Configure Git HTTP(S) credentials through SecretSpec (0.20+)")]
+    #[command(about = "Configure Git HTTP(S) or SMTP credentials through SecretSpec (0.20+)")]
     Git {
         #[command(subcommand)]
         action: GitAction,

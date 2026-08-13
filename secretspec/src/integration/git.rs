@@ -1,32 +1,33 @@
-use crate::{NamedResolution, Secrets};
+use crate::{Config, GlobalConfig, NamedResolution, Secrets};
 use clap::Parser;
 use miette::{IntoDiagnostic, Result, miette};
 use secrecy::{ExposeSecret, SecretString};
+use sha2::{Digest, Sha256};
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
-use url::{Host, Url};
+use std::path::{Path, PathBuf};
+use url::{Host, Position, Url};
 
 const MAX_ATTRIBUTE_LINE_BYTES: usize = 65_535;
+const EMBEDDED_MANIFEST: &str = include_str!("git-credentials.toml");
+pub(crate) const EMBEDDED_PASSWORD: &str = "PASSWORD";
+pub(crate) const EMBEDDED_USERNAME: &str = "USERNAME";
 
 #[derive(Parser)]
 #[command(
     name = "git-credential-secretspec",
-    about = "Retrieve Git HTTP(S) credentials through SecretSpec providers",
+    about = "Retrieve Git HTTP(S) or SMTP credentials through SecretSpec providers",
     version
 )]
 struct Args {
     #[arg(long, help = "Git URL this credential is allowed to authenticate")]
     url: Url,
+    #[arg(long, help = "Git username this credential is allowed to authenticate")]
+    username: Option<String>,
     #[arg(long, help = "SecretSpec key containing the Git username")]
     username_secret: Option<String>,
     #[arg(long, help = "SecretSpec key containing the Git password or token")]
     password_secret: String,
-    #[arg(
-        short = 'f',
-        long,
-        env = "SECRETSPEC_FILE",
-        help = "Path to secretspec.toml"
-    )]
+    #[arg(short = 'f', long, help = "Path to secretspec.toml")]
     file: Option<PathBuf>,
     #[arg(
         short = 'P',
@@ -57,6 +58,7 @@ struct Request {
     protocol: Option<String>,
     host: Option<String>,
     path: Option<String>,
+    username: Option<String>,
 }
 
 impl Request {
@@ -92,6 +94,7 @@ impl Request {
                 "protocol" => request.protocol = Some(value.to_string()),
                 "host" => request.host = Some(value.to_string()),
                 "path" => request.path = Some(value.to_string()),
+                "username" => request.username = Some(value.to_string()),
                 "url" => request.apply_url(value)?,
                 _ => {}
             }
@@ -135,8 +138,8 @@ impl Request {
 }
 
 pub(crate) fn validate_target(target: &Url) -> Result<()> {
-    if !matches!(target.scheme(), "http" | "https") {
-        return Err(miette!("Git credential URL must use HTTP or HTTPS"));
+    if !matches!(target.scheme(), "http" | "https" | "smtp") {
+        return Err(miette!("Git credential URL must use HTTP, HTTPS, or SMTP"));
     }
     if target.host().is_none() {
         return Err(miette!("Git credential URL must include a host"));
@@ -149,10 +152,68 @@ pub(crate) fn validate_target(target: &Url) -> Result<()> {
             "Git credential URL must not include a query or fragment"
         ));
     }
+    if target.scheme() == "smtp" && !target.path().trim_matches('/').is_empty() {
+        return Err(miette!("SMTP credential URL must not include a path"));
+    }
     Ok(())
 }
 
-fn target_matches(target: &Url, request: &Request) -> bool {
+pub(crate) fn canonical_target(url: &Url) -> String {
+    let mut target = url[..Position::BeforePath].to_string();
+    let path = url.path().trim_end_matches('/');
+    if !path.is_empty() {
+        target.push_str(path);
+    }
+    target
+}
+
+fn context_username<'a>(target: &Url, username: Option<&'a str>) -> Result<Option<&'a str>> {
+    if target.scheme() != "smtp" {
+        return Ok(None);
+    }
+    let username = username.ok_or_else(|| miette!("SMTP credentials require a username"))?;
+    if username.is_empty() || username.contains(['\n', '\r', '\0']) {
+        return Err(miette!(
+            "SMTP username cannot be empty or contain a newline or NUL byte"
+        ));
+    }
+    Ok(Some(username))
+}
+
+fn embedded_project_name(target: &Url, username: Option<&str>) -> Result<String> {
+    let username = context_username(target, username)?;
+    let target = canonical_target(target);
+    let mut digest = Sha256::new();
+    digest.update(target.as_bytes());
+    if let Some(username) = username {
+        digest.update([0]);
+        digest.update(username.as_bytes());
+    }
+    Ok(format!(
+        "git-credential-{}",
+        data_encoding::HEXLOWER.encode(&digest.finalize())
+    ))
+}
+
+pub(crate) fn load_embedded_git_credentials(
+    target: &Url,
+    username: Option<&str>,
+) -> Result<Secrets> {
+    validate_target(target)?;
+    let mut config: Config = toml::from_str(EMBEDDED_MANIFEST).into_diagnostic()?;
+    config.project.name = embedded_project_name(target, username)?;
+    let config_path = GlobalConfig::path().into_diagnostic()?;
+    let config_dir = config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| miette!("SecretSpec config path has no parent directory"))?;
+    let mut secrets = Secrets::load_config(config, config_dir)?;
+    secrets.set_profile("default");
+    secrets.set_ignore_ambient_scope(true);
+    Ok(secrets)
+}
+
+fn target_matches(target: &Url, username: Option<&str>, request: &Request) -> bool {
     let Some(candidate) = request.authority_url() else {
         return false;
     };
@@ -160,6 +221,9 @@ fn target_matches(target: &Url, request: &Request) -> bool {
         || target.host() != candidate.host()
         || target.port_or_known_default() != candidate.port_or_known_default()
     {
+        return false;
+    }
+    if target.scheme() == "smtp" && request.username.as_deref() != username {
         return false;
     }
 
@@ -195,13 +259,15 @@ fn validate_value(name: &str, attribute: &str, value: &SecretString) -> Result<(
 
 fn load(args: &Args) -> Result<Secrets> {
     let mut secrets = match &args.file {
-        Some(path) => Secrets::load_from(path),
-        None => Secrets::load(),
-    }?;
+        Some(path) => Secrets::load_from(path)?,
+        None => load_embedded_git_credentials(&args.url, args.username.as_deref())?,
+    };
     if let Some(provider) = &args.provider {
         secrets.set_provider(provider);
     }
-    if let Some(profile) = &args.profile {
+    if args.file.is_some()
+        && let Some(profile) = &args.profile
+    {
         secrets.set_profile(profile);
     }
     if let Some(reason) = &args.reason {
@@ -244,7 +310,7 @@ fn run(args: Args, input: impl BufRead, mut output: impl Write) -> Result<()> {
     validate_target(&args.url)?;
     let request = Request::read(input)?;
 
-    if !target_matches(&args.url, &request) {
+    if !target_matches(&args.url, args.username.as_deref(), &request) {
         return Ok(());
     }
 
@@ -252,14 +318,18 @@ fn run(args: Args, input: impl BufRead, mut output: impl Write) -> Result<()> {
     let Some(password) = resolve(&secrets, &args.password_secret)? else {
         return Ok(());
     };
-    let username = match &args.username_secret {
-        Some(name) => {
+    let username = match (&args.username_secret, &request.username) {
+        (_, Some(_)) => None,
+        (Some(name), None) => {
             let Some(value) = resolve(&secrets, name)? else {
-                return Ok(());
+                if args.file.is_some() {
+                    return Ok(());
+                }
+                return write_password(&args.password_secret, &password, output);
             };
             Some((name, value))
         }
-        None => None,
+        (None, None) => None,
     };
 
     validate_value(&args.password_secret, "password", &password)?;
@@ -270,6 +340,11 @@ fn run(args: Args, input: impl BufRead, mut output: impl Write) -> Result<()> {
     if let Some((_, username)) = username {
         writeln!(output, "username={}", username.expose_secret()).into_diagnostic()?;
     }
+    write_password(&args.password_secret, &password, output)
+}
+
+fn write_password(name: &str, password: &SecretString, mut output: impl Write) -> Result<()> {
+    validate_value(name, "password", password)?;
     writeln!(output, "password={}", password.expose_secret()).into_diagnostic()?;
     writeln!(output).into_diagnostic()?;
     Ok(())
@@ -300,6 +375,7 @@ mod tests {
     fn args(path: PathBuf, operation: &str) -> Args {
         Args {
             url: Url::parse("https://github.com").unwrap(),
+            username: None,
             username_secret: Some("GITHUB_USERNAME".to_string()),
             password_secret: "GITHUB_TOKEN".to_string(),
             file: Some(path),
@@ -396,14 +472,16 @@ GITHUB_TOKEN = { description = "GitHub token", providers = ["null"] }
             protocol: Some("https".to_string()),
             host: Some("github.com".to_string()),
             path: Some("cachix/secretspec".to_string()),
+            username: None,
         };
         let unrelated = Request {
             protocol: Some("https".to_string()),
             host: Some("github.com".to_string()),
             path: Some("cachix-evil/secretspec".to_string()),
+            username: None,
         };
-        assert!(target_matches(&target, &matching));
-        assert!(!target_matches(&target, &unrelated));
+        assert!(target_matches(&target, None, &matching));
+        assert!(!target_matches(&target, None, &unrelated));
     }
 
     #[test]
@@ -414,24 +492,28 @@ GITHUB_TOKEN = { description = "GitHub token", providers = ["null"] }
                 protocol: Some("http".to_string()),
                 host: Some("github.com".to_string()),
                 path: None,
+                username: None,
             },
             Request {
                 protocol: Some("https".to_string()),
                 host: Some("github.com.example.com".to_string()),
                 path: None,
+                username: None,
             },
             Request {
                 protocol: Some("https".to_string()),
                 host: Some("example.com@github.com".to_string()),
                 path: None,
+                username: None,
             },
             Request {
                 protocol: Some("https".to_string()),
                 host: Some("github.com/path".to_string()),
                 path: None,
+                username: None,
             },
         ] {
-            assert!(!target_matches(&target, &request));
+            assert!(!target_matches(&target, None, &request));
         }
     }
 
@@ -443,8 +525,70 @@ GITHUB_TOKEN = { description = "GitHub token", providers = ["null"] }
             .unwrap();
         assert!(target_matches(
             &Url::parse("https://github.com/cachix").unwrap(),
+            None,
             &request
         ));
+    }
+
+    #[test]
+    fn embedded_storage_identity_uses_the_canonical_target() {
+        let github = Url::parse("https://GITHUB.com:443/").unwrap();
+        let canonical_github = Url::parse("https://github.com").unwrap();
+        let path = Url::parse("https://github.com/cachix").unwrap();
+        let insecure = Url::parse("http://github.com").unwrap();
+        assert_eq!(
+            embedded_project_name(&github, None).unwrap(),
+            embedded_project_name(&canonical_github, None).unwrap()
+        );
+        assert_ne!(
+            embedded_project_name(&github, None).unwrap(),
+            embedded_project_name(&path, None).unwrap()
+        );
+        assert_ne!(
+            embedded_project_name(&github, None).unwrap(),
+            embedded_project_name(&insecure, None).unwrap()
+        );
+    }
+
+    #[test]
+    fn smtp_matching_requires_the_exact_server_port_and_username() {
+        let target = Url::parse("smtp://smtp.example.com:587").unwrap();
+        let request = Request {
+            protocol: Some("smtp".to_string()),
+            host: Some("smtp.example.com:587".to_string()),
+            path: None,
+            username: Some("user@example.com".to_string()),
+        };
+        assert!(target_matches(&target, Some("user@example.com"), &request));
+
+        let mut mismatch = request;
+        mismatch.username = Some("other@example.com".to_string());
+        assert!(!target_matches(
+            &target,
+            Some("user@example.com"),
+            &mismatch
+        ));
+
+        mismatch.username = Some("user@example.com".to_string());
+        mismatch.host = Some("smtp.example.com:465".to_string());
+        assert!(!target_matches(
+            &target,
+            Some("user@example.com"),
+            &mismatch
+        ));
+
+        mismatch.protocol = Some("https".to_string());
+        mismatch.host = Some("smtp.example.com:587".to_string());
+        assert!(!target_matches(
+            &target,
+            Some("user@example.com"),
+            &mismatch
+        ));
+
+        assert_ne!(
+            embedded_project_name(&target, Some("user@example.com")).unwrap(),
+            embedded_project_name(&target, Some("other@example.com")).unwrap()
+        );
     }
 
     #[test]

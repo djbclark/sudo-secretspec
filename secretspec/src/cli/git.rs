@@ -1,4 +1,5 @@
 use super::{load_secrets, shell_quote};
+use crate::integration::git::canonical_target;
 use crate::{GlobalConfig, Secrets};
 use clap::Subcommand;
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
@@ -11,7 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::NamedTempFile;
-use url::{Position, Url};
+use url::Url;
 
 const MARKER_KEY: &str = "secretspec.gitCredentialVersion";
 const STATE_KEY: &str = "secretspec.gitCredential";
@@ -19,12 +20,14 @@ const FORMAT_VERSION: u8 = 1;
 
 #[derive(Subcommand)]
 pub(super) enum GitAction {
-    #[command(about = "Configure Git to retrieve an HTTP(S) credential through SecretSpec (0.20+)")]
+    #[command(
+        about = "Configure Git to retrieve an HTTP(S) or SMTP credential through SecretSpec (0.20+)"
+    )]
     Configure {
-        #[arg(long, help = "HTTP or HTTPS URL this credential may authenticate")]
+        #[arg(long, help = "HTTP(S) or SMTP URL this credential may authenticate")]
         url: Url,
-        #[arg(long, help = "SecretSpec key containing the password or token")]
-        token_secret: String,
+        #[arg(long, help = "Custom manifest key containing the password or token")]
+        token_secret: Option<String>,
         #[arg(
             long,
             conflicts_with = "username_secret",
@@ -34,14 +37,14 @@ pub(super) enum GitAction {
         #[arg(
             long,
             conflicts_with = "username",
-            help = "SecretSpec key containing the username"
+            help = "Custom manifest key containing the username"
         )]
         username_secret: Option<String>,
         #[arg(
             short = 'P',
             long,
             env = "SECRETSPEC_PROFILE",
-            help = "SecretSpec profile the helper should use"
+            help = "Custom manifest profile the helper should use"
         )]
         profile: Option<String>,
         #[arg(
@@ -61,13 +64,41 @@ pub(super) enum GitAction {
         )]
         yes: bool,
     },
+    #[command(about = "Store a Git credential in the embedded SecretSpec store (0.20+)")]
+    Login {
+        #[arg(help = "HTTP(S) or SMTP credential URL")]
+        url: Url,
+        #[arg(long, help = "Username to store with the credential")]
+        username: Option<String>,
+        #[arg(
+            short,
+            long,
+            env = "SECRETSPEC_PROVIDER",
+            help = "Provider override to store the credential in"
+        )]
+        provider: Option<String>,
+    },
+    #[command(about = "Remove a Git credential from the embedded SecretSpec store (0.20+)")]
+    Logout {
+        #[arg(help = "HTTP(S) or SMTP credential URL")]
+        url: Url,
+        #[arg(long, help = "Username identifying an SMTP credential")]
+        username: Option<String>,
+        #[arg(
+            short,
+            long,
+            env = "SECRETSPEC_PROVIDER",
+            help = "Provider override to remove the credential from"
+        )]
+        provider: Option<String>,
+    },
     #[command(about = "Remove Git credential configuration managed by SecretSpec (0.20+)")]
     Unconfigure {
         #[arg(
             long,
             required_unless_present = "all",
             conflicts_with = "all",
-            help = "HTTP or HTTPS URL whose managed credential should be removed"
+            help = "HTTP(S) or SMTP URL whose managed credential should be removed"
         )]
         url: Option<Url>,
         #[arg(
@@ -148,6 +179,16 @@ pub(super) fn run(
             file,
             reason,
         }),
+        GitAction::Login {
+            url,
+            username,
+            provider,
+        } => login(url, username, provider, file, reason),
+        GitAction::Logout {
+            url,
+            username,
+            provider,
+        } => logout(url, username, provider, file, reason),
         GitAction::Unconfigure {
             url,
             all,
@@ -159,7 +200,7 @@ pub(super) fn run(
 
 struct ConfigureOptions<'a> {
     url: Url,
-    token_secret: String,
+    token_secret: Option<String>,
     username: Option<String>,
     username_secret: Option<String>,
     profile: Option<String>,
@@ -173,30 +214,69 @@ struct ConfigureOptions<'a> {
 fn configure(options: ConfigureOptions<'_>) -> Result<()> {
     crate::integration::git::validate_target(&options.url)?;
     validate_literal_username(options.username.as_deref())?;
-
-    let manifest = manifest_path(options.file)?;
-    let mut secrets = load_secrets(options.file, options.reason)?;
-    if let Some(profile) = &options.profile {
-        secrets.set_profile(profile);
+    if options.url.scheme() == "smtp" && options.username.is_none() {
+        return Err(miette!(
+            "SMTP credential configuration requires --username matching sendemail.smtpUser"
+        ));
     }
+
+    let target = crate::integration::git::canonical_target(&options.url);
+    let (mut secrets, manifest, profile, token_secret, username_secret) = if options.file.is_some()
+    {
+        let token_secret = options.token_secret.as_deref().ok_or_else(|| {
+            miette!("--token-secret is required when --file selects a custom manifest")
+        })?;
+        let manifest = manifest_path(options.file)?;
+        let mut secrets = load_secrets(options.file, options.reason)?;
+        if let Some(profile) = &options.profile {
+            secrets.set_profile(profile);
+        }
+        let profile = secrets.resolve_profile_name(None);
+        validate_secret(&secrets, token_secret, &profile)?;
+        if let Some(secret) = &options.username_secret {
+            validate_secret(&secrets, secret, &profile)?;
+        }
+        (
+            secrets,
+            Some(manifest),
+            Some(profile),
+            token_secret.to_string(),
+            options.username_secret.clone(),
+        )
+    } else {
+        if options.token_secret.is_some()
+            || options.username_secret.is_some()
+            || options.profile.is_some()
+        {
+            return Err(miette!(
+                "--token-secret, --username-secret, and --profile require --file; the embedded Git credential store uses PASSWORD, optional USERNAME, and the default profile"
+            ));
+        }
+        let secrets = crate::integration::git::load_embedded_git_credentials(
+            &options.url,
+            options.username.as_deref(),
+        )?;
+        (
+            secrets,
+            None,
+            None,
+            crate::integration::git::EMBEDDED_PASSWORD.to_string(),
+            Some(crate::integration::git::EMBEDDED_USERNAME.to_string()),
+        )
+    };
     if let Some(provider) = &options.provider {
         secrets.set_provider(provider);
     }
-    let profile = secrets.resolve_profile_name(None);
-    validate_secret(&secrets, &options.token_secret, &profile)?;
-    if let Some(secret) = &options.username_secret {
-        validate_secret(&secrets, secret, &profile)?;
-    }
 
-    let target = canonical_target(&options.url);
     let helper = helper_command(
         &target,
-        &manifest,
-        &profile,
+        manifest.as_deref(),
+        profile.as_deref(),
         options.provider.as_deref(),
         options.reason.as_deref(),
-        &options.token_secret,
-        options.username_secret.as_deref(),
+        &token_secret,
+        username_secret.as_deref(),
+        options.username.as_deref(),
     );
     let credential = ManagedCredential {
         version: FORMAT_VERSION,
@@ -256,8 +336,114 @@ fn configure(options: ConfigureOptions<'_>) -> Result<()> {
         "Configured Git credential for {target} in {} scope.",
         scope.label()
     );
-    println!("SecretSpec manifest: {}", manifest.display());
+    if let Some(manifest) = manifest {
+        println!("SecretSpec manifest: {}", manifest.display());
+    } else {
+        let mut login = format!("secretspec git login {}", shell_quote(&target));
+        if let Some(provider) = options.provider.as_deref() {
+            login.push_str(" --provider ");
+            login.push_str(&shell_quote(provider));
+        }
+        println!("Store the credential with: {login}");
+    }
     println!("Undo with: {}", undo_command(scope, &target));
+    Ok(())
+}
+
+fn embedded_cli_secrets(
+    url: &Url,
+    username: Option<&str>,
+    provider: Option<&str>,
+    file: &Option<PathBuf>,
+    reason: &Option<String>,
+    action: &str,
+) -> Result<Secrets> {
+    if file.is_some() {
+        return Err(miette!(
+            "secretspec git {action} manages the embedded Git credential store; omit --file and use secretspec set or delete for a custom manifest"
+        ));
+    }
+    let mut secrets = crate::integration::git::load_embedded_git_credentials(url, username)?;
+    if let Some(provider) = provider {
+        secrets.set_provider(provider);
+    }
+    if let Some(reason) = reason {
+        secrets = secrets.with_reason(reason.clone());
+    }
+    secrets.set_write_target_reporter(|target| {
+        eprintln!(
+            "Writing secret '{}' to {} (profile: {})\n  target: {}",
+            target.name, target.provider_uri, target.profile, target.target
+        );
+    });
+    Ok(secrets)
+}
+
+fn login(
+    url: Url,
+    username: Option<String>,
+    provider: Option<String>,
+    file: &Option<PathBuf>,
+    reason: &Option<String>,
+) -> Result<()> {
+    crate::integration::git::validate_target(&url)?;
+    let username = credential_username(&url, username)?;
+    let secrets = embedded_cli_secrets(
+        &url,
+        username.as_deref(),
+        provider.as_deref(),
+        file,
+        reason,
+        "login",
+    )?;
+    secrets
+        .set(crate::integration::git::EMBEDDED_PASSWORD, None)
+        .into_diagnostic()
+        .wrap_err("Failed to store Git password or token")?;
+    if let Some(username) = username {
+        secrets
+            .set(crate::integration::git::EMBEDDED_USERNAME, Some(username))
+            .into_diagnostic()
+            .wrap_err("Failed to store Git username")?;
+    }
+    println!(
+        "Stored Git credential for {}.",
+        crate::integration::git::canonical_target(&url)
+    );
+    Ok(())
+}
+
+fn logout(
+    url: Url,
+    username: Option<String>,
+    provider: Option<String>,
+    file: &Option<PathBuf>,
+    reason: &Option<String>,
+) -> Result<()> {
+    crate::integration::git::validate_target(&url)?;
+    let username = credential_username(&url, username)?;
+    let secrets = embedded_cli_secrets(
+        &url,
+        username.as_deref(),
+        provider.as_deref(),
+        file,
+        reason,
+        "logout",
+    )?;
+    let password = secrets
+        .delete(crate::integration::git::EMBEDDED_PASSWORD)
+        .into_diagnostic()
+        .wrap_err("Failed to remove Git password or token")?;
+    let username = secrets
+        .delete(crate::integration::git::EMBEDDED_USERNAME)
+        .into_diagnostic()
+        .wrap_err("Failed to remove Git username")?;
+    let target = crate::integration::git::canonical_target(&url);
+    if password || username {
+        println!("Removed stored Git credential for {target}.");
+    } else {
+        println!("No stored Git credential for {target} was found.");
+    }
     Ok(())
 }
 
@@ -371,6 +557,25 @@ fn validate_literal_username(username: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn credential_username(url: &Url, username: Option<String>) -> Result<Option<String>> {
+    validate_literal_username(username.as_deref())?;
+    if url.scheme() != "smtp" || username.is_some() {
+        return Ok(username);
+    }
+
+    let target = canonical_target(url);
+    let output = git_output(["config", "--get-urlmatch", "credential.username", &target])?;
+    if output.status.code() == Some(1) {
+        return Err(miette!(
+            "SMTP credential {target} has no configured username; pass --username or run secretspec git configure with --username first"
+        ));
+    }
+    let username = output_text(output, "Failed to read the configured SMTP username")?;
+    let username = username.trim_end_matches(['\n', '\r']).to_string();
+    validate_literal_username(Some(&username))?;
+    Ok(Some(username))
+}
+
 fn validate_secret(secrets: &Secrets, name: &str, profile: &str) -> Result<()> {
     if name.is_empty() {
         return Err(miette!("Secret name cannot be empty"));
@@ -397,34 +602,36 @@ fn manifest_path(file: &Option<PathBuf>) -> Result<PathBuf> {
     require_utf8_path(path, "SecretSpec manifest")
 }
 
-fn canonical_target(url: &Url) -> String {
-    let mut target = url[..Position::BeforePath].to_string();
-    let path = url.path().trim_end_matches('/');
-    if !path.is_empty() {
-        target.push_str(path);
-    }
-    target
-}
-
 fn helper_command(
     target: &str,
-    manifest: &Path,
-    profile: &str,
+    manifest: Option<&Path>,
+    profile: Option<&str>,
     provider: Option<&str>,
     reason: Option<&str>,
     token_secret: &str,
     username_secret: Option<&str>,
+    username: Option<&str>,
 ) -> String {
     let mut command = format!(
-        "secretspec --url {} --file {} --profile {} --password-secret {}",
+        "secretspec --url {} --password-secret {}",
         shell_quote(target),
-        shell_quote(&manifest.to_string_lossy()),
-        shell_quote(profile),
         shell_quote(token_secret)
     );
+    if let Some(manifest) = manifest {
+        command.push_str(" --file ");
+        command.push_str(&shell_quote(&manifest.to_string_lossy()));
+    }
+    if let Some(profile) = profile {
+        command.push_str(" --profile ");
+        command.push_str(&shell_quote(profile));
+    }
     if let Some(secret) = username_secret {
         command.push_str(" --username-secret ");
         command.push_str(&shell_quote(secret));
+    }
+    if let Some(username) = username {
+        command.push_str(" --username ");
+        command.push_str(&shell_quote(username));
     }
     if let Some(provider) = provider {
         command.push_str(" --provider ");
@@ -942,16 +1149,18 @@ mod tests {
     fn helper_command_quotes_every_persisted_argument() {
         let command = helper_command(
             "https://github.com",
-            Path::new("/tmp/project's secretspec.toml"),
-            "team's profile",
+            Some(Path::new("/tmp/project's secretspec.toml")),
+            Some("team's profile"),
             Some("provider's alias"),
             Some("developer's machine"),
             "TOKEN'S_NAME",
             Some("USERNAME'S_NAME"),
+            Some("literal user's name"),
         );
         assert!(command.contains("'/tmp/project'\\''s secretspec.toml'"));
         assert!(command.contains("'TOKEN'\\''S_NAME'"));
         assert!(command.contains("'USERNAME'\\''S_NAME'"));
+        assert!(command.contains("'literal user'\\''s name'"));
         assert!(command.contains("'provider'\\''s alias'"));
         assert!(command.contains("'developer'\\''s machine'"));
     }

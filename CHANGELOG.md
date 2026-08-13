@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- A read-only `git-credential-secretspec` helper lets Git retrieve HTTPS
+  usernames and tokens through SecretSpec providers without duplicating them in
+  Git's credential store. Its built-in manifest keeps the default independent
+  of the current directory and isolates values by protocol, host, and configured
+  path; `secretspec git login` and `logout` manage those values explicitly.
+  SMTP credential contexts support `git send-email` without writing
+  `sendemail.smtpPass`, with passwords isolated by server, port, and username.
+  `configure` and `unconfigure` safely manage repository or global Git
+  configuration without replacing existing helpers, while `--file` retains the
+  custom-manifest workflow (0.20+).
+
 ## [0.19.1] - 2026-08-11
 
 Republishes 0.19.0's command-line artifacts. The library and CLI behave exactly
@@ -23,12 +38,6 @@ as in 0.19.0.
   checksum. The static installer keeps selecting the x86_64 build on Windows
   ARM64, which runs under emulation, so download the archive directly for a
   native binary.
-- A read-only `git-credential-secretspec` helper lets Git retrieve HTTPS
-  usernames and tokens through SecretSpec providers without duplicating them in
-  Git's credential store. `secretspec git configure` and `unconfigure` safely
-  manage repository or global Git configuration without replacing existing
-  helpers (0.20+).
-
 ### Fixed
 
 - The 0.19.0 GitHub Release shipped without its CLI archives, its installer,

@@ -31,7 +31,10 @@ GITHUB_TOKEN = { description = "GitHub token", default = "token=value", provider
         std::iter::once(binary_directory.to_path_buf()).chain(env::split_paths(&existing_path)),
     )
     .unwrap();
-    let helper = "secretspec --url https://github.com --username-secret GITHUB_USERNAME --password-secret GITHUB_TOKEN";
+    let helper = format!(
+        "secretspec --url https://github.com --file {} --username-secret GITHUB_USERNAME --password-secret GITHUB_TOKEN",
+        manifest.display()
+    );
     let mut child = Command::new("git")
         .args([
             "-c",
@@ -49,7 +52,7 @@ GITHUB_TOKEN = { description = "GitHub token", default = "token=value", provider
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("PATH", path)
-        .env("SECRETSPEC_FILE", &manifest)
+        .env_remove("SECRETSPEC_FILE")
         .env_remove("SECRETSPEC_PROFILE")
         .env_remove("SECRETSPEC_PROVIDER")
         .env_remove("SECRETSPEC_REASON")

@@ -1,11 +1,12 @@
 ---
 title: Git credentials
-description: Let Git retrieve HTTPS credentials through SecretSpec providers
+description: Let Git retrieve HTTPS and SMTP credentials through SecretSpec providers
 ---
 
 The Git credential helper is available in SecretSpec 0.20+. It lets ordinary
 `git clone`, `git fetch`, `git pull`, and `git push` commands retrieve HTTPS
-credentials from any SecretSpec provider.
+credentials from any SecretSpec provider. It also supports SMTP authentication
+for `git send-email`.
 
 Use it when your Git token already lives in a provider such as 1Password,
 Bitwarden, or Vault and you do not want to copy it into a separate Git
@@ -16,59 +17,51 @@ into repositories.
 
 - Git
 - SecretSpec 0.20 or newer, including `git-credential-secretspec` on `PATH`
-- A SecretSpec manifest that declares the token
-
-For example:
-
-```toml
-[project]
-name = "git-credentials"
-revision = "1.0"
-
-[profiles.default]
-GITHUB_TOKEN = { description = "GitHub token for HTTPS authentication" }
-```
-
-Store the token through the manifest's configured provider:
-
-```bash
-$ secretspec set GITHUB_TOKEN
-```
 
 ## Configure Git
 
-Keep a fixed username in Git and let SecretSpec supply the token:
+These commands are available in SecretSpec 0.20+.
+
+Register the helper, keeping the non-secret username in Git:
 
 ```bash
 $ secretspec git configure \
   --url https://github.com \
-  --token-secret GITHUB_TOKEN \
   --username YOUR_USERNAME
 ```
 
-The command validates the URL and secret declaration without retrieving the
-token. It records the manifest's absolute path and resolved profile, then
-registers `git-credential-secretspec` for this repository. Other configured
-helpers and usernames remain untouched.
-
-Git configuration stores the manifest path, profile, provider alias, reason,
-and secret names needed to invoke the helper, but never the resolved secret
-values. If you move or delete the manifest, run `secretspec git configure`
-again for each affected URL to record its new path.
-
-To retrieve the username from a SecretSpec provider as well, declare it and use
-`--username-secret` instead of `--username`:
+Then store the password or token through your configured default provider:
 
 ```bash
-$ secretspec git configure \
-  --url https://github.com \
-  --token-secret GITHUB_TOKEN \
-  --username-secret GITHUB_USERNAME
+$ secretspec git login https://github.com
+? Enter value for PASSWORD (profile: default):
 ```
 
-The helper checks `--url` independently before returning credentials. A token
-configured for `https://github.com` is therefore not returned for another host
-or for an HTTP remote.
+The built-in manifest declares a required `PASSWORD` and optional `USERNAME`.
+It is embedded in the binary: the helper never searches the current directory
+for `secretspec.toml`, so clone, fetch, and push resolve the same declarations
+inside or outside a repository. Git configuration records no manifest path.
+
+Each canonical credential target has a separate provider namespace. The
+identity includes the protocol and host, plus the configured path when
+`useHttpPath` is enabled, so credentials for different hosts or path scopes
+cannot share a value accidentally.
+
+To keep the username in the provider too, omit `--username` from `configure`
+and supply it when logging in:
+
+```bash
+$ secretspec git configure --url https://github.com
+$ secretspec git login https://github.com --username YOUR_USERNAME
+```
+
+`login` prompts securely on a terminal and reads the password or token from
+standard input when piped. Use the same `--provider` override on `configure`
+and `login` when the credential should not use your default provider.
+
+The helper checks the URL independently before loading the provider. A token
+configured for `https://github.com` is not returned for another host or for an
+HTTP remote.
 
 ::::danger[Use HTTPS for credentials]
 Although the helper accepts `http://` URLs for trusted local or test systems,
@@ -81,36 +74,64 @@ To limit a credential to part of a host, include the path in the URL:
 ```bash
 $ secretspec git configure \
   --url https://github.com/cachix \
-  --token-secret GITHUB_TOKEN \
   --username YOUR_USERNAME
+$ secretspec git login https://github.com/cachix
 ```
 
 SecretSpec also enables Git's `useHttpPath` setting for that URL. This example
 answers for repositories below `https://github.com/cachix/`, but not for
-another GitHub organization.
+another GitHub organization. The path-scoped credential is stored separately
+from one configured for all of `https://github.com`.
+
+## Send patches with SMTP
+
+SMTP credential support is available in SecretSpec 0.20+. Git queries
+credential helpers when `sendemail.smtpUser` is set and
+`sendemail.smtpPass` is omitted:
+
+```bash
+$ git config --global sendemail.smtpServer smtp.example.com
+$ git config --global sendemail.smtpServerPort 587
+$ git config --global sendemail.smtpEncryption tls
+$ git config --global sendemail.smtpUser user@example.com
+$ secretspec git configure \
+  --url smtp://smtp.example.com:587 \
+  --username user@example.com \
+  --global
+$ secretspec git login smtp://smtp.example.com:587
+```
+
+The username on `configure` must match `sendemail.smtpUser`. `login` and
+`logout` read it back from Git configuration; pass `--username` explicitly if
+the helper has already been unconfigured or another account is being managed.
+Protocol, server, port, and username form the embedded storage identity, so two
+accounts on the same SMTP server never share a password.
+
+The `smtp` URL is Git's credential-context name, not a transport-security
+setting. Encryption remains controlled by
+`sendemail.smtpEncryption=tls|ssl`. SecretSpec never writes
+`sendemail.smtpPass` or any other `sendemail.*` setting, and the helper rejects
+HTTP(S), a different port, or another username when answering an SMTP request.
 
 ## Clone private repositories
 
-During the initial clone, the destination repository and its manifest do not
-exist yet. Put the declaration in a separate manifest and configure it
-globally:
+Configure the embedded credential globally before the destination repository
+exists:
 
 ::::danger[This changes your global Git configuration]
 Using `--global` enables this credential helper for matching URLs in every Git
-repository owned by your user. Review the URL and manifest path before
-confirming. To roll back the example below, run
+repository owned by your user. Review the URL before confirming. To roll back
+the example below, run
 `secretspec git unconfigure --url https://github.com --global`; see
 [Remove the configuration](#remove-the-configuration) for all removal options.
 ::::
 
 ```bash
-$ secretspec \
-  --file ~/.config/secretspec/git/secretspec.toml \
-  git configure \
+$ secretspec git configure \
   --url https://github.com \
-  --token-secret GITHUB_TOKEN \
   --username YOUR_USERNAME \
   --global
+$ secretspec git login https://github.com
 ```
 
 Then clone normally:
@@ -123,19 +144,65 @@ Git invokes the SecretSpec credential helper automatically. The token does not
 need to appear in the clone URL or your shell history.
 
 Global changes require a confirmation that defaults to **No**. Pass `--yes`
-only for non-interactive setup. You can also select a profile or provider with
-`--profile` or `--provider`; the corresponding SecretSpec environment variables
-are supported.
+only for non-interactive setup. A `--provider` override and the corresponding
+SecretSpec environment variable are supported.
+
+## Use a custom manifest
+
+Custom Git helper configuration is available in SecretSpec 0.20+.
+
+Pass `--file` when the credential should use declarations from a project or
+company manifest. In this mode, `--token-secret` is required and
+`--username-secret` and `--profile` are available:
+
+```toml
+[project]
+name = "company-git"
+revision = "1.0"
+
+[profiles.default]
+GITHUB_TOKEN = { description = "GitHub token for HTTPS authentication" }
+```
+
+```bash
+$ secretspec set GITHUB_TOKEN --file company-git.toml
+$ secretspec --file company-git.toml git configure \
+  --url https://github.com \
+  --token-secret GITHUB_TOKEN \
+  --username YOUR_USERNAME
+```
+
+The managed helper records the custom manifest's absolute path and resolved
+profile. Explicit `--file` always takes precedence over the embedded manifest.
+Use ordinary `secretspec set` and `delete` commands with the same file to manage
+custom credential values; `git login` and `logout` intentionally operate only
+on the embedded store.
+
+## Remove stored values
+
+`secretspec git logout` is available in SecretSpec 0.20+.
+
+Remove the embedded username and password or token for one exact target:
+
+```bash
+$ secretspec git logout https://github.com
+```
+
+This leaves the Git helper configured. Repeat `login` to replace the credential,
+or use `unconfigure` when Git should stop invoking SecretSpec for that target.
+If `login` used a provider override, pass the same override to `logout`.
 
 ## Remove the configuration
 
-Remove one credential from the current repository:
+`secretspec git unconfigure` is available in SecretSpec 0.20+.
+
+Remove one credential helper from the current repository:
 
 ```bash
 $ secretspec git unconfigure --url https://github.com
 ```
 
-Remove every Git credential that SecretSpec configured in the current
+Remove every Git credential helper that SecretSpec configured in the current
 repository:
 
 ```bash
@@ -158,13 +225,15 @@ manually.
 
 ## Manual configuration
 
-The convenience command is equivalent to registering the helper yourself. For
-example:
+The Git credential helper is available in SecretSpec 0.20+.
+
+The default convenience command is equivalent to registering the embedded
+helper yourself. For example:
 
 ```bash
 $ git config --local credential.https://github.com.username YOUR_USERNAME
 $ git config --local credential.https://github.com.helper \
-  'secretspec --url https://github.com --password-secret GITHUB_TOKEN'
+  'secretspec --url https://github.com --password-secret PASSWORD --username-secret USERNAME'
 ```
 
 When configuring a path manually, set `useHttpPath` and use the same URL in the
@@ -173,19 +242,29 @@ helper:
 ```bash
 $ git config --local credential.https://github.com/cachix.useHttpPath true
 $ git config --local credential.https://github.com/cachix.helper \
-  'secretspec --url https://github.com/cachix --password-secret GITHUB_TOKEN'
+  'secretspec --url https://github.com/cachix --password-secret PASSWORD --username-secret USERNAME'
 ```
 
 These entries are not recorded in SecretSpec's managed file, so
 `secretspec git unconfigure` does not remove them. Remove manually configured
 entries with `git config` as well.
 
+For SMTP, include the expected username in the helper command and keep
+transport settings under `sendemail.*`:
+
+```bash
+$ git config --global credential.smtp://smtp.example.com:587.helper \
+  "secretspec --url smtp://smtp.example.com:587 --username user@example.com \
+  --password-secret PASSWORD --username-secret USERNAME"
+```
+
 ## Read-only behavior
 
 In SecretSpec 0.20+, the helper only answers Git's `get` operation. It safely
 ignores automatic `store` and `erase` requests, so a rejected credential cannot
-delete or overwrite a value in a shared provider. Manage the value explicitly
-with `secretspec set` or `secretspec delete`.
+delete or overwrite a value in a shared provider. Manage embedded values
+explicitly with `secretspec git login` and `logout`, or custom-manifest values
+with `secretspec set` and `delete`.
 
 Git can continue to try another configured helper or prompt when SecretSpec has
-no stored value for the declared key.
+no stored value for the selected target.
