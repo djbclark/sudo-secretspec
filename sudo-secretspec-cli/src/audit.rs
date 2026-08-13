@@ -338,7 +338,7 @@ fn open_connection(directory: &Path, expected_uid: Option<u32>) -> Result<Connec
 
     // 2. Check any existing ledger metadata before opening.
     let db_path = directory.join(DB_NAME);
-    let existed = db_path.exists();
+    let _existed = db_path.exists();
     check_ledger_metadata(&db_path, expected_uid)?;
 
     // 3. Open with mask to ensure new file gets 0600.
@@ -356,11 +356,27 @@ fn open_connection(directory: &Path, expected_uid: Option<u32>) -> Result<Connec
          PRAGMA trusted_schema=OFF;",
     )?;
 
-    // 5. Ensure new ledger gets correct permissions.
-    if !existed {
-        let mut perms = std::fs::metadata(&db_path)?.permissions();
+    // 5. Ensure ledger is mode 0600 and owned by the vault service identity.
+    {
+        let meta = std::fs::metadata(&db_path)?;
+        let mut perms = meta.permissions();
         perms.set_mode(0o600);
         std::fs::set_permissions(&db_path, perms)?;
+        // When the broker runs as root, reassign ownership to the vault owner
+        // (the dedicated service user) so doctor/drift checks stay consistent.
+        if unsafe { libc::geteuid() } == 0 {
+            let dir_meta = std::fs::metadata(directory)?;
+            let uid = dir_meta.uid();
+            let gid = dir_meta.gid();
+            let c_path = std::ffi::CString::new(db_path.to_string_lossy().as_bytes())
+                .map_err(|_| AuditError::Denied("invalid ledger path".into()))?;
+            let rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+            if rc != 0 {
+                return Err(AuditError::Denied(format!(
+                    "could not chown ledger to vault owner {uid}:{gid}"
+                )));
+            }
+        }
     }
 
     // 6. Re-verify ledger metadata after open.

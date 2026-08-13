@@ -380,6 +380,12 @@ pub fn inspect(layout: &Layout) -> Report {
                     Some(&path),
                     "pending rollback artifact requires operator review",
                 ));
+            } else if matches!(name.as_ref(), ".local" | ".ansible" | ".cache") {
+                findings.push(finding(
+                    "LEGACY_VAULT_CLUTTER",
+                    Some(&path),
+                    "non-secret tool state under the vault; safe to remove after review",
+                ));
             } else if !allowed.iter().any(|a| *a == name) {
                 findings.push(finding(
                     "UNEXPECTED_RUNTIME_ENTRY",

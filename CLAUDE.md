@@ -15,9 +15,22 @@ For an upcoming provider or feature:
   pages, README files, and generated documentation summaries with the minimum
   version, for example `(0.15+)`.
 
-## Project Overview
+## Downstream fork notes (`djbclark/sudo-secretspec`)
 
-SecretSpec is a declarative secrets manager for development workflows written in Rust. It provides a CLI tool and Rust library for managing environment variables and secrets across different environments using multiple storage backends (keyring, dotenv, environment variables, OnePassword, LastPass).
+This repository is a fork. In addition to upstream SecretSpec:
+
+- Companion crate: `sudo-secretspec-cli` (binary `sudo-secretspec`)
+- Downstream docs: `sudo-secretspec/README.md`, `README.downstream.md`
+- AI automation contract: `sudo-secretspec/AI-GUIDANCE.md`
+- Fork-only agent notes/tricks: `FORK-AI.md` (do not upstream)
+- Branches: `main` mirrors upstream; `sudo-main` is the downstream release line
+- Version scheme: `0.19.1-djbclark.1`
+
+When changing the companion, update `CHANGELOG.md` Unreleased with a user-facing
+entry and keep privileged install explicit (Homebrew must not silently edit
+sudoers/users/vaults).
+
+Prefer system SQLite (not `rusqlite` bundled) on macOS; see `FORK-AI.md`.
 
 ## Build and Development Commands
 
