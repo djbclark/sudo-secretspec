@@ -299,23 +299,52 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     if req.dry_run {
         if req.adopt_existing {
             // Metadata-only validation of existing identity/vault.
-            let _ = Command::new("/usr/bin/id")
+            let id_status = Command::new("/usr/bin/id")
                 .arg(&req.service_user)
                 .status()
                 .map_err(|e| InstallError::Denied(e.to_string()))?;
+            if !id_status.success() {
+                return Err(InstallError::Denied(format!(
+                    "adopted user missing: {}",
+                    req.service_user
+                )));
+            }
+            let group_status = Command::new("/usr/bin/dscl")
+                .args([".", "-read", &format!("/Groups/{}", req.service_group)])
+                .status()
+                .map_err(|e| InstallError::Denied(e.to_string()))?;
+            if !group_status.success() {
+                return Err(InstallError::Denied(format!(
+                    "adopted group missing: {}",
+                    req.service_group
+                )));
+            }
             if !req.vault.is_dir() || req.vault.is_symlink() {
                 return Err(InstallError::Denied(
                     "adopted vault missing or symlinked".into(),
                 ));
             }
+            // Root-only metadata checks of vault contents (never open values).
             for runtime in ["secretspec.toml", ".env"] {
                 let p = req.vault.join(runtime);
-                if !p.is_file() || p.is_symlink() {
+                let meta = fs::symlink_metadata(&p).map_err(|_| {
+                    InstallError::Denied(format!(
+                        "adopted runtime file missing or unreadable: {}",
+                        p.display()
+                    ))
+                })?;
+                if meta.file_type().is_symlink() || !meta.is_file() {
                     return Err(InstallError::Denied(format!(
                         "adopted runtime file missing or symlinked: {}",
                         p.display()
                     )));
                 }
+            }
+            let vault_real = resolve_path(&req.vault);
+            if !vault_real.starts_with("/private/var/db/") {
+                return Err(InstallError::Denied(
+                    "vault resolves outside /private/var/db".into(),
+                ));
             }
         } else if Path::new(&req.vault).exists()
             || Command::new("/usr/bin/id")
