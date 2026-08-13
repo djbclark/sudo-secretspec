@@ -31,9 +31,9 @@ GITHUB_TOKEN = { description = "GitHub token", default = "token=value", provider
         std::iter::once(binary_directory.to_path_buf()).chain(env::split_paths(&existing_path)),
     )
     .unwrap();
+    let manifest = manifest.to_string_lossy().replace('\'', "'\\''");
     let helper = format!(
-        "secretspec --url https://github.com --file {} --username-secret GITHUB_USERNAME --password-secret GITHUB_TOKEN",
-        manifest.display()
+        "secretspec --url https://github.com --file '{manifest}' --username-secret GITHUB_USERNAME --password-secret GITHUB_TOKEN"
     );
     let mut child = Command::new("git")
         .args([
