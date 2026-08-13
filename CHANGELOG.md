@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Downstream `sudo-secretspec` privilege-boundary companion: a single Rust
+  binary with mediated credential operations, fail-closed SQLite audit,
+  metadata-only doctor/drift checks, explicit install/adopt/rollback, and
+  Homebrew packaging that never performs privileged installation side effects.
+- Short install UX: `sudo-secretspec install` / `install --adopt-existing`
+  with declaration auto-detection and TTY prompts; long flags are overrides.
+- Fork docs: `sudo-secretspec/README.md`, `README.downstream.md`, `FORK-AI.md`.
+
 ## [0.19.1] - 2026-08-11
 
 Republishes 0.19.0's command-line artifacts. The library and CLI behave exactly

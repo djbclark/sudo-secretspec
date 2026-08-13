@@ -17,3 +17,6 @@ target
 /secretspec-swift/Artifacts/
 
 .idea/
+
+__pycache__/
+*.pyc
