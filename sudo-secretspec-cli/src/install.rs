@@ -382,13 +382,23 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     if req.vault.is_symlink() {
         return Err(InstallError::Denied("vault must not be a symlink".into()));
     }
-    let _ = Command::new("/usr/sbin/chown")
-        .arg(format!("{}:{}", req.service_user, req.service_group))
-        .arg(&req.vault)
-        .status();
-    let mut perms = fs::metadata(&req.vault)?.permissions();
-    perms.set_mode(0o700);
-    fs::set_permissions(&req.vault, perms)?;
+    if req.adopt_existing {
+        // Never rewrite ownership of an adopted vault; only verify metadata.
+        let meta = fs::metadata(&req.vault)?;
+        if (meta.permissions().mode() & 0o777) != 0o700 {
+            return Err(InstallError::Denied(
+                "adopted vault must be mode 0700".into(),
+            ));
+        }
+    } else {
+        let _ = Command::new("/usr/sbin/chown")
+            .arg(format!("{}:{}", req.service_user, req.service_group))
+            .arg(&req.vault)
+            .status();
+        let mut perms = fs::metadata(&req.vault)?.permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&req.vault, perms)?;
+    }
 
     let vault_real = resolve_path(&req.vault);
     if !vault_real.starts_with("/private/var/db/") {

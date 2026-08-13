@@ -156,14 +156,21 @@ impl Mutation {
         ))
     }
 
-    fn restore(&self) {
+    fn restore(&self) -> bool {
+        let mut ok = true;
         for (dest, suffix) in [(&self.manifest, "toml"), (&self.dotenv, "env")] {
             let backup = self.rollback_path(suffix);
             if backup.is_file() {
-                let _ = std::fs::copy(&backup, dest);
+                if std::fs::copy(&backup, dest).is_err() {
+                    ok = false;
+                    continue;
+                }
                 let _ = std::fs::remove_file(&backup);
+            } else {
+                ok = false;
             }
         }
+        ok
     }
 
     fn commit(&self) {
@@ -192,8 +199,9 @@ fn resolve_client(raw: &str) -> ClientFamily {
 }
 
 fn reason_sha256(reason: &str) -> Option<String> {
+    let reason = reason.trim();
     if reason.is_empty() {
-        return Some(String::from(audit::ZERO_HASH));
+        return None;
     }
     Some(format!("{:x}", Sha256::digest(reason.as_bytes())))
 }
@@ -220,8 +228,13 @@ fn run(broker: &Broker) -> Result<(), i32> {
             let cfg = load_config()?;
             require_boundary(&cfg)?;
 
+            if broker.reason.trim().is_empty() {
+                eprintln!("broker: --reason is required");
+                return Err(2);
+            }
+
             let client = resolve_client(&broker.client);
-            let reason_hash = reason_sha256(&broker.reason);
+            let reason_hash = reason_sha256(&broker.reason).ok_or(2)?;
             let transaction = uuid::Uuid::new_v4();
             let names = broker
                 .name
@@ -230,8 +243,8 @@ fn run(broker: &Broker) -> Result<(), i32> {
                 .unwrap_or_default();
             let actor = actor_from_env();
 
-            // Audit attempt
-            let _ = audit::append_event(
+            // Fail-closed audit attempt before any secret operation.
+            audit::append_event(
                 &cfg.vault,
                 AppendEventRequest {
                     operation: broker.operation.clone(),
@@ -239,13 +252,17 @@ fn run(broker: &Broker) -> Result<(), i32> {
                     transaction,
                     actor: actor.clone(),
                     client,
-                    reason_sha256: reason_hash.clone(),
+                    reason_sha256: Some(reason_hash.clone()),
                     command_basename: broker.command_basename.clone(),
                     names: names.clone(),
                     result_code: None,
                     expected_uid: None,
                 },
-            );
+            )
+            .map_err(|e| {
+                eprintln!("broker: audit attempt failed: {e}");
+                2
+            })?;
 
             // Begin mutation for write operations
             let mutation = if matches!(
@@ -261,21 +278,25 @@ fn run(broker: &Broker) -> Result<(), i32> {
             let (rc, names) = execute(broker, &cfg);
 
             // Commit or restore mutation
+            let mut unknown = false;
             if let Some(m) = &mutation {
                 if rc == 0 {
                     m.commit();
-                } else {
-                    m.restore();
+                } else if !m.restore() {
+                    unknown = true;
                 }
             }
 
-            // Terminal audit (unknown outcome if rc says success but we can't prove it)
-            let phase = if rc == 0 {
+            // Terminal audit must also succeed.
+            let phase = if unknown {
+                Outcome::Unknown
+            } else if rc == 0 {
                 Outcome::Success
             } else {
                 Outcome::Failure
             };
-            let _ = audit::append_event(
+            let terminal_rc = if unknown { 125 } else { rc };
+            audit::append_event(
                 &cfg.vault,
                 AppendEventRequest {
                     operation: broker.operation.clone(),
@@ -283,15 +304,23 @@ fn run(broker: &Broker) -> Result<(), i32> {
                     transaction,
                     actor,
                     client,
-                    reason_sha256: reason_hash,
+                    reason_sha256: Some(reason_hash),
                     command_basename: broker.command_basename.clone(),
                     names,
-                    result_code: Some(rc),
+                    result_code: Some(terminal_rc),
                     expected_uid: None,
                 },
-            );
+            )
+            .map_err(|e| {
+                eprintln!("broker: audit terminal failed: {e}");
+                2
+            })?;
 
-            if rc != 0 { Err(rc as i32) } else { Ok(()) }
+            if terminal_rc != 0 {
+                Err(i32::from(terminal_rc))
+            } else {
+                Ok(())
+            }
         }
         op => {
             eprintln!("broker: unknown operation: {op}");
@@ -316,13 +345,28 @@ fn run_audit_verify(_broker: &Broker) -> Result<(), i32> {
 }
 
 fn execute(broker: &Broker, cfg: &Config) -> (u8, Vec<String>) {
+    // Prevent ambient SecretSpec env from selecting another control plane.
+    for key in [
+        "SECRETSPEC_PROVIDER",
+        "SECRETSPEC_FILE",
+        "SECRETSPEC_PROFILE",
+        "SECRETSPEC_SCOPE",
+    ] {
+        // SAFETY: single-threaded broker process; no concurrent env readers.
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+
     let manifest = cfg.vault.join("secretspec.toml");
+    let dotenv = cfg.vault.join(".env");
+    // Pin dotenv provider to the protected vault file — never cwd-relative `.env`.
+    // Absolute paths need the dotenv:/// form.
+    let provider = format!("dotenv://{}", dotenv.display());
     let secrets = match secretspec::Secrets::load_from(&manifest) {
         Ok(mut s) => {
-            s.set_provider("dotenv");
-            if !broker.reason.is_empty() {
-                s = s.with_reason(broker.reason.clone());
-            }
+            s.set_provider(provider);
+            s = s.with_reason(broker.reason.clone());
             s
         }
         Err(e) => {
