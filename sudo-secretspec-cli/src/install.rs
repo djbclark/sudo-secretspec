@@ -1,0 +1,479 @@
+//! Privileged installer for the sudo-secretspec boundary.
+//!
+//! Fresh installs can create the dedicated service identity and vault.
+//! Existing protected stores must be adopted explicitly. Dry-run validates
+//! without mutating.
+
+use std::fs;
+use std::io::Write;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+
+const PREFIX: &str = "/usr/local";
+const CONFIG_PATH: &str = "/usr/local/etc/sudo-secretspec.toml";
+const SUDOERS_PATH: &str = "/private/etc/sudoers.d/sudo-secretspec";
+const DEFAULT_VAULT: &str = "/var/db/sudo-secretspec";
+const DEFAULT_USER: &str = "_sudo_secretspec";
+const DEFAULT_GROUP: &str = "_sudo_secretspec";
+
+#[derive(Debug, Error)]
+pub enum InstallError {
+    #[error("{0}")]
+    Denied(String),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+#[derive(Debug, Clone)]
+pub struct InstallRequest {
+    pub declarations: PathBuf,
+    pub dry_run: bool,
+    pub adopt_existing: bool,
+    pub vault: PathBuf,
+    pub service_user: String,
+    pub service_group: String,
+    pub operator: String,
+    pub source_root: Option<PathBuf>,
+}
+
+impl InstallRequest {
+    pub fn from_cli(declarations: PathBuf, dry_run: bool, adopt_existing: bool) -> Self {
+        let operator = std::env::var("SUDO_USER")
+            .or_else(|_| std::env::var("USER"))
+            .unwrap_or_else(|_| "root".into());
+        Self {
+            declarations,
+            dry_run,
+            adopt_existing,
+            vault: PathBuf::from(DEFAULT_VAULT),
+            service_user: DEFAULT_USER.into(),
+            service_group: DEFAULT_GROUP.into(),
+            operator,
+            source_root: None,
+        }
+    }
+}
+
+fn require_root() -> Result<(), InstallError> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(InstallError::Denied(
+            "must run as root (Touch ID/sudo is expected, including dry-run)".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn sha256_file(path: &Path) -> Result<String, InstallError> {
+    let bytes = fs::read(path)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn install_file(src: &Path, dst: &Path, mode: u32) -> Result<(), InstallError> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = dst.with_extension(format!("new.{}", std::process::id()));
+    fs::copy(src, &tmp)?;
+    let mut perms = fs::metadata(&tmp)?.permissions();
+    perms.set_mode(mode);
+    fs::set_permissions(&tmp, perms)?;
+    // Best-effort ownership; already root when installer is root.
+    let _ = Command::new("/usr/sbin/chown")
+        .args(["root:wheel"])
+        .arg(&tmp)
+        .status();
+    fs::rename(&tmp, dst)?;
+    Ok(())
+}
+
+fn write_bytes(dst: &Path, bytes: &[u8], mode: u32) -> Result<(), InstallError> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = dst.with_extension(format!("new.{}", std::process::id()));
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+    }
+    let mut perms = fs::metadata(&tmp)?.permissions();
+    perms.set_mode(mode);
+    fs::set_permissions(&tmp, perms)?;
+    let _ = Command::new("/usr/sbin/chown")
+        .args(["root:wheel"])
+        .arg(&tmp)
+        .status();
+    fs::rename(&tmp, dst)?;
+    Ok(())
+}
+
+fn ensure_service_group(name: &str, create: bool) -> Result<u32, InstallError> {
+    let output = Command::new("/usr/bin/dscl")
+        .args([".", "-read", &format!("/Groups/{name}"), "PrimaryGroupID"])
+        .output()?;
+    if output.status.success() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        let gid = text
+            .split_whitespace()
+            .last()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| InstallError::Denied("cannot parse group id".into()))?;
+        return Ok(gid);
+    }
+    if !create {
+        return Err(InstallError::Denied(format!(
+            "adopted group missing: {name}"
+        )));
+    }
+    // Find free GID 400-499.
+    let mut gid = 499u32;
+    while gid >= 400 {
+        let probe = Command::new("/usr/bin/dscl")
+            .args([
+                ".",
+                "-search",
+                "/Groups",
+                "PrimaryGroupID",
+                &gid.to_string(),
+            ])
+            .output()?;
+        if !String::from_utf8_lossy(&probe.stdout).contains(char::is_alphanumeric) {
+            break;
+        }
+        gid -= 1;
+    }
+    if gid < 400 {
+        return Err(InstallError::Denied("no free hidden group id".into()));
+    }
+    for args in [
+        vec![".", "-create", &format!("/Groups/{name}")],
+        vec![
+            ".",
+            "-create",
+            &format!("/Groups/{name}"),
+            "PrimaryGroupID",
+            &gid.to_string(),
+        ],
+        vec![".", "-create", &format!("/Groups/{name}"), "Password", "*"],
+    ] {
+        let status = Command::new("/usr/bin/dscl").args(&args).status()?;
+        if !status.success() {
+            return Err(InstallError::Denied(format!(
+                "failed to create group {name}"
+            )));
+        }
+    }
+    Ok(gid)
+}
+
+fn ensure_service_user(name: &str, gid: u32, create: bool) -> Result<(), InstallError> {
+    let output = Command::new("/usr/bin/id").arg(name).output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    if !create {
+        return Err(InstallError::Denied(format!(
+            "adopted user missing: {name}"
+        )));
+    }
+    let mut uid = 499u32;
+    while uid >= 400 {
+        let probe = Command::new("/usr/bin/dscl")
+            .args([".", "-search", "/Users", "UniqueID", &uid.to_string()])
+            .output()?;
+        if !String::from_utf8_lossy(&probe.stdout).contains(char::is_alphanumeric) {
+            break;
+        }
+        uid -= 1;
+    }
+    if uid < 400 {
+        return Err(InstallError::Denied("no free hidden user id".into()));
+    }
+    let home = "/var/empty";
+    let shell = "/usr/bin/false";
+    let path = format!("/Users/{name}");
+    for args in [
+        vec![".", "-create", &path],
+        vec![".", "-create", &path, "UniqueID", &uid.to_string()],
+        vec![".", "-create", &path, "PrimaryGroupID", &gid.to_string()],
+        vec![".", "-create", &path, "UserShell", shell],
+        vec![".", "-create", &path, "NFSHomeDirectory", home],
+        vec![".", "-create", &path, "IsHidden", "1"],
+        vec![".", "-create", &path, "Password", "*"],
+    ] {
+        let status = Command::new("/usr/bin/dscl").args(&args).status()?;
+        if !status.success() {
+            return Err(InstallError::Denied(format!(
+                "failed to create user {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_protected_ancestors() -> Result<(), InstallError> {
+    for dir in [
+        "/usr",
+        "/usr/local",
+        "/private",
+        "/private/var",
+        "/private/var/db",
+        "/private/etc",
+        "/private/etc/sudoers.d",
+    ] {
+        let path = Path::new(dir);
+        if !path.is_dir() || path.is_symlink() {
+            return Err(InstallError::Denied(format!(
+                "unsafe protected directory {dir}"
+            )));
+        }
+        let meta = fs::metadata(path)?;
+        if meta.uid() != 0 || (meta.permissions().mode() & 0o022) != 0 {
+            return Err(InstallError::Denied(format!(
+                "unsafe protected directory metadata {dir}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn config_toml(req: &InstallRequest, vault_real: &Path) -> String {
+    format!(
+        "engine = \"{prefix}/libexec/sudo-secretspec\"\n\
+         audit_helper = \"{prefix}/libexec/sudo-secretspec\"\n\
+         vault = \"{vault}\"\n\
+         vault_realpath = \"{vault_real}\"\n\
+         declarations = \"{prefix}/share/sudo-secretspec/secretspec.toml\"\n\
+         service_user = \"{user}\"\n\
+         service_group = \"{group}\"\n",
+        prefix = PREFIX,
+        vault = req.vault.display(),
+        vault_real = vault_real.display(),
+        user = req.service_user,
+        group = req.service_group,
+    )
+}
+
+fn sudoers_text(operator: &str) -> String {
+    format!(
+        "Defaults!{prefix}/libexec/sudo-secretspec env_reset,secure_path=/usr/bin:/bin:/usr/sbin:/sbin,umask=0077\n\
+         {operator} ALL=(root) NOPASSWD: {prefix}/libexec/sudo-secretspec\n\
+         {operator} ALL=(root) NOPASSWD: {prefix}/libexec/sudo-secretspec *\n",
+        prefix = PREFIX,
+        operator = operator,
+    )
+}
+
+fn retired_toml() -> &'static str {
+    "# RETIRED SECRETSPEC PATH — NO SECRET VALUES\n\
+     # This path is not a credential store. Use /usr/local/bin/sudo-secretspec.\n\
+     # Do not create, copy, symlink, regenerate, relocate, or select an alternate\n\
+     # manifest or provider.\n"
+}
+
+fn guidance_text() -> &'static str {
+    // Keep installer self-contained so packaging does not depend on relative
+    // source layout after cargo install.
+    "# AI and automation contract for sudo-secretspec\n\n\
+     Use only /usr/local/bin/sudo-secretspec. Never select manifests, providers,\n\
+     profiles, or backing files. Fail closed if the broker is unavailable.\n"
+}
+
+/// Run the installer. Returns Ok(()) on success.
+pub fn run(req: InstallRequest) -> Result<(), InstallError> {
+    require_root()?;
+    if !req.declarations.is_file() || req.declarations.is_symlink() {
+        return Err(InstallError::Denied(
+            "declarations must be a regular file".into(),
+        ));
+    }
+    validate_protected_ancestors()?;
+
+    if req.dry_run {
+        if req.adopt_existing {
+            // Metadata-only validation of existing identity/vault.
+            let _ = Command::new("/usr/bin/id")
+                .arg(&req.service_user)
+                .status()
+                .map_err(|e| InstallError::Denied(e.to_string()))?;
+            if !req.vault.is_dir() || req.vault.is_symlink() {
+                return Err(InstallError::Denied(
+                    "adopted vault missing or symlinked".into(),
+                ));
+            }
+            for runtime in ["secretspec.toml", ".env"] {
+                let p = req.vault.join(runtime);
+                if !p.is_file() || p.is_symlink() {
+                    return Err(InstallError::Denied(format!(
+                        "adopted runtime file missing or symlinked: {}",
+                        p.display()
+                    )));
+                }
+            }
+        } else if Path::new(&req.vault).exists()
+            || Command::new("/usr/bin/id")
+                .arg(&req.service_user)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        {
+            return Err(InstallError::Denied(
+                "fresh-install identity or vault already exists; use --adopt-existing".into(),
+            ));
+        }
+        println!("would install sudo-secretspec");
+        println!("operator={}", req.operator);
+        println!("service={}:{}", req.service_user, req.service_group);
+        println!("vault={}", req.vault.display());
+        println!("prefix={PREFIX}");
+        println!("adopt_existing={}", u8::from(req.adopt_existing));
+        return Ok(());
+    }
+
+    // Create or adopt service identity.
+    let gid = ensure_service_group(&req.service_group, !req.adopt_existing)?;
+    ensure_service_user(&req.service_user, gid, !req.adopt_existing)?;
+
+    // Vault.
+    let mut created_vault = false;
+    if !req.vault.exists() {
+        if req.adopt_existing {
+            return Err(InstallError::Denied("adopted vault missing".into()));
+        }
+        fs::create_dir_all(&req.vault)?;
+        created_vault = true;
+    }
+    if req.vault.is_symlink() {
+        return Err(InstallError::Denied("vault must not be a symlink".into()));
+    }
+    let _ = Command::new("/usr/sbin/chown")
+        .arg(format!("{}:{}", req.service_user, req.service_group))
+        .arg(&req.vault)
+        .status();
+    let mut perms = fs::metadata(&req.vault)?.permissions();
+    perms.set_mode(0o700);
+    fs::set_permissions(&req.vault, perms)?;
+
+    let vault_real = resolve_path(&req.vault);
+    if !vault_real.starts_with("/private/var/db/") {
+        return Err(InstallError::Denied(
+            "vault resolves outside /private/var/db".into(),
+        ));
+    }
+
+    // Self binary sources.
+    let self_exe = std::env::current_exe()
+        .map_err(|e| InstallError::Denied(format!("cannot resolve current exe: {e}")))?;
+    let client_dst = PathBuf::from(PREFIX).join("bin/sudo-secretspec");
+    let broker_dst = PathBuf::from(PREFIX).join("libexec/sudo-secretspec");
+    let share = PathBuf::from(PREFIX).join("share/sudo-secretspec");
+    let declarations_dst = share.join("secretspec.toml");
+    let retired_dst = share.join("sudo-secretspec-retired.toml");
+    let guidance_dst = share.join("AI-GUIDANCE.md");
+    let manifest_dst = share.join("MANIFEST.sha256");
+    let config_dst = PathBuf::from(CONFIG_PATH);
+    let sudoers_dst = PathBuf::from(SUDOERS_PATH);
+
+    fs::create_dir_all(PathBuf::from(PREFIX).join("bin"))?;
+    fs::create_dir_all(PathBuf::from(PREFIX).join("libexec"))?;
+    fs::create_dir_all(PathBuf::from(PREFIX).join("etc"))?;
+    fs::create_dir_all(&share)?;
+
+    install_file(&self_exe, &client_dst, 0o755)?;
+    install_file(&self_exe, &broker_dst, 0o755)?;
+    install_file(&req.declarations, &declarations_dst, 0o444)?;
+    write_bytes(&retired_dst, retired_toml().as_bytes(), 0o444)?;
+    write_bytes(&guidance_dst, guidance_text().as_bytes(), 0o444)?;
+    write_bytes(
+        &config_dst,
+        config_toml(&req, &vault_real).as_bytes(),
+        0o444,
+    )?;
+    write_bytes(&sudoers_dst, sudoers_text(&req.operator).as_bytes(), 0o440)?;
+
+    // Release manifest of installed artifacts.
+    let mut manifest = String::new();
+    for path in [
+        &client_dst,
+        &broker_dst,
+        &declarations_dst,
+        &retired_dst,
+        &guidance_dst,
+        &config_dst,
+        &sudoers_dst,
+    ] {
+        manifest.push_str(&format!("{}  {}\n", sha256_file(path)?, path.display()));
+    }
+    write_bytes(&manifest_dst, manifest.as_bytes(), 0o444)?;
+
+    // Validate sudoers.
+    let visudo = Command::new("/usr/sbin/visudo")
+        .args(["-c", "-f"])
+        .arg(&sudoers_dst)
+        .status()?;
+    if !visudo.success() {
+        return Err(InstallError::Denied("visudo rejected sudoers".into()));
+    }
+
+    // Runtime files for fresh install only.
+    if !req.adopt_existing {
+        let manifest_rt = req.vault.join("secretspec.toml");
+        let env_rt = req.vault.join(".env");
+        fs::copy(&declarations_dst, &manifest_rt)?;
+        fs::File::create(&env_rt)?;
+        for path in [&manifest_rt, &env_rt] {
+            let mut p = fs::metadata(path)?.permissions();
+            p.set_mode(0o600);
+            fs::set_permissions(path, p)?;
+            let _ = Command::new("/usr/sbin/chown")
+                .arg(format!("{}:{}", req.service_user, req.service_group))
+                .arg(path)
+                .status();
+        }
+    } else {
+        for runtime in ["secretspec.toml", ".env"] {
+            let p = req.vault.join(runtime);
+            if !p.is_file() || p.is_symlink() {
+                return Err(InstallError::Denied(format!(
+                    "adopted runtime file missing or symlinked: {}",
+                    p.display()
+                )));
+            }
+        }
+    }
+
+    // Snapshot directory for future rollback of artifacts (not vault values).
+    let stamp = chrono_like_stamp();
+    let rollback = PathBuf::from(PREFIX)
+        .join("libexec")
+        .join(format!("sudo-secretspec-rollback-{stamp}"));
+    fs::create_dir_all(&rollback)?;
+    let mut rp = fs::metadata(&rollback)?.permissions();
+    rp.set_mode(0o700);
+    fs::set_permissions(&rollback, rp)?;
+
+    println!("installed sudo-secretspec");
+    println!("config={}", config_dst.display());
+    println!("vault={}", req.vault.display());
+    println!("rollback_snapshot={}", rollback.display());
+    if created_vault {
+        println!("created_vault=1");
+    }
+    Ok(())
+}
+
+fn chrono_like_stamp() -> String {
+    // UTC-ish timestamp without extra deps.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs}")
+}
