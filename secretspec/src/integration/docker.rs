@@ -1,9 +1,10 @@
-use crate::{GlobalConfig, NamedResolution, Secrets};
+use crate::{Config, GlobalConfig, NamedResolution, Secrets};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use url::{Host, Url};
 
@@ -11,22 +12,40 @@ pub(crate) const HELPER_NAME: &str = "secretspec";
 pub(crate) const STATE_VERSION: u8 = 1;
 const MAX_INPUT_BYTES: u64 = 1_048_576;
 const NOT_FOUND: &str = "credentials not found in native keychain";
+const EMBEDDED_MANIFEST: &str = include_str!("docker-credentials.toml");
+pub(crate) const EMBEDDED_PASSWORD: &str = "PASSWORD";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ManagedCredential {
     pub(crate) registry: String,
     pub(crate) docker_config: PathBuf,
-    pub(crate) manifest: PathBuf,
-    pub(crate) profile: String,
     pub(crate) provider: Option<String>,
     pub(crate) reason: Option<String>,
-    pub(crate) username: UsernameSource,
-    pub(crate) password_secret: String,
+    pub(crate) source: CredentialSource,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "source", content = "value")]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
+pub(crate) enum CredentialSource {
+    Embedded {
+        username: String,
+    },
+    Manifest {
+        manifest: PathBuf,
+        profile: String,
+        username: UsernameSource,
+        password_secret: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "snake_case",
+    tag = "source",
+    content = "value"
+)]
 pub(crate) enum UsernameSource {
     Literal(String),
     Secret(String),
@@ -76,11 +95,7 @@ pub(crate) fn load_state() -> Result<ManagedState, String> {
     for credential in &state.credentials {
         if canonical_registry(&credential.registry).as_deref() != Ok(&credential.registry)
             || !credential.docker_config.is_absolute()
-            || !credential.manifest.is_absolute()
-            || credential.profile.is_empty()
-            || credential.password_secret.is_empty()
-            || matches!(&credential.username, UsernameSource::Literal(username) if !valid_username(username))
-            || matches!(&credential.username, UsernameSource::Secret(secret) if secret.is_empty())
+            || !valid_source(&credential.source)
         {
             return Err(format!(
                 "Invalid entry in Docker credential configuration {}",
@@ -97,6 +112,26 @@ pub(crate) fn load_state() -> Result<ManagedState, String> {
     Ok(state)
 }
 
+fn valid_source(source: &CredentialSource) -> bool {
+    match source {
+        CredentialSource::Embedded { username } => valid_username(username),
+        CredentialSource::Manifest {
+            manifest,
+            profile,
+            username,
+            password_secret,
+        } => {
+            manifest.is_absolute()
+                && !profile.is_empty()
+                && !password_secret.is_empty()
+                && match username {
+                    UsernameSource::Literal(username) => valid_username(username),
+                    UsernameSource::Secret(secret) => !secret.is_empty(),
+                }
+        }
+    }
+}
+
 pub(crate) fn canonical_registry(input: &str) -> Result<String, String> {
     let input = input.trim();
     if input.is_empty() {
@@ -108,8 +143,14 @@ pub(crate) fn canonical_registry(input: &str) -> Result<String, String> {
     if matches!(
         input.trim_end_matches('/').to_ascii_lowercase().as_str(),
         "docker.io"
+            | "http://docker.io"
+            | "https://docker.io"
             | "index.docker.io"
+            | "http://index.docker.io"
+            | "https://index.docker.io"
             | "registry-1.docker.io"
+            | "http://registry-1.docker.io"
+            | "https://registry-1.docker.io"
             | "https://index.docker.io/v1"
             | "http://index.docker.io/v1"
     ) {
@@ -163,6 +204,31 @@ pub(crate) fn canonical_registry(input: &str) -> Result<String, String> {
     })
 }
 
+fn embedded_project_name(registry: &str) -> String {
+    let digest = Sha256::digest(registry.as_bytes());
+    format!(
+        "docker-credential-{}",
+        data_encoding::HEXLOWER.encode(&digest)
+    )
+}
+
+pub(crate) fn load_embedded_docker_credentials(registry: &str) -> Result<Secrets, String> {
+    let registry = canonical_registry(registry)?;
+    let mut config: Config =
+        toml::from_str(EMBEDDED_MANIFEST).map_err(|error| error.to_string())?;
+    config.project.name = embedded_project_name(&registry);
+    let config_path = GlobalConfig::path().map_err(|error| error.to_string())?;
+    let config_dir = config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "SecretSpec config path has no parent directory".to_string())?;
+    let mut secrets =
+        Secrets::load_config(config, config_dir).map_err(|error| error.to_string())?;
+    secrets.set_profile("default");
+    secrets.set_ignore_ambient_scope(true);
+    Ok(secrets)
+}
+
 fn read_input(mut input: impl Read) -> Result<String, String> {
     let mut bytes = Vec::new();
     input
@@ -205,9 +271,23 @@ fn resolve_secret(secrets: &Secrets, name: &str) -> Result<Option<SecretString>,
 }
 
 fn resolve(credential: &ManagedCredential) -> Result<Option<(String, SecretString)>, String> {
-    let mut secrets =
-        Secrets::load_from(&credential.manifest).map_err(|error| error.to_string())?;
-    secrets.set_profile(&credential.profile);
+    let (mut secrets, username, password_secret) = match &credential.source {
+        CredentialSource::Embedded { username } => (
+            load_embedded_docker_credentials(&credential.registry)?,
+            UsernameSource::Literal(username.clone()),
+            EMBEDDED_PASSWORD,
+        ),
+        CredentialSource::Manifest {
+            manifest,
+            profile,
+            username,
+            password_secret,
+        } => {
+            let mut secrets = Secrets::load_from(manifest).map_err(|error| error.to_string())?;
+            secrets.set_profile(profile);
+            (secrets, username.clone(), password_secret.as_str())
+        }
+    };
     if let Some(provider) = &credential.provider {
         secrets.set_provider(provider);
     }
@@ -216,13 +296,13 @@ fn resolve(credential: &ManagedCredential) -> Result<Option<(String, SecretStrin
     }
     secrets.set_ignore_ambient_scope(true);
 
-    let Some(password) = resolve_secret(&secrets, &credential.password_secret)? else {
+    let Some(password) = resolve_secret(&secrets, password_secret)? else {
         return Ok(None);
     };
-    let username = match &credential.username {
-        UsernameSource::Literal(username) => username.clone(),
+    let username = match username {
+        UsernameSource::Literal(username) => username,
         UsernameSource::Secret(name) => {
-            let Some(username) = resolve_secret(&secrets, name)? else {
+            let Some(username) = resolve_secret(&secrets, &name)? else {
                 return Ok(None);
             };
             username.expose_secret().to_string()
@@ -283,15 +363,15 @@ pub fn main() -> ExitCode {
         .next()
         .unwrap_or_else(|| "docker-credential-secretspec".to_string());
     let Some(operation) = arguments.next() else {
-        println!("Usage: {program} <store|get|erase>");
+        println!("Usage: {program} <store|get|erase|list>");
         return ExitCode::FAILURE;
     };
     if arguments.next().is_some() {
-        println!("Usage: {program} <store|get|erase>");
+        println!("Usage: {program} <store|get|erase|list>");
         return ExitCode::FAILURE;
     }
     if matches!(operation.as_str(), "--help" | "-h") {
-        println!("Usage: {program} <store|get|erase>");
+        println!("Usage: {program} <store|get|erase|list>");
         return ExitCode::SUCCESS;
     }
     if matches!(operation.as_str(), "--version" | "-v") {
@@ -317,8 +397,11 @@ mod tests {
     fn canonicalizes_docker_hub_and_registry_hosts() {
         for registry in [
             "docker.io",
+            "https://docker.io/",
             "index.docker.io",
+            "http://index.docker.io/",
             "registry-1.docker.io",
+            "https://registry-1.docker.io/",
             "https://index.docker.io/v1/",
         ] {
             assert_eq!(
@@ -383,12 +466,14 @@ DOCKER_TOKEN = { description = "Docker token", default = "token=value", provider
         let credential = ManagedCredential {
             registry: "ghcr.io".to_string(),
             docker_config: directory.path().join("docker/config.json"),
-            manifest,
-            profile: "default".to_string(),
             provider: None,
             reason: None,
-            username: UsernameSource::Secret("DOCKER_USERNAME".to_string()),
-            password_secret: "DOCKER_TOKEN".to_string(),
+            source: CredentialSource::Manifest {
+                manifest,
+                profile: "default".to_string(),
+                username: UsernameSource::Secret("DOCKER_USERNAME".to_string()),
+                password_secret: "DOCKER_TOKEN".to_string(),
+            },
         };
         let resolved = resolve(&credential).unwrap().unwrap();
         assert_eq!(resolved.0, "registry-user");

@@ -3,21 +3,90 @@ title: Docker credentials
 description: Let Docker retrieve registry credentials through SecretSpec providers
 ---
 
-The Docker credential helper is available in SecretSpec 0.20+. It lets ordinary
-`docker pull`, `docker push`, `docker build`, and Docker Compose operations
-retrieve registry credentials from any SecretSpec provider.
+The Docker credential integration is available in SecretSpec 0.20+. It lets
+`docker pull`, `docker push`, `docker build`, and Docker Compose retrieve
+registry credentials from any SecretSpec provider without copying the
+password or token into Docker's `config.json`.
 
-Use it when a registry token already lives in a provider such as 1Password,
-Bitwarden, or Vault and you do not want Docker to copy it into its own
-credential store or `config.json`.
+## Quick start
 
-## Prerequisites
+Configure the registry with its non-secret username:
 
-- Docker CLI or another client that supports Docker credential helpers
-- SecretSpec 0.20 or newer, including `docker-credential-secretspec` on `PATH`
-- A SecretSpec manifest that declares the registry token
+::::danger[This changes your Docker configuration]
+Docker has no repository-local configuration. `configure` updates
+`$DOCKER_CONFIG/config.json` when `DOCKER_CONFIG` is set, or the user-level
+`~/.docker/config.json` (`%USERPROFILE%\.docker\config.json` on Windows)
+otherwise. The change applies to every Docker command using that configuration.
+SecretSpec preserves unrelated settings and refuses to replace another helper.
+Undo it with `secretspec docker unconfigure --registry ghcr.io`.
+::::
 
-For example:
+```bash
+$ secretspec docker configure --registry ghcr.io --username YOUR_USERNAME
+```
+
+After confirmation, the command prints the matching login command:
+
+```console
+Configured Docker credential for ghcr.io.
+Docker configuration: /home/you/.docker/config.json
+Store the credential with: secretspec docker login 'ghcr.io'
+Undo with: secretspec docker unconfigure --registry 'ghcr.io'
+```
+
+Store the password or access token in SecretSpec's embedded, registry-isolated
+credential store:
+
+```bash
+$ secretspec docker login ghcr.io
+```
+
+Docker now invokes `docker-credential-secretspec get` automatically:
+
+```bash
+$ docker pull ghcr.io/OWNER/IMAGE:TAG
+$ docker push ghcr.io/OWNER/IMAGE:TAG
+```
+
+`configure` does not retrieve or store the credential. It adds the registry's
+`credHelpers` entry and records only the registry, username, provider selection,
+and other value-free metadata. `login` prompts for the secret and stores it
+through the selected provider. Each registry has a separate SecretSpec project
+identity, so credentials cannot collide between registries.
+
+To use a provider other than your default, pass the same override to both
+commands. The follow-up command printed by `configure` includes it automatically:
+
+```bash
+$ secretspec docker configure \
+  --registry ghcr.io \
+  --username YOUR_USERNAME \
+  --provider onepassword
+$ secretspec docker login ghcr.io --provider onepassword
+```
+
+## Docker Hub
+
+Docker uses the historical key `https://index.docker.io/v1/` for Docker Hub.
+SecretSpec 0.20+ normalizes the familiar Docker Hub hostnames and URL forms to
+that key:
+
+```bash
+$ secretspec docker configure \
+  --registry docker.io \
+  --username YOUR_DOCKER_ID
+$ secretspec docker login docker.io
+```
+
+Registry addresses may contain a port, such as
+`registry.example.com:5000`, but not a repository path. Credentials are scoped
+to the registry rather than an image namespace.
+
+## Use a project manifest
+
+For a credential already declared by a project, pass `--file` to select the
+advanced custom-manifest mode. In this mode, `--token-secret` and either
+`--username` or `--username-secret` are required:
 
 ```toml
 [project]
@@ -28,87 +97,22 @@ revision = "1.0"
 GHCR_TOKEN = { description = "GitHub Container Registry token" }
 ```
 
-Store the token through the manifest's configured provider:
-
 ```bash
-$ secretspec set GHCR_TOKEN
-```
-
-## Configure a registry
-
-Keep a fixed username in SecretSpec's integration configuration and resolve the
-token from the provider:
-
-::::danger[This changes your Docker configuration]
-The command below updates the active Docker `config.json`, normally
-`~/.docker/config.json` (or `%USERPROFILE%\.docker\config.json` on Windows), for
-every Docker command run by your user. Review the registry and manifest path
-before confirming. To roll it back, run
-`secretspec docker unconfigure --registry ghcr.io`; see
-[Remove the configuration](#remove-the-configuration) for all removal options.
-::::
-
-```bash
-$ secretspec docker configure \
+$ secretspec --file secretspec.toml docker configure \
   --registry ghcr.io \
   --token-secret GHCR_TOKEN \
   --username YOUR_USERNAME
 ```
 
-The command validates the registry and secret declaration without retrieving
-the token. It records the manifest's absolute path and resolved profile, then
-sets the registry's Docker `credHelpers` entry to `secretspec`. The default
-credential store, other registry helpers, existing `auths`, and unrelated
-Docker settings remain untouched.
+To resolve the username from SecretSpec too, declare it and replace
+`--username` with `--username-secret GHCR_USERNAME`. Custom-manifest mode also
+accepts `--profile` and `--provider`.
 
-Docker configuration stores only the helper name. In its user configuration
-directory, SecretSpec separately stores the manifest path, profile, provider
-override, reason, secret names, and any literal username needed to invoke the
-helper, but never resolved secret values. If you move or delete the manifest,
-run `secretspec docker configure` again for the affected registry.
-
-To retrieve the username from a SecretSpec provider as well, declare it and use
-`--username-secret` instead of `--username`:
-
-```bash
-$ secretspec docker configure \
-  --registry ghcr.io \
-  --token-secret GHCR_TOKEN \
-  --username-secret GHCR_USERNAME
-```
-
-Configuration changes prompt with a default of **No**. Pass `--yes` only for
-non-interactive setup. You can also select a profile or provider with
-`--profile` or `--provider`; the corresponding SecretSpec environment variables
-are supported.
-
-Docker invokes `docker-credential-secretspec get` automatically when it needs
-the credential:
-
-```bash
-$ docker pull ghcr.io/OWNER/IMAGE:TAG
-$ docker push ghcr.io/OWNER/IMAGE:TAG
-```
-
-You do not need to run `docker login`: configuring the helper replaces the need
-to copy a credential into Docker's store.
-
-## Docker Hub
-
-Docker uses the historical key `https://index.docker.io/v1/` for Docker Hub
-credentials. SecretSpec accepts the familiar aliases and stores the canonical
-key, so this is sufficient:
-
-```bash
-$ secretspec docker configure \
-  --registry docker.io \
-  --token-secret DOCKER_HUB_TOKEN \
-  --username YOUR_DOCKER_ID
-```
-
-Registry addresses may contain a port, such as `registry.example.com:5000`, but
-not a repository path. Configure credentials per registry rather than per image
-namespace.
+The managed state records the manifest's absolute path and resolved profile,
+but never resolved secret values. If the manifest moves, rerun `configure` for
+the affected registry. Manage custom-manifest values with `secretspec set` and
+`secretspec delete`; `secretspec docker login` and `logout` intentionally manage
+only the embedded store.
 
 ## Alternate Docker configuration directory
 
@@ -119,38 +123,51 @@ Docker CLI:
 $ DOCKER_CONFIG="$HOME/.config/docker-work" \
   secretspec docker configure \
     --registry registry.example.com \
-    --token-secret REGISTRY_TOKEN \
     --username YOUR_USERNAME
 ```
 
-Use the same `DOCKER_CONFIG` value when removing entries from that file.
+Use the same `DOCKER_CONFIG` value when unconfiguring entries from that file.
 
-## Remove the configuration
+## Remove credentials and configuration
 
-Remove one registry from the active Docker configuration:
+Remove an embedded secret without changing Docker's helper configuration:
+
+```bash
+$ secretspec docker logout ghcr.io
+```
+
+Pass the same `--provider` used for login when it was explicitly overridden.
+
+Remove one helper registration from the active Docker configuration:
 
 ```bash
 $ secretspec docker unconfigure --registry ghcr.io
 ```
 
-Remove every Docker credential that SecretSpec configured in that file:
+Remove every Docker credential helper registration that SecretSpec owns in
+that file:
 
 ```bash
 $ secretspec docker unconfigure --all
 ```
 
-Removal also prompts with a default of **No** and accepts `--yes` for
-non-interactive use. SecretSpec removes only entries it recorded. If a managed
-entry was changed or removed outside SecretSpec, the command refuses to modify
-its state and asks you to inspect the files manually.
+Configuration changes prompt with a default of **No**. Pass `--yes` for
+non-interactive setup or removal. SecretSpec preserves the default credential
+store, other registry helpers, existing `auths`, and unrelated Docker options.
+If a managed entry changes outside SecretSpec, `unconfigure` refuses to modify
+it.
 
-## Read-only behavior
+`logout` and `unconfigure` are independent: logout deletes the embedded secret,
+while unconfigure removes Docker's reference to the helper. This matches the
+separation between `login` and `configure`.
 
-In SecretSpec 0.20+, the helper answers only Docker's `get` operation. It rejects
-`store` and `erase`, so `docker login` and `docker logout` cannot overwrite or
-delete a value in a shared provider. Manage values explicitly with
-`secretspec set` and `secretspec delete`, and manage helper registration with
-`secretspec docker configure` and `unconfigure`.
+## Read-only helper behavior
+
+In SecretSpec 0.20+, `docker-credential-secretspec` answers Docker's `get`
+operation. It rejects `store`, `erase`, and `list`, so Docker's own
+`docker login` and `docker logout` cannot overwrite or delete values in a shared
+provider. Use `secretspec docker login` and `secretspec docker logout` for the
+embedded store, or normal SecretSpec commands for a custom manifest.
 
 When no matching configuration or stored value exists, the helper returns
 Docker's standard credential-not-found response.

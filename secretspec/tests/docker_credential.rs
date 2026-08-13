@@ -56,6 +56,7 @@ DOCKER_TOKEN = { description = "Docker token", default = "token=value", provider
 
     fn apply_environment(&self, command: &mut Command) {
         command
+            .current_dir(&self.root)
             .env("HOME", &self.root)
             .env("USERPROFILE", &self.root)
             .env("XDG_CONFIG_HOME", self.root.join("config"))
@@ -72,6 +73,12 @@ DOCKER_TOKEN = { description = "Docker token", default = "token=value", provider
     fn secretspec(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_secretspec"));
         command.arg("--file").arg(&self.manifest);
+        self.apply_environment(&mut command);
+        command
+    }
+
+    fn embedded_secretspec(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_secretspec"));
         self.apply_environment(&mut command);
         command
     }
@@ -107,6 +114,18 @@ DOCKER_TOKEN = { description = "Docker token", default = "token=value", provider
             .output()
             .unwrap()
     }
+}
+
+fn command_with_stdin(mut command: Command, args: &[&str], input: &[u8]) -> Output {
+    let mut child = command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
 }
 
 fn assert_success(context: &str, output: &Output) {
@@ -156,6 +175,124 @@ fn configure_get_and_unconfigure_preserve_docker_configuration() {
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
         "credentials not found in native keychain"
+    );
+}
+
+#[test]
+fn embedded_credentials_ignore_the_cwd_manifest_and_isolate_each_registry() {
+    let fixture = Fixture::new();
+    let store = fixture.root.join("docker-credential-store");
+    let provider = format!("file://{}", store.display());
+
+    let output = fixture
+        .embedded_secretspec()
+        .args([
+            "docker",
+            "configure",
+            "--registry",
+            "ghcr.io",
+            "--username",
+            "github-user",
+            "--provider",
+            &provider,
+            "--yes",
+        ])
+        .output()
+        .unwrap();
+    assert_success("embedded GHCR configure", &output);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("secretspec docker login 'ghcr.io'"));
+    assert!(!stdout.contains("SecretSpec manifest:"));
+
+    let output = command_with_stdin(
+        fixture.embedded_secretspec(),
+        &["docker", "login", "ghcr.io", "--provider", &provider],
+        b"github-token\n",
+    );
+    assert_success("embedded GHCR login", &output);
+
+    let output = fixture
+        .embedded_secretspec()
+        .args([
+            "docker",
+            "configure",
+            "--registry",
+            "registry.example.com:5000",
+            "--username",
+            "private-user",
+            "--provider",
+            &provider,
+            "--yes",
+        ])
+        .output()
+        .unwrap();
+    assert_success("embedded private registry configure", &output);
+    let output = command_with_stdin(
+        fixture.embedded_secretspec(),
+        &[
+            "docker",
+            "login",
+            "registry.example.com:5000",
+            "--provider",
+            &provider,
+        ],
+        b"private-token\n",
+    );
+    assert_success("embedded private registry login", &output);
+
+    let github = fixture.helper("get", b"ghcr.io\n");
+    assert_success("embedded GHCR get", &github);
+    let github: Value = serde_json::from_slice(&github.stdout).unwrap();
+    assert_eq!(github["Username"], "github-user");
+    assert_eq!(github["Secret"], "github-token");
+
+    let private = fixture.helper("get", b"registry.example.com:5000\n");
+    assert_success("embedded private registry get", &private);
+    let private: Value = serde_json::from_slice(&private.stdout).unwrap();
+    assert_eq!(private["Username"], "private-user");
+    assert_eq!(private["Secret"], "private-token");
+
+    let output = fixture
+        .embedded_secretspec()
+        .args(["docker", "logout", "ghcr.io", "--provider", &provider])
+        .output()
+        .unwrap();
+    assert_success("embedded GHCR logout", &output);
+    assert!(!fixture.helper("get", b"ghcr.io\n").status.success());
+    let private = fixture.helper("get", b"registry.example.com:5000\n");
+    assert_success("private registry remains after GHCR logout", &private);
+}
+
+#[test]
+fn embedded_and_custom_manifest_options_cannot_be_mixed() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .embedded_secretspec()
+        .args([
+            "docker",
+            "configure",
+            "--registry",
+            "ghcr.io",
+            "--username",
+            "registry-user",
+            "--token-secret",
+            "DOCKER_TOKEN",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--token-secret") && stderr.contains("require --file"));
+
+    let output = fixture
+        .secretspec()
+        .args(["docker", "login", "ghcr.io"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("manages the embedded Docker credential store")
     );
 }
 

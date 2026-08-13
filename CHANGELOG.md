@@ -26,7 +26,9 @@ as in 0.19.0.
 - A read-only `docker-credential-secretspec` helper lets Docker retrieve
   registry usernames and tokens through any SecretSpec provider.
   `secretspec docker configure` and `unconfigure` safely manage per-registry
-  Docker credential-helper settings without replacing existing helpers (0.20+).
+  Docker credential-helper settings without replacing existing helpers, while
+  `secretspec docker login` and `logout` manage isolated embedded credentials;
+  custom manifests remain available through `--file` (0.20+).
 
 ### Fixed
 

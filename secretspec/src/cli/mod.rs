@@ -20,7 +20,7 @@ mod docker;
 #[command(about = "A declarative interface for every secret provider. https://secretspec.dev", long_about = None)]
 #[command(version)]
 struct Cli {
-    /// Path to secretspec.toml (default: auto-detect by walking up from current directory)
+    /// Explicit secretspec.toml path (default: auto-detect for manifest commands)
     #[arg(short = 'f', long, global = true, env = "SECRETSPEC_FILE")]
     file: Option<PathBuf>,
 

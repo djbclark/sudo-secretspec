@@ -1,8 +1,8 @@
-use super::load_secrets;
+use super::{load_secrets, shell_quote};
 use crate::Secrets;
 use crate::integration::docker::{
-    HELPER_NAME, ManagedCredential, UsernameSource, canonical_registry, load_state, state_path,
-    valid_username,
+    CredentialSource, EMBEDDED_PASSWORD, HELPER_NAME, ManagedCredential, UsernameSource,
+    canonical_registry, load_embedded_docker_credentials, load_state, state_path, valid_username,
 };
 use clap::Subcommand;
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
@@ -22,27 +22,25 @@ pub(super) enum DockerAction {
     Configure {
         #[arg(long, help = "Registry hostname, optionally including a port")]
         registry: String,
-        #[arg(long, help = "SecretSpec key containing the password or token")]
-        token_secret: String,
+        #[arg(long, help = "Custom manifest key containing the password or token")]
+        token_secret: Option<String>,
         #[arg(
             long,
-            required_unless_present = "username_secret",
             conflicts_with = "username_secret",
-            help = "Non-secret username to store in the SecretSpec integration configuration"
+            help = "Non-secret username to store in the managed Docker configuration"
         )]
         username: Option<String>,
         #[arg(
             long,
-            required_unless_present = "username",
             conflicts_with = "username",
-            help = "SecretSpec key containing the username"
+            help = "Custom manifest key containing the username"
         )]
         username_secret: Option<String>,
         #[arg(
             short = 'P',
             long,
             env = "SECRETSPEC_PROFILE",
-            help = "SecretSpec profile the helper should use"
+            help = "Custom manifest profile the helper should use"
         )]
         profile: Option<String>,
         #[arg(
@@ -58,6 +56,34 @@ pub(super) enum DockerAction {
             help = "Confirm the Docker configuration change non-interactively"
         )]
         yes: bool,
+    },
+    #[command(
+        about = "Store a Docker registry credential in the embedded SecretSpec store (0.20+)"
+    )]
+    Login {
+        #[arg(help = "Registry hostname, optionally including a port")]
+        registry: String,
+        #[arg(
+            short,
+            long,
+            env = "SECRETSPEC_PROVIDER",
+            help = "Provider override to store the credential in"
+        )]
+        provider: Option<String>,
+    },
+    #[command(
+        about = "Remove a Docker registry credential from the embedded SecretSpec store (0.20+)"
+    )]
+    Logout {
+        #[arg(help = "Registry hostname, optionally including a port")]
+        registry: String,
+        #[arg(
+            short,
+            long,
+            env = "SECRETSPEC_PROVIDER",
+            help = "Provider override to remove the credential from"
+        )]
+        provider: Option<String>,
     },
     #[command(about = "Remove Docker credential configuration managed by SecretSpec (0.20+)")]
     Unconfigure {
@@ -104,13 +130,15 @@ pub(super) fn run(
             file,
             reason,
         }),
+        DockerAction::Login { registry, provider } => login(registry, provider, file, reason),
+        DockerAction::Logout { registry, provider } => logout(registry, provider, file, reason),
         DockerAction::Unconfigure { registry, all, yes } => unconfigure(registry, all, yes),
     }
 }
 
 struct ConfigureOptions<'a> {
     registry: String,
-    token_secret: String,
+    token_secret: Option<String>,
     username: Option<String>,
     username_secret: Option<String>,
     profile: Option<String>,
@@ -122,28 +150,64 @@ struct ConfigureOptions<'a> {
 
 fn configure(options: ConfigureOptions<'_>) -> Result<()> {
     let registry = canonical_registry(&options.registry).map_err(|error| miette!(error))?;
-    let username = match (options.username, options.username_secret) {
-        (Some(username), None) => {
-            validate_literal_username(&username)?;
-            UsernameSource::Literal(username)
+    let (mut secrets, source, manifest) = if options.file.is_some() {
+        let token_secret = options.token_secret.as_deref().ok_or_else(|| {
+            miette!("--token-secret is required when --file selects a custom manifest")
+        })?;
+        let username = match (options.username, options.username_secret) {
+            (Some(username), None) => {
+                validate_literal_username(&username)?;
+                UsernameSource::Literal(username)
+            }
+            (None, Some(secret)) => UsernameSource::Secret(secret),
+            (None, None) => {
+                return Err(miette!(
+                    "--username or --username-secret is required when --file selects a custom manifest"
+                ));
+            }
+            (Some(_), Some(_)) => unreachable!("clap rejects conflicting username options"),
+        };
+        let manifest = manifest_path(options.file)?;
+        let mut secrets = load_secrets(options.file, options.reason)?;
+        if let Some(profile) = &options.profile {
+            secrets.set_profile(profile);
         }
-        (None, Some(secret)) => UsernameSource::Secret(secret),
-        (None, None) => unreachable!("clap requires a username option"),
-        (Some(_), Some(_)) => unreachable!("clap rejects conflicting username options"),
+        let profile = secrets.resolve_profile_name(None);
+        validate_secret(&secrets, token_secret, &profile)?;
+        if let UsernameSource::Secret(secret) = &username {
+            validate_secret(&secrets, secret, &profile)?;
+        }
+        (
+            secrets,
+            CredentialSource::Manifest {
+                manifest: manifest.clone(),
+                profile,
+                username,
+                password_secret: token_secret.to_string(),
+            },
+            Some(manifest),
+        )
+    } else {
+        if options.token_secret.is_some()
+            || options.username_secret.is_some()
+            || options.profile.is_some()
+        {
+            return Err(miette!(
+                "--token-secret, --username-secret, and --profile require --file; the embedded Docker credential store uses PASSWORD and the default profile"
+            ));
+        }
+        let username = options.username.ok_or_else(|| {
+            miette!("--username is required when using the embedded Docker credential store")
+        })?;
+        validate_literal_username(&username)?;
+        (
+            load_embedded_docker_credentials(&registry).map_err(|error| miette!(error))?,
+            CredentialSource::Embedded { username },
+            None,
+        )
     };
-
-    let manifest = manifest_path(options.file)?;
-    let mut secrets = load_secrets(options.file, options.reason)?;
-    if let Some(profile) = &options.profile {
-        secrets.set_profile(profile);
-    }
     if let Some(provider) = &options.provider {
         secrets.set_provider(provider);
-    }
-    let profile = secrets.resolve_profile_name(None);
-    validate_secret(&secrets, &options.token_secret, &profile)?;
-    if let UsernameSource::Secret(secret) = &username {
-        validate_secret(&secrets, secret, &profile)?;
     }
 
     let docker_config = docker_config_path()?;
@@ -181,12 +245,9 @@ fn configure(options: ConfigureOptions<'_>) -> Result<()> {
     let credential = ManagedCredential {
         registry: registry.clone(),
         docker_config: docker_config.clone(),
-        manifest,
-        profile,
-        provider: options.provider,
+        provider: options.provider.clone(),
         reason: options.reason.clone(),
-        username,
-        password_secret: options.token_secret,
+        source,
     };
     let state_changed = match existing_index {
         Some(index) if state.credentials[index] == credential => false,
@@ -225,7 +286,84 @@ fn configure(options: ConfigureOptions<'_>) -> Result<()> {
 
     println!("Configured Docker credential for {registry}.");
     println!("Docker configuration: {}", docker_config.display());
-    println!("Undo with: secretspec docker unconfigure --registry {registry}");
+    if let Some(manifest) = manifest {
+        println!("SecretSpec manifest: {}", manifest.display());
+    } else {
+        let mut login = format!("secretspec docker login {}", shell_quote(&registry));
+        if let Some(provider) = options.provider.as_deref() {
+            login.push_str(" --provider ");
+            login.push_str(&shell_quote(provider));
+        }
+        println!("Store the credential with: {login}");
+    }
+    println!(
+        "Undo with: secretspec docker unconfigure --registry {}",
+        shell_quote(&registry)
+    );
+    Ok(())
+}
+
+fn embedded_cli_secrets(
+    registry: &str,
+    provider: Option<&str>,
+    file: &Option<PathBuf>,
+    reason: &Option<String>,
+    action: &str,
+) -> Result<Secrets> {
+    if file.is_some() {
+        return Err(miette!(
+            "secretspec docker {action} manages the embedded Docker credential store; omit --file and use secretspec set or delete for a custom manifest"
+        ));
+    }
+    let mut secrets = load_embedded_docker_credentials(registry).map_err(|error| miette!(error))?;
+    if let Some(provider) = provider {
+        secrets.set_provider(provider);
+    }
+    if let Some(reason) = reason {
+        secrets = secrets.with_reason(reason.clone());
+    }
+    secrets.set_write_target_reporter(|target| {
+        eprintln!(
+            "Writing secret '{}' to {} (profile: {})\n  target: {}",
+            target.name, target.provider_uri, target.profile, target.target
+        );
+    });
+    Ok(secrets)
+}
+
+fn login(
+    registry: String,
+    provider: Option<String>,
+    file: &Option<PathBuf>,
+    reason: &Option<String>,
+) -> Result<()> {
+    let registry = canonical_registry(&registry).map_err(|error| miette!(error))?;
+    let secrets = embedded_cli_secrets(&registry, provider.as_deref(), file, reason, "login")?;
+    secrets
+        .set(EMBEDDED_PASSWORD, None)
+        .into_diagnostic()
+        .wrap_err("Failed to store Docker password or token")?;
+    println!("Stored Docker credential for {registry}.");
+    Ok(())
+}
+
+fn logout(
+    registry: String,
+    provider: Option<String>,
+    file: &Option<PathBuf>,
+    reason: &Option<String>,
+) -> Result<()> {
+    let registry = canonical_registry(&registry).map_err(|error| miette!(error))?;
+    let secrets = embedded_cli_secrets(&registry, provider.as_deref(), file, reason, "logout")?;
+    if secrets
+        .delete(EMBEDDED_PASSWORD)
+        .into_diagnostic()
+        .wrap_err("Failed to remove Docker password or token")?
+    {
+        println!("Removed stored Docker credential for {registry}.");
+    } else {
+        println!("No stored Docker credential for {registry} was found.");
+    }
     Ok(())
 }
 
@@ -339,7 +477,7 @@ fn manifest_path(file: &Option<PathBuf>) -> Result<PathBuf> {
         Some(path) => path.clone(),
         None => crate::secrets::find_config_file().into_diagnostic()?,
     };
-    fs::canonicalize(&path)
+    dunce::canonicalize(&path)
         .into_diagnostic()
         .wrap_err_with(|| format!("Failed to resolve SecretSpec manifest {}", path.display()))
 }
@@ -356,7 +494,7 @@ fn docker_config_path() -> Result<PathBuf> {
         .into_diagnostic()
         .wrap_err("Failed to resolve Docker configuration path")?;
     match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(&path)
+        Ok(metadata) if metadata.file_type().is_symlink() => dunce::canonicalize(&path)
             .into_diagnostic()
             .wrap_err_with(|| format!("Failed to resolve Docker configuration {}", path.display())),
         Ok(_) => Ok(path),
@@ -551,6 +689,8 @@ fn restore_file(path: &Path, contents: Option<&[u8]>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use tempfile::TempDir;
 
     #[test]
     fn preserves_unrelated_docker_configuration() {
@@ -579,5 +719,15 @@ mod tests {
     fn rejects_invalid_credential_helpers_shape() {
         let config = serde_json::json!({"credHelpers": []});
         assert!(credential_helper(&config, "ghcr.io").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn manifest_path_avoids_a_windows_verbatim_prefix() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("secretspec.toml");
+        fs::write(&path, "").unwrap();
+        let resolved = manifest_path(&Some(path)).unwrap();
+        assert!(!resolved.to_string_lossy().starts_with(r"\\?\"));
     }
 }

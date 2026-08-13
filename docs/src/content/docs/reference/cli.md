@@ -207,28 +207,51 @@ A read-only source provider is rejected. An alias that declares no credentials r
 Configure Docker to retrieve credentials for one registry through SecretSpec.
 
 ```bash
-$ secretspec docker configure --registry <REGISTRY> --token-secret <KEY> [OPTIONS]
+$ secretspec docker configure --registry <REGISTRY> --username <USERNAME> [OPTIONS]
 ```
 
 **Options:**
 
 - `--registry <REGISTRY>` - Registry hostname, optionally including a port;
   Docker Hub aliases are normalized to Docker's canonical registry key
-- `--token-secret <KEY>` - Declared SecretSpec key containing the password or
-  access token
-- `--username <USERNAME>` - Required unless `--username-secret` is used;
-  non-secret username to keep in SecretSpec's managed integration configuration
-- `--username-secret <KEY>` - Declared SecretSpec key containing the username;
-  required unless `--username` is used
-- `-P, --profile <PROFILE>` - Profile the helper should use
+- `--username <USERNAME>` - Non-secret registry username; required for the
+  embedded store, or as an alternative to `--username-secret` with `--file`
+- `--token-secret <KEY>` - Custom manifest key containing the password or
+  access token; requires `--file`
+- `--username-secret <KEY>` - Custom manifest key containing the username;
+  requires `--file` and conflicts with `--username`
+- `-P, --profile <PROFILE>` - Custom manifest profile; requires `--file`
 - `-p, --provider <PROVIDER>` - Provider override the helper should use
 - `-y, --yes` - Confirm the Docker configuration change non-interactively
 
-The command records the manifest's absolute path and resolved profile, then
-adds a registry-specific `credHelpers` entry to Docker's `config.json`. It
-prompts with a default of **No** and refuses to replace an existing helper.
-See [Docker credentials](/integrations/docker/) for setup examples and the
-ownership model.
+Without `--file`, the command configures the embedded registry-isolated store
+and prints the corresponding `secretspec docker login` command. With `--file`,
+`--token-secret` and either username option are required. The command adds a
+registry-specific `credHelpers` entry to Docker's `config.json`, prompts with a
+default of **No**, and refuses to replace an existing helper.
+
+### docker login (0.20+)
+
+Store a password or token in the embedded Docker credential store:
+
+```bash
+$ secretspec docker login <REGISTRY> [--provider <PROVIDER>]
+```
+
+The registry is normalized exactly as it is for `configure`. Each registry is
+stored under a separate SecretSpec project identity. This command rejects
+`--file`; use `secretspec set` for custom-manifest credentials.
+
+### docker logout (0.20+)
+
+Remove a password or token from the embedded Docker credential store:
+
+```bash
+$ secretspec docker logout <REGISTRY> [--provider <PROVIDER>]
+```
+
+Use the same provider override supplied to `login`. This does not remove the
+Docker helper registration; use `unconfigure` for that.
 
 ### docker unconfigure (0.20+)
 
@@ -243,6 +266,8 @@ $ secretspec docker unconfigure --all
 Use `--yes` to confirm the change non-interactively. `--all` removes only
 entries SecretSpec owns; it preserves the default credential store, other
 registry helpers, stored authentication entries, and unrelated Docker options.
+See [Docker credentials](/integrations/docker/) for complete setup, custom
+manifest, and ownership details.
 
 ### check
 Check if all required secrets are available, with interactive prompting for missing secrets.
