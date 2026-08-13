@@ -384,12 +384,7 @@ impl Provider for DotEnvProvider {
         self.check_writable(addr)
     }
 
-    fn reflect(
-        &self,
-        _context: DiscoveryContext<'_>,
-    ) -> Result<HashMap<String, crate::config::Secret>> {
-        use crate::config::Secret;
-
+    fn reflect(&self, _context: DiscoveryContext<'_>) -> Result<HashMap<String, crate::Secret>> {
         if !self.config.path.exists() {
             return Ok(HashMap::new());
         }
@@ -411,11 +406,7 @@ impl Provider for DotEnvProvider {
             let (key, _value) = item?;
             secrets.insert(
                 key.clone(),
-                Secret {
-                    description: Some(format!("{} secret", key)),
-                    required: Some(true),
-                    ..Default::default()
-                },
+                crate::Secret::required(format!("{} secret", key)),
             );
         }
 
@@ -562,12 +553,8 @@ mod tests {
         assert!(secrets.contains_key("DATABASE_URL"));
 
         let api_key_config = &secrets["API_KEY"];
-        assert_eq!(
-            api_key_config.description,
-            Some("API_KEY secret".to_string())
-        );
-        assert_eq!(api_key_config.required, Some(true));
-        assert!(api_key_config.default.is_none());
+        assert_eq!(api_key_config.description(), "API_KEY secret");
+        assert_eq!(api_key_config.required_setting(), Some(true));
     }
 
     #[test]
