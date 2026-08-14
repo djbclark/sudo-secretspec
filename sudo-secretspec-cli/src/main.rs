@@ -584,6 +584,40 @@ fn run_uninstall(
     }
 }
 
+/// Hash the operator's reason before it crosses the privilege boundary.
+///
+/// The reason used to be passed to the broker as plaintext in argv, where
+/// `ps` and `KERN_PROCARGS2` expose it to every process running as the same
+/// user, and where it also lands in shell history — while the design's stated
+/// invariant is that only `SHA-256(reason)` is ever stored. Hashing here keeps
+/// the prose inside the unprivileged process that already had it.
+///
+/// The non-empty check stays on this side: it must not be possible to satisfy
+/// the gate by sending `SHA-256("")`, and the broker rejects that digest too.
+fn reason_digest_or_exit(reason: &str) -> String {
+    sudo_secretspec_cli::broker::reason_sha256(reason).unwrap_or_else(|| {
+        eprintln!("sudo-secretspec: --reason must not be empty");
+        std::process::exit(2);
+    })
+}
+
+/// Report a broker exit, adding a hint for the one confusing failure.
+fn exit_from_broker(code: i32) -> ! {
+    // The client and the broker are installed as a pair, but the Homebrew keg
+    // ships a bootstrap binary that can be newer than the installed broker. An
+    // older broker rejects `--reason-sha256` with clap's usage exit, which
+    // otherwise reads as an unexplained argument error. Deliberately *not* a
+    // retry with plaintext: falling back would hand an attacker who can
+    // downgrade the broker a way to get the prose back.
+    if code == 2 {
+        eprintln!(
+            "sudo-secretspec: if the broker reported an unexpected '--reason-sha256' argument,\n\
+             the installed boundary predates this client; re-run `sudo-secretspec install`"
+        );
+    }
+    std::process::exit(code);
+}
+
 fn lifecycle(op: &str, name: &str, reason: &str) {
     let mut cmd = Command::new(SUDO);
     cmd.arg("-n")
@@ -592,17 +626,19 @@ fn lifecycle(op: &str, name: &str, reason: &str) {
         .arg(format!("source-{op}"))
         .arg("--client")
         .arg(detect_client())
-        .arg("--reason")
-        .arg(reason);
+        .arg("--reason-sha256")
+        .arg(reason_digest_or_exit(reason));
     if !name.is_empty() {
         cmd.arg("--name").arg(name);
     }
+    // `status`, not `output`: `get` streams the secret value straight to the
+    // caller's stdout, and capturing it here would put a copy in this process.
     let status = cmd.status().unwrap_or_else(|e| {
         eprintln!("cannot invoke broker: {e}");
         std::process::exit(2);
     });
     if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+        exit_from_broker(status.code().unwrap_or(1));
     }
 }
 
@@ -639,8 +675,8 @@ fn run_target(reason: &str, command: &[OsString]) {
         .arg("source-export")
         .arg("--client")
         .arg(detect_client())
-        .arg("--reason")
-        .arg(reason)
+        .arg("--reason-sha256")
+        .arg(reason_digest_or_exit(reason))
         .arg("--command-basename")
         .arg(target[0].to_str().unwrap_or("unknown"))
         .output()
@@ -651,7 +687,7 @@ fn run_target(reason: &str, command: &[OsString]) {
 
     if !output.status.success() {
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
-        std::process::exit(output.status.code().unwrap_or(1));
+        exit_from_broker(output.status.code().unwrap_or(1));
     }
 
     let env: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {

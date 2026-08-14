@@ -77,6 +77,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SECRETSPEC_PROTONPASS_CLI_PATH`) name an executable it launches — as root.
   The purge is now a prefix rule, so a knob added upstream is covered the day
   it lands, and it runs before dispatch rather than partway through.
+- The reason for a credential operation is now hashed before it crosses the
+  privilege boundary, which is what the design always claimed. It was passed
+  to the broker as plaintext in `argv`, readable via `ps` and
+  `KERN_PROCARGS2` by every process running as the same user, and left in
+  shell history. `--reason` on the client is unchanged; only the internal
+  broker protocol moved to a digest. A side effect worth having: the engine's
+  own JSONL audit now records the same digest as the SQLite ledger, so the two
+  can be joined on it. A client newer than the installed broker fails with a
+  message pointing at `sudo-secretspec install` rather than falling back to
+  plaintext.
 - The manifest profile the broker resolves from is now recorded in the
   root-owned `/usr/local/etc/sudo-secretspec.toml` (new `profile` key,
   defaulting to `default`, settable with `sudo-secretspec install --profile`).

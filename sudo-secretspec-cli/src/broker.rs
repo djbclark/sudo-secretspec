@@ -41,8 +41,15 @@ pub(crate) struct Broker {
     #[arg(long, default_value = "unknown")]
     pub(crate) client: String,
 
+    /// SHA-256 of the operator's reason, hex, computed by the client.
+    ///
+    /// The reason crosses the boundary already hashed. It used to cross as
+    /// plaintext in argv, where `ps` and `KERN_PROCARGS2` expose it to every
+    /// process running as the same user — and it landed in shell history —
+    /// while the design's stated invariant was that the ledger stores only
+    /// `SHA-256(reason)`. Now the plaintext never leaves the client.
     #[arg(long, default_value = "")]
-    pub(crate) reason: String,
+    pub(crate) reason_sha256: String,
 
     #[arg(long)]
     pub(crate) name: Option<String>,
@@ -300,12 +307,34 @@ fn resolve_client(raw: &str) -> ClientFamily {
     }
 }
 
-fn reason_sha256(reason: &str) -> Option<String> {
+/// `SHA-256("")`. Never a valid reason digest: it is what a caller sends when
+/// it has no reason at all, and the gate exists to make that impossible.
+pub const EMPTY_REASON_SHA256: &str =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// Digest a reason for transport across the privilege boundary.
+///
+/// `None` for a blank reason, so a caller cannot satisfy the gate by sending
+/// the digest of nothing. Used by the client before it elevates; the broker
+/// only ever sees the result.
+pub fn reason_sha256(reason: &str) -> Option<String> {
     let reason = reason.trim();
     if reason.is_empty() {
         return None;
     }
     Some(format!("{:x}", Sha256::digest(reason.as_bytes())))
+}
+
+/// True for a well-formed reason digest the broker will accept.
+///
+/// Lowercase hex, 64 characters, and not the digest of the empty string.
+pub fn is_valid_reason_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .as_bytes()
+            .iter()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        && value != EMPTY_REASON_SHA256
 }
 
 fn actor_from_env() -> String {
@@ -426,13 +455,17 @@ fn run(broker: &Broker) -> Result<(), i32> {
                 })?
                 .gid();
 
-            if broker.reason.trim().is_empty() {
-                eprintln!("broker: --reason is required");
+            // The digest arrives already computed; the broker's job is to
+            // refuse anything that is not one. Rejecting SHA-256("") matters as
+            // much as the format check: without it a caller with no reason
+            // could still satisfy the gate by sending the digest of nothing.
+            let reason_hash = broker.reason_sha256.trim().to_string();
+            if !is_valid_reason_digest(&reason_hash) {
+                eprintln!("broker: --reason-sha256 must be the hex SHA-256 of a non-empty reason");
                 return Err(2);
             }
 
             let client = resolve_client(&broker.client);
-            let reason_hash = reason_sha256(&broker.reason).ok_or(2)?;
             let transaction = uuid::Uuid::new_v4();
             let names = broker
                 .name
@@ -484,7 +517,7 @@ fn run(broker: &Broker) -> Result<(), i32> {
                     None
                 };
 
-                let (rc, names) = execute(broker, &cfg);
+                let (rc, names) = execute(broker, &cfg, &reason_hash);
 
                 // Commit or restore mutation
                 let mut unknown = false;
@@ -568,7 +601,7 @@ fn run_audit_verify(_broker: &Broker) -> Result<(), i32> {
     }
 }
 
-fn execute(broker: &Broker, cfg: &Config) -> (u8, Vec<String>) {
+fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>) {
     // The ambient environment was purged in `run` before dispatch; see
     // `purge_ambient_env`.
     let manifest = cfg.vault.join("secretspec.toml");
@@ -583,7 +616,10 @@ fn execute(broker: &Broker, cfg: &Config) -> (u8, Vec<String>) {
             // engine's `resolve_profile_name` falls through to its user-global
             // config — which, inside a root process, is the caller's file.
             s.set_profile(cfg.profile.clone());
-            s = s.with_reason(broker.reason.clone());
+            // The digest, because that is all this side has. The engine's own
+            // JSONL audit therefore records the same value as the SQLite
+            // ledger, so the two join on it — which prose never allowed.
+            s = s.with_reason(reason_hash.to_string());
             s
         }
         Err(e) => {
@@ -753,6 +789,55 @@ mod tests {
         let (phase, rc, _) = classify_terminal(Err(i32::MAX), &[]);
         assert_eq!(phase, Outcome::Failure);
         assert_eq!(rc, 2);
+    }
+
+    // --- the reason never crosses the boundary as prose ---------------------
+
+    #[test]
+    fn the_empty_reason_digest_constant_is_actually_sha256_of_nothing() {
+        // Hardcoded so the gate does not depend on computing it at startup;
+        // pinned by this test so it cannot drift into being merely decorative.
+        assert_eq!(
+            format!("{:x}", Sha256::digest(b"")),
+            EMPTY_REASON_SHA256,
+            "the rejected constant must be the digest it claims to be"
+        );
+    }
+
+    #[test]
+    fn a_blank_reason_produces_no_digest_to_send() {
+        for blank in ["", "   ", "\t\n"] {
+            assert!(reason_sha256(blank).is_none(), "{blank:?}");
+        }
+        assert!(reason_sha256("rotate integration credential").is_some());
+    }
+
+    #[test]
+    fn the_digest_of_nothing_never_satisfies_the_gate() {
+        // The whole point of requiring a reason is defeated if a caller can
+        // send the digest of the empty string, which is a fixed public value.
+        assert!(!is_valid_reason_digest(EMPTY_REASON_SHA256));
+        assert!(is_valid_reason_digest(&format!(
+            "{:x}",
+            Sha256::digest(b"rotate integration credential")
+        )));
+    }
+
+    #[test]
+    fn malformed_reason_digests_are_refused() {
+        let real = format!("{:x}", Sha256::digest(b"rotate"));
+        for bad in [
+            "",
+            "not-a-digest",
+            &real[..63],             // too short
+            &format!("{real}0"),     // too long
+            &real.to_uppercase(),    // hex must be lowercase
+            &real.replace('a', "g"), // not hex
+            &format!(" {real}"),     // the broker trims before this check
+        ] {
+            assert!(!is_valid_reason_digest(bad), "{bad:?} must be refused");
+        }
+        assert!(is_valid_reason_digest(&real));
     }
 
     #[test]
