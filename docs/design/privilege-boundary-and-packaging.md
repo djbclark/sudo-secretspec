@@ -56,6 +56,23 @@ timestamp, not unauthenticated privilege." That diagnosis was mechanically
 correct; the conclusion "the privilege boundary is intact" was true but
 under-stated the problem.
 
+**Demonstrated on this host, 2026-08-14** — previously this was inference from
+the enforced policy, because the original event could not be replayed. In one
+tty, with no prior timestamp:
+
+```
+$ sudo true                                                  # unrelated; authenticates
+$ sudo -n /usr/local/bin/sudo-secretspec install --dry-run --non-interactive
+would install sudo-secretspec ...                            # exit 0
+```
+
+`-n` makes sudo refuse rather than prompt. It did not refuse. An unrelated
+command paid for boundary lifecycle access, which is precisely what
+`sudoers_text`'s comment says must not happen. The privilege boundary still
+holds — an unauthorised user cannot elevate — but the *interactive
+authentication* the design claims is borrowed from state any command can
+satisfy on our behalf.
+
 **Fix:** `Defaults!/usr/local/bin/sudo-secretspec timestamp_timeout=0`.
 Cheap, and worth doing whether or not the sudo dependency is ever removed.
 
@@ -99,6 +116,13 @@ Three things changed from the original sketch, each for a reason worth keeping:
 A copy under a writable prefix fails even when it loses `PATH` order today:
 losing is an accident of ordering, while write access is a standing ability to
 swap the bytes.
+
+**Verified as root against the live install, 2026-08-14.** With the real caller
+`PATH`, `doctor` reports zero `CLIENT_*` findings — this host has exactly one
+copy, at `/usr/local/bin/sudo-secretspec`. With a decoy of differing bytes
+prepended to the caller `PATH`, it reports `CLIENT_SHADOWED` ("this resolves
+ahead of the installed client … and its bytes differ"), clears `ok`, and exits
+non-zero. Both directions, not just the negative one.
 
 Version skew fell out of this: a client built from a newer tree can meet an
 older installed broker, since brew hands over a new bootstrap binary before
