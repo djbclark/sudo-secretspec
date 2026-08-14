@@ -15,6 +15,12 @@
 //! re-checked, and its `(dev, ino)` is compared against the pre-open identity so
 //! a file swapped in during the open is rejected.
 //!
+//! That reassignment is a write, which is why [`verify_read_only`] exists
+//! alongside [`verify`]: callers that promise not to mutate state get a
+//! connection with no power to normalise, create a schema, or take a write
+//! lock. The repairing path stays the broker's, so a ledger left root-owned by
+//! an earlier install still recovers.
+//!
 //! If any check fails the call returns an error before creating or touching a
 //! database — **fail-closed**.
 //!
@@ -346,38 +352,76 @@ fn check_ledger_metadata(path: &Path, expected_uid: Option<u32>) -> Result<(), A
 // Database connection
 // ---------------------------------------------------------------------------
 
-fn open_connection(directory: &Path, expected_uid: Option<u32>) -> Result<Connection, AuditError> {
+/// Whether opening the ledger may also normalise it.
+///
+/// `ReadWrite` is the broker's mode: it repairs the ledger's mode and
+/// ownership on the way in, which is what lets a ledger left root-owned by an
+/// earlier install recover instead of being permanently fatal.
+///
+/// `ReadOnly` exists because `drift` documents itself as never mutating state,
+/// and then reached this function. A non-repairing checker that silently
+/// repairs is exactly the surprise this codebase otherwise refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyMode {
+    ReadWrite,
+    ReadOnly,
+}
+
+fn open_connection(
+    directory: &Path,
+    expected_uid: Option<u32>,
+    mode: VerifyMode,
+) -> Result<Connection, AuditError> {
     // 1. Validate protected directory metadata first (fail-closed).
     check_protected_dir(directory, expected_uid)?;
 
-    // 2. Check any existing ledger metadata before opening. Ownership is
-    //    deliberately not asserted yet: step 5 reassigns the ledger to the vault
-    //    owner, so a ledger left root-owned by an earlier install must be
-    //    repairable rather than permanently fatal. The post-open check enforces
-    //    the final ownership.
+    // 2. Check any existing ledger metadata before opening. Under `ReadWrite`
+    //    ownership is deliberately not asserted yet: step 5 reassigns the ledger
+    //    to the vault owner, so a ledger left root-owned by an earlier install
+    //    must be repairable rather than permanently fatal, and the post-open
+    //    check enforces the final ownership. Under `ReadOnly` there is no such
+    //    repair, so the expectation is asserted immediately.
     let db_path = directory.join(DB_NAME);
     let identity_before = std::fs::symlink_metadata(&db_path)
         .ok()
         .map(|m| (m.dev(), m.ino()));
-    check_ledger_metadata(&db_path, None)?;
+    let pre_open_uid = match mode {
+        VerifyMode::ReadWrite => None,
+        VerifyMode::ReadOnly => expected_uid,
+    };
+    check_ledger_metadata(&db_path, pre_open_uid)?;
 
-    // 3. Open with mask to ensure new file gets 0600.
-    let old_mask = unsafe { libc::umask(0o077) };
-    let conn_result = Connection::open(&db_path);
-    unsafe { libc::umask(old_mask) };
+    // 3. Open. `ReadWrite` masks so a newly created ledger gets 0600;
+    //    `ReadOnly` opens an existing ledger without the power to create one.
+    let conn = match mode {
+        VerifyMode::ReadWrite => {
+            let old_mask = unsafe { libc::umask(0o077) };
+            let conn_result = Connection::open(&db_path);
+            unsafe { libc::umask(old_mask) };
+            conn_result?
+        }
+        VerifyMode::ReadOnly => Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?,
+    };
 
-    let conn = conn_result?;
-
-    // 4. Set pragmas immediately.
+    // 4. Set pragmas immediately. `journal_mode` is a property of the database
+    //    file rather than the connection, so setting it needs write access and
+    //    is skipped under `ReadOnly`; the rest are per-connection.
+    if mode == VerifyMode::ReadWrite {
+        conn.execute_batch("PRAGMA journal_mode=DELETE;")?;
+    }
     conn.execute_batch(
-        "PRAGMA journal_mode=DELETE;\
-         PRAGMA synchronous=FULL;\
+        "PRAGMA synchronous=FULL;\
          PRAGMA foreign_keys=ON;\
          PRAGMA trusted_schema=OFF;",
     )?;
 
     // 5. Ensure ledger is mode 0600 and owned by the vault service identity.
-    {
+    if mode == VerifyMode::ReadWrite {
         let meta = std::fs::metadata(&db_path)?;
         let mut perms = meta.permissions();
         perms.set_mode(0o600);
@@ -647,7 +691,34 @@ fn verify_rows(conn: &Connection) -> Result<(String, i64), AuditError> {
 /// and total event count. If no ledger exists yet, returns `count=0` with
 /// `ZERO_HASH`.
 pub fn verify(directory: &Path, expected_uid: Option<u32>) -> Result<VerifyResult, AuditError> {
-    // If no ledger exists yet, succeed with count=0.
+    verify_with(directory, expected_uid, VerifyMode::ReadWrite)
+}
+
+/// Verify the ledger without touching it.
+///
+/// Same answer as [`verify`], but the ledger is opened read-only and its mode,
+/// ownership and schema are left exactly as found. For callers that promise not
+/// to mutate state — `drift`, and so `doctor` — where repairing on the read
+/// path would be a silent surprise.
+///
+/// Note that a ledger with a hot journal cannot be replayed read-only, so an
+/// interrupted write surfaces here as an error rather than being recovered.
+/// That is the intended trade: the caller reports it, the broker repairs it.
+pub fn verify_read_only(
+    directory: &Path,
+    expected_uid: Option<u32>,
+) -> Result<VerifyResult, AuditError> {
+    verify_with(directory, expected_uid, VerifyMode::ReadOnly)
+}
+
+fn verify_with(
+    directory: &Path,
+    expected_uid: Option<u32>,
+    mode: VerifyMode,
+) -> Result<VerifyResult, AuditError> {
+    // If no ledger exists yet, succeed with count=0. This early return is also
+    // what keeps `ReadOnly` from having to open a database that does not exist:
+    // it cannot create one, so it would otherwise fail on a fresh install.
     let db_path = directory.join(DB_NAME);
     if !db_path.exists() {
         check_protected_dir(directory, expected_uid)?;
@@ -657,11 +728,26 @@ pub fn verify(directory: &Path, expected_uid: Option<u32>) -> Result<VerifyResul
         });
     }
 
-    let conn = open_connection(directory, expected_uid)?;
+    let conn = open_connection(directory, expected_uid, mode)?;
 
     let result = (|| -> Result<VerifyResult, AuditError> {
-        ensure_schema(&conn)?;
-        conn.execute("BEGIN IMMEDIATE", [])?;
+        // Creating the schema is a write. Under `ReadOnly` a ledger missing its
+        // tables is a finding for the caller to report, not something to fix
+        // here — and `verify_rows` returns the same "no events" answer either
+        // way once the tables exist.
+        if mode == VerifyMode::ReadWrite {
+            ensure_schema(&conn)?;
+        }
+        // `BEGIN IMMEDIATE` takes a write lock, which a read-only connection
+        // cannot. A deferred `BEGIN` still gives the snapshot the chain check
+        // needs.
+        conn.execute(
+            match mode {
+                VerifyMode::ReadWrite => "BEGIN IMMEDIATE",
+                VerifyMode::ReadOnly => "BEGIN",
+            },
+            [],
+        )?;
         let (hash, count) = verify_rows(&conn)?;
 
         // Run integrity check
@@ -757,7 +843,8 @@ pub fn append_event(
 
     // ---- Database operations ----
 
-    let conn = open_connection(directory, request.expected_uid)?;
+    // Appending is a write by definition; there is no read-only variant here.
+    let conn = open_connection(directory, request.expected_uid, VerifyMode::ReadWrite)?;
 
     let result = (|| -> Result<AuditEvent, AuditError> {
         ensure_schema(&conn)?;
@@ -859,6 +946,95 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         dir
+    }
+
+    // --- read-only verification ------------------------------------------
+    //
+    // `drift` documents itself as never mutating state and then called into
+    // this module, whose read-write path creates the schema and reassigns the
+    // ledger's mode and ownership. These cover the mode that keeps that promise.
+
+    #[test]
+    fn read_only_verify_agrees_with_the_repairing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = protected_dir(tmp.path());
+        let uid = Some(unsafe { libc::getuid() });
+        let tx = uuid::Uuid::new_v4();
+        attempt(&dir, tx).unwrap();
+        terminal(&dir, tx, Outcome::Success, 0).unwrap();
+
+        let rw = verify(&dir, uid).unwrap();
+        let ro = verify_read_only(&dir, uid).unwrap();
+        assert_eq!((ro.count, &ro.hash), (rw.count, &rw.hash));
+        assert_eq!(ro.count, 2);
+    }
+
+    #[test]
+    fn read_only_verify_does_not_create_a_ledger() {
+        // A fresh vault has no ledger. The read-only connection has no power to
+        // create one, so the early return is what keeps this from failing.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = protected_dir(tmp.path());
+
+        let result = verify_read_only(&dir, Some(unsafe { libc::getuid() })).unwrap();
+        assert_eq!(result.count, 0);
+        assert_eq!(result.hash, ZERO_HASH);
+        assert!(
+            !dir.join(DB_NAME).exists(),
+            "verifying must not bring a ledger into existence"
+        );
+    }
+
+    #[test]
+    fn read_only_verify_does_not_create_the_schema() {
+        // An existing but empty database file. The read-write path would run
+        // CREATE TABLE IF NOT EXISTS and report a clean empty ledger; the
+        // read-only path must report the problem instead of fixing it.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = protected_dir(tmp.path());
+        let db = dir.join(DB_NAME);
+        Connection::open(&db).unwrap();
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
+        let uid = Some(unsafe { libc::getuid() });
+
+        assert!(
+            verify_read_only(&dir, uid).is_err(),
+            "a ledger with no schema must be reported, not repaired"
+        );
+        // Control: the repairing path does create it, so the assertion above is
+        // about the mode and not about the fixture being broken.
+        assert_eq!(verify(&dir, uid).unwrap().count, 0);
+        // And now that the schema exists, read-only agrees again.
+        assert_eq!(verify_read_only(&dir, uid).unwrap().count, 0);
+    }
+
+    #[test]
+    fn read_only_verify_leaves_the_ledger_file_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = protected_dir(tmp.path());
+        let uid = Some(unsafe { libc::getuid() });
+        let tx = uuid::Uuid::new_v4();
+        attempt(&dir, tx).unwrap();
+        terminal(&dir, tx, Outcome::Success, 0).unwrap();
+
+        let db = dir.join(DB_NAME);
+        let before = fs::metadata(&db).unwrap();
+        let bytes_before = fs::read(&db).unwrap();
+
+        verify_read_only(&dir, uid).unwrap();
+
+        let after = fs::metadata(&db).unwrap();
+        assert_eq!(fs::read(&db).unwrap(), bytes_before, "ledger bytes changed");
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        // No journal or side files left behind either.
+        let strays: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != DB_NAME)
+            .collect();
+        assert!(strays.is_empty(), "read-only verify left {strays:?}");
     }
 
     /// Simple sliding-window substring check.

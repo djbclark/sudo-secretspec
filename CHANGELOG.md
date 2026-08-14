@@ -86,6 +86,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `sudo-secretspec doctor` no longer writes to the audit ledger it is
+  reporting on. Its drift check reached the ledger through the ordinary
+  verification path, which opens read-write and normalises on the way in —
+  resetting mode, reassigning ownership, and creating the schema if absent.
+  Run as root, a health check could therefore quietly rewrite the ledger's
+  metadata. Verification for checkers now opens read-only and reports what it
+  finds; the repairing path stays with the broker, so a ledger left root-owned
+  by an earlier install still recovers.
+- `audit-verify` now asserts who the ledger belongs to. Both it and the drift
+  check passed no expected owner, which skipped the ownership comparison on
+  the directory *and* the ledger — on the one command whose purpose is to
+  prove the ledger is intact. The full boundary check is deliberately still
+  not required, so a drifted install can continue to verify its own ledger.
 - A crashed credential mutation no longer wedges `doctor`. The broker's
   rollback backups are created by root with `fs::copy`, which carries the mode
   across but not the owner, so they landed root-owned inside a service-user

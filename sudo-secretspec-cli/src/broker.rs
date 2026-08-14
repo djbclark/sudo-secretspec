@@ -538,7 +538,19 @@ fn run(broker: &Broker) -> Result<(), i32> {
 fn run_audit_verify(_broker: &Broker) -> Result<(), i32> {
     require_root()?;
     let cfg = load_config()?;
-    match audit::verify(&cfg.vault, None) {
+    // Assert who the ledger must belong to, but deliberately *without*
+    // `require_boundary`. This is the one command whose job is to prove the
+    // ledger is intact, and running the full boundary check first would mean a
+    // drifted install (wrong binary mode, missing manifest) could no longer
+    // verify its own ledger — precisely when the answer matters most. Passing
+    // `None` here, though, skipped the owner comparison in both
+    // `check_protected_dir` and `check_ledger_metadata`, so "verified" said
+    // nothing about ownership at all.
+    let expected_uid = uid_for_user(&cfg.service_user).ok_or_else(|| {
+        eprintln!("broker: unknown service user {}", cfg.service_user);
+        2
+    })?;
+    match audit::verify(&cfg.vault, Some(expected_uid)) {
         Ok(result) => {
             println!("audit-verify: {} events, tip {}", result.count, result.hash);
             Ok(())

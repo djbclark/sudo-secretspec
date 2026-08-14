@@ -1,6 +1,13 @@
 //! Metadata-only, non-repairing drift validation for sudo-secretspec.
 //!
 //! Never reads secret values. Never mutates state.
+//!
+//! The second promise reaches through the audit ledger too, which is why the
+//! integrity check here goes through [`audit::verify_read_only`]. The ordinary
+//! [`audit::verify`] path opens the ledger read-write and normalises it on the
+//! way in — mode, ownership, and `CREATE TABLE IF NOT EXISTS` — so running it
+//! from a checker meant a `doctor` invocation could quietly rewrite the thing it
+//! was reporting on.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -176,6 +183,24 @@ fn owner_name(uid: u32) -> String {
         std::ffi::CStr::from_ptr((*pw).pw_name)
             .to_string_lossy()
             .into_owned()
+    }
+}
+
+/// Resolve a service-user name to its uid, or `None` if the account is absent.
+///
+/// The inverse of [`owner_name`]. `drift` carries the configured identity as a
+/// name, but the audit ledger's ownership check compares uids.
+fn uid_for_user(name: &str) -> Option<u32> {
+    let c = std::ffi::CString::new(name).ok()?;
+    // SAFETY: `getpwnam` is called with a valid NUL-terminated string and the
+    // returned pointer is only dereferenced while non-null.
+    unsafe {
+        let pw = libc::getpwnam(c.as_ptr());
+        if pw.is_null() {
+            None
+        } else {
+            Some((*pw).pw_uid)
+        }
     }
 }
 
@@ -644,8 +669,13 @@ pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
         }
     }
 
-    // Audit integrity via library (no secret contents).
-    if let Err(e) = audit::verify(&layout.vault, None) {
+    // Audit integrity via library (no secret contents, and no writes: this
+    // module promises never to mutate state, and the read-write path repairs
+    // the ledger's mode and ownership and creates its schema).
+    //
+    // A missing service account leaves the ownership assertion off rather than
+    // failing here; the identity itself is already reported by the checks above.
+    if let Err(e) = audit::verify_read_only(&layout.vault, uid_for_user(&layout.service_user)) {
         findings.push(finding(
             "AUDIT_VERIFY_FAILED",
             Some(&layout.vault.join(audit::DB_NAME)),
