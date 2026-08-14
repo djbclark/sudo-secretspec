@@ -228,3 +228,50 @@ fn inspect_without_a_caller_path_ignores_unrelated_directories() {
         report.findings
     );
 }
+
+/// `inspect` must write nothing to stdout, so `doctor --json` emits only the
+/// report.
+///
+/// `visudo -c` prints "<path>: parsed OK" on success. Inheriting its stdout put
+/// that line ahead of the JSON, and anything consuming the report as JSON —
+/// which is what `AI-GUIDANCE.md` tells automation to do — failed on the very
+/// first character.
+///
+/// Re-execs this test binary because cargo captures the parent's stdout but not
+/// a child's.
+#[test]
+fn inspect_writes_nothing_to_stdout() {
+    const MARKER: &str = "SUDO_SECRETSPEC_STDOUT_CHILD";
+
+    if std::env::var_os(MARKER).is_some() {
+        let dir = TempDir::new().unwrap();
+        let policy = dir.path().join("sudo-secretspec");
+        // Valid on purpose: the leak only happens when visudo *succeeds*.
+        std::fs::write(
+            &policy,
+            "operator ALL=(root) NOPASSWD: /usr/local/libexec/sudo-secretspec doctor\n",
+        )
+        .unwrap();
+
+        let mut layout = sudo_secretspec_cli::load_config(&write_config(&dir, minimal_toml()))
+            .expect("minimal config");
+        layout.sudoers = policy;
+        let _ = sudo_secretspec_cli::inspect(
+            &layout,
+            &sudo_secretspec_cli::InspectOptions { caller_path: None },
+        );
+        return;
+    }
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["inspect_writes_nothing_to_stdout", "--exact", "--nocapture"])
+        .env(MARKER, "1")
+        .output()
+        .expect("re-exec the test binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !stdout.contains("parsed OK"),
+        "visudo output leaked into stdout: {stdout}"
+    );
+}

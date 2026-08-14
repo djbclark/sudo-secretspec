@@ -526,13 +526,18 @@ pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
     }
 
     // Sudoers syntax.
+    //
+    // Captured, not inherited: `visudo -c` writes "<path>: parsed OK" to
+    // stdout, and letting that through put a non-JSON line ahead of the report
+    // in `doctor --json`. Anything consuming the report as JSON — which is what
+    // AI-GUIDANCE tells automation to do — failed to parse it.
     if layout.sudoers.exists() {
-        let status = Command::new("/usr/sbin/visudo")
+        let checked = Command::new("/usr/sbin/visudo")
             .args(["-c", "-f"])
             .arg(&layout.sudoers)
-            .status();
-        match status {
-            Ok(s) if s.success() => {}
+            .output();
+        match checked {
+            Ok(out) if out.status.success() => {}
             _ => findings.push(finding(
                 "SUDOERS_INVALID",
                 Some(&layout.sudoers),

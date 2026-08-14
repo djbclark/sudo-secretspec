@@ -57,6 +57,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `sudo-secretspec doctor --json` now emits only the JSON report. `visudo`
+  printed `<path>: parsed OK` to the same stream first, so anything parsing the
+  output as JSON failed on the first character.
 - `sudo-secretspec install` now prunes rollback snapshots instead of leaving one
   behind on every run. Snapshots that captured nothing — which is every first
   install, and which `rollback` refuses to restore from — are removed, and the
