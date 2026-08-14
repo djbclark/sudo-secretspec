@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The Homebrew formula now declares its version explicitly. Homebrew parsed the
+  trailing `.1` of the `v0.19.1-djbclark.1` tag as the entire version, so kegs
+  were recorded as version `1` and upgrade detection did not work.
+- The Homebrew formula installs the companion to `libexec` instead of `bin`, so
+  it is no longer linked onto `PATH`. The keg copy is only a bootstrap for the
+  initial `install`; leaving it linked shadowed the client at
+  `/usr/local/bin/sudo-secretspec` — the path the sudoers policy and installed
+  manifest are pinned to — with a same-version, different-hash binary. Run the
+  bootstrap from the path shown in `brew info sudo-secretspec` caveats.
 - `sudo-secretspec` now invokes `/usr/bin/sudo` by absolute path. It previously
   resolved `sudo` through `PATH`, so a `sudo` planted earlier in `PATH` could
   satisfy any credential operation with forged values and no audit record.

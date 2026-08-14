@@ -6,6 +6,9 @@ class SudoSecretspec < Formula
   desc "SecretSpec engine with an opt-in macOS privilege-boundary companion"
   homepage "https://github.com/djbclark/sudo-secretspec"
   url "https://github.com/djbclark/sudo-secretspec/archive/refs/tags/v0.19.1-djbclark.1.tar.gz"
+  # Homebrew parses the trailing ".1" of the tag as the whole version, which
+  # breaks upgrade detection. State it explicitly.
+  version "0.19.1-djbclark.1"
   sha256 "29f25c0274ad8db6fd5e14b5c6db5ba2906c906e470e5504134f71a16e540200"
   license "Apache-2.0"
   head "https://github.com/djbclark/sudo-secretspec.git", branch: "sudo-main"
@@ -14,7 +17,17 @@ class SudoSecretspec < Formula
 
   def install
     system "cargo", "install", "--locked", "--root", prefix, "--path", "secretspec"
-    system "cargo", "install", "--locked", "--root", prefix, "--path", "sudo-secretspec-cli"
+
+    # The companion goes to libexec, which Homebrew does not link, so it never
+    # lands on PATH. It is only a bootstrap: the binary you run day to day is
+    # the one `sudo-secretspec install` places at /usr/local/bin, and that path
+    # is what the sudoers policy and the installed manifest are pinned to. A
+    # linked keg copy would shadow it with a same-version, different-hash
+    # binary that `doctor` cannot currently detect.
+    staging = buildpath/"companion-root"
+    system "cargo", "install", "--locked", "--root", staging, "--path", "sudo-secretspec-cli"
+    libexec.install staging/"bin/sudo-secretspec"
+
     (share/"sudo-secretspec").install "sudo-secretspec/AI-GUIDANCE.md"
     (share/"sudo-secretspec/skills/sudo-secretspec").install "skills/sudo-secretspec/SKILL.md"
   end
@@ -23,9 +36,13 @@ class SudoSecretspec < Formula
     <<~EOS
       Homebrew installed files only. It did not run sudo, edit sudoers, create
       users, or mutate /var/db. To opt in after reviewing the installed assets,
-      explicitly run:
+      explicitly run the bootstrap companion out of libexec:
 
-        sudo-secretspec install --declarations /path/to/secretspec.toml
+        #{opt_libexec}/sudo-secretspec install --declarations /path/to/secretspec.toml
+
+      That installs the client you use from then on at
+      /usr/local/bin/sudo-secretspec. The libexec copy is deliberately not on
+      PATH so it cannot shadow the installed client.
 
       Existing protected stores must be adopted explicitly; see
       sudo-secretspec/AI-GUIDANCE.md in the source distribution.
@@ -34,6 +51,8 @@ class SudoSecretspec < Formula
 
   test do
     assert_match "0.19.1-djbclark.1", shell_output("#{bin}/secretspec --version")
-    assert_match "sudo-secretspec 0.19.1-djbclark.1", shell_output("#{bin}/sudo-secretspec --version")
+    assert_match "sudo-secretspec 0.19.1-djbclark.1", shell_output("#{libexec}/sudo-secretspec --version")
+    # The companion must never be linked onto PATH; see the install comment.
+    refute_path_exists bin/"sudo-secretspec"
   end
 end
