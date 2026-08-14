@@ -5,10 +5,10 @@
 class SudoSecretspec < Formula
   desc "SecretSpec engine with an opt-in macOS privilege-boundary companion"
   homepage "https://github.com/djbclark/sudo-secretspec"
-  url "https://github.com/djbclark/sudo-secretspec/archive/refs/tags/v0.19.1-djbclark.3.tar.gz"
+  url "https://github.com/djbclark/sudo-secretspec/archive/refs/tags/v0.19.1-sudo.4.tar.gz"
   # Homebrew parses the trailing ".1" of the tag as the whole version, which
   # breaks upgrade detection. State it explicitly.
-  version "0.19.1-djbclark.3"
+  version "0.19.1-sudo.4"
   sha256 "f0b379a37b58bc0f1a5a050af24ab9a06a5feec85596b4aa18fa9d68ae9888f7"
   license "Apache-2.0"
   head "https://github.com/djbclark/sudo-secretspec.git", branch: "sudo-main"
@@ -51,8 +51,8 @@ class SudoSecretspec < Formula
   end
 
   test do
-    assert_match "0.19.1-djbclark.3", shell_output("#{bin}/secretspec --version")
-    assert_match "sudo-secretspec 0.19.1-djbclark.3", shell_output("#{libexec}/sudo-secretspec --version")
+    assert_match "0.19.1-sudo.4", shell_output("#{bin}/secretspec --version")
+    assert_match "sudo-secretspec 0.19.1-sudo.4", shell_output("#{libexec}/sudo-secretspec --version")
     # The companion must never be linked onto PATH; see the install comment.
     refute_path_exists bin/"sudo-secretspec"
   end
