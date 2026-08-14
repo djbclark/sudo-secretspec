@@ -602,9 +602,24 @@ fn config_toml(req: &InstallRequest, vault_real: &Path) -> String {
 /// the mediated broker operations and the read-only doctor are NOPASSWD here.
 /// `main` enforces the same restriction inside the binary, because sudoers
 /// argument matching alone is easy to get subtly wrong.
-fn sudoers_text(operator: &str) -> String {
+///
+/// `timestamp_timeout=0` on the *client* path is what makes "behind Touch ID"
+/// mean per-operation. Without it the grant is enforced by sudo's shared
+/// timestamp — five minutes by default, and satisfied by any other command:
+/// `sudo true` followed by `sudo -n sudo-secretspec install` was observed to
+/// run with no authentication at all. The boundary still held, but the
+/// interactive-authentication guarantee was borrowed from state this project
+/// does not own. Zero also means the time stamp is not *updated*, so running
+/// boundary lifecycle cannot pay for some later command either.
+///
+/// This binds to the installed client path only. Running the Homebrew keg's
+/// `libexec` bootstrap directly is outside the policy — that path exists for a
+/// first install, when there is no policy yet, and `doctor`'s `CLIENT_SHADOWED`
+/// check is what keeps it from becoming the everyday entry point.
+pub fn sudoers_text(operator: &str) -> String {
     format!(
         "Defaults!{prefix}/libexec/sudo-secretspec env_reset,secure_path=/usr/bin:/bin:/usr/sbin:/sbin,umask=0077\n\
+         Defaults!{prefix}/bin/sudo-secretspec timestamp_timeout=0\n\
          {operator} ALL=(root) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker *\n\
          {operator} ALL=(root) NOPASSWD: {prefix}/libexec/sudo-secretspec doctor\n\
          {operator} ALL=(root) NOPASSWD: {prefix}/libexec/sudo-secretspec doctor *\n",

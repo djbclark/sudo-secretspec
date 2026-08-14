@@ -143,6 +143,41 @@ fn a_valid_policy_stages_without_touching_the_live_path() {
     );
 }
 
+/// The policy this project actually ships, run through the real `visudo`.
+///
+/// The other two tests use hand-written stand-ins, so nothing before this
+/// checked that the generated text parses — and an unparseable file under
+/// `sudoers.d` strands the operator with no way to elevate.
+#[test]
+fn the_shipped_policy_parses_and_gates_boundary_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let dst = dir.path().join("sudo-secretspec");
+    let policy = sudo_secretspec_cli::install::sudoers_text("someoperator");
+
+    sudo_secretspec_cli::install::stage_sudoers(&dst, &policy, 0o440)
+        .expect("visudo should accept the policy we ship");
+
+    // Per-operation authentication for the client path. Without this the gate
+    // is sudo's shared 5-minute timestamp, which any other command can satisfy.
+    assert!(
+        policy.contains("Defaults!/usr/local/bin/sudo-secretspec timestamp_timeout=0\n"),
+        "{policy}"
+    );
+    // The broker stays NOPASSWD: mediated credential operations are the
+    // autonomous path, and making them prompt would wedge every agent.
+    assert!(
+        policy.contains("NOPASSWD: /usr/local/libexec/sudo-secretspec __broker *\n"),
+        "{policy}"
+    );
+    // Boundary lifecycle must never be granted without authentication. The
+    // client path carries no NOPASSWD rule at all; it rides the host's own
+    // admin grant, which is what `timestamp_timeout=0` then constrains.
+    assert!(
+        !policy.contains("NOPASSWD: /usr/local/bin/sudo-secretspec"),
+        "{policy}"
+    );
+}
+
 #[test]
 fn an_invalid_policy_never_reaches_the_live_path() {
     let dir = tempfile::tempdir().unwrap();

@@ -1,6 +1,6 @@
 # Design note: privilege boundary, packaging, and the authentication gate
 
-**Status:** analysis complete; F2, F4, F6 implemented; F1, F3 outstanding
+**Status:** analysis complete; F1, F2, F4, F6 implemented; F3 outstanding
 **Date:** 2026-08-13
 **Scope:** fork-only (`djbclark/sudo-secretspec`). Not upstream material.
 **Prompted by:** resolving the Homebrew link conflict after the
@@ -32,7 +32,7 @@ from the configured engine path. Only the install side hardcodes it.
 
 ## Findings
 
-### F1 — The Touch ID gate is not per-operation
+### F1 — The Touch ID gate is not per-operation (fixed)
 
 The design's central claim is stated at `install.rs:475-478`: *"Boundary
 lifecycle must stay behind Touch ID via the public client."*
@@ -73,10 +73,39 @@ holds — an unauthorised user cannot elevate — but the *interactive
 authentication* the design claims is borrowed from state any command can
 satisfy on our behalf.
 
-**Fix:** `Defaults!/usr/local/bin/sudo-secretspec timestamp_timeout=0`.
-Cheap, and worth doing whether or not the sudo dependency is ever removed.
+**Fixed.** `sudoers_text()` now emits
+`Defaults!/usr/local/bin/sudo-secretspec timestamp_timeout=0`. Zero means the
+time stamp is neither consulted *nor updated*, so the gate closes in both
+directions: an unrelated command cannot pay for boundary lifecycle, and
+boundary lifecycle cannot pay for a later command.
 
-### F2 — `doctor` verifies the installation, not the invocation
+**The mechanism was verified before shipping, not assumed.** `visudo -c`
+accepting the file only proves syntax; whether sudo honors a *command-scoped*
+`timestamp_timeout` at authentication time is the load-bearing question, and
+the sudoers(5) text does not say either way. Probed on this host with a
+throwaway drop-in (`Defaults!/usr/bin/true timestamp_timeout=0`, since removed):
+
+```
+$ sudo -k && sudo /bin/ls >/dev/null   # authenticate via an unrelated command
+$ sudo -n /usr/bin/true                # gated
+sudo: a password is required
+$ sudo -n /bin/ls >/dev/null           # control, same timestamp
+$ echo $?
+0
+```
+
+The control is what makes it conclusive: the timestamp was demonstrably still
+valid, so the refusal was command-scoped rather than expiry. sudo 1.9.17p2.
+
+Scope: this binds the installed client path only. The Homebrew keg's `libexec`
+bootstrap is outside the policy — that path exists for a first install, when
+there is no policy yet, and F2's `CLIENT_SHADOWED` check is what keeps it from
+becoming the everyday entry point. Mediated credential operations are
+unaffected: they run through the NOPASSWD *broker* path, so agents and
+automation never see a new prompt. `sudo <client> doctor` run by hand will now
+always prompt, where before it could ride a cached timestamp.
+
+### F2 — `doctor` verifies the installation, not the invocation (fixed)
 
 `INSTALLED_HASH_MISMATCH` (`drift.rs:311`) checks
 `/usr/local/bin/sudo-secretspec` against `MANIFEST.sha256`. Nothing checks
@@ -315,7 +344,7 @@ These belong together: the policy change only takes effect when `install` is
 re-run, and re-running `install` churns snapshot directories, so the GC fix
 must ship in the same version.
 
-5. `timestamp_timeout=0` on the client path (F1).
+5. ~~`timestamp_timeout=0` on the client path (F1).~~ **Done.**
 6. `sudo-secretspec uninstall` (F3).
 7. ~~`doctor`: `CLIENT_SHADOWED` and unsafe-prefix checks (F2).~~ **Done.**
 8. `doctor`: report broken neighbours in `sudoers.d`; GC rollback snapshots

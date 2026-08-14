@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with declaration auto-detection and TTY prompts; long flags are overrides.
 - Fork docs: `sudo-secretspec/README.md`, `README.downstream.md`, `FORK-AI.md`.
 
+- The generated sudoers policy now sets `timestamp_timeout=0` on the installed
+  client path, so `install` and `rollback` require interactive authentication
+  every time. Previously the gate was sudo's shared timestamp — five minutes by
+  default, and satisfied by any other command, so `sudo true` followed by
+  `sudo sudo-secretspec install` authenticated for nothing. Zero also stops
+  boundary lifecycle from refreshing the timestamp for later commands. Mediated
+  credential operations are unaffected: they run through the NOPASSWD broker
+  path and never prompt. **Run `sudo-secretspec install --adopt-existing` to
+  apply this to an existing policy.**
 - `sudo-secretspec doctor` now checks which `sudo-secretspec` would actually
   run, not only whether the installed one is intact. A different binary found on
   the executable search path is reported as `CLIENT_SHADOWED` and fails the
