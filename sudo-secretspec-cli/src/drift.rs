@@ -299,7 +299,10 @@ fn sha256_file(path: &Path) -> Option<String> {
     Some(format!("{:x}", Sha256::digest(bytes)))
 }
 
-fn parse_manifest(path: &Path) -> Vec<(String, PathBuf)> {
+/// Parse `hash  absolute-path` rows. An unreadable manifest yields no rows,
+/// which every caller must treat as "cannot prove anything about these paths"
+/// rather than "these paths are fine".
+pub(crate) fn parse_manifest(path: &Path) -> Vec<(String, PathBuf)> {
     let Ok(text) = fs::read_to_string(path) else {
         return Vec::new();
     };

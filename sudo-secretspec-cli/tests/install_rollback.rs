@@ -227,6 +227,54 @@ fn installed_artifact_table_pins_the_sensitive_modes() {
     assert_eq!(artifact_mode(std::path::Path::new("/etc/passwd")), None);
 }
 
+/// The ordering guarantee, checked against the real artifact table rather than
+/// the rebased one the module's own tests use.
+///
+/// Uninstall closes the sudo grant before removing the paths it names, so the
+/// policy has to come first no matter how the table is ordered or extended.
+#[test]
+fn uninstall_plans_the_real_sudo_policy_before_any_binary() {
+    let artifacts = sudo_secretspec_cli::install::installed_artifacts();
+    let plan = sudo_secretspec_cli::uninstall::plan_uninstall(
+        &artifacts,
+        &[],
+        std::path::Path::new("/private/etc/sudoers.d"),
+    );
+
+    assert_eq!(plan.len(), artifacts.len(), "every owned path is planned");
+    assert_eq!(
+        plan[0].path,
+        PathBuf::from("/private/etc/sudoers.d/sudo-secretspec")
+    );
+    assert!(
+        plan[1..]
+            .iter()
+            .all(|step| !step.path.starts_with("/private/etc/sudoers.d")),
+        "only one policy is owned, and it leads the plan: {plan:?}"
+    );
+}
+
+/// With no manifest there is no proof of ownership, so the policy survives.
+///
+/// The empty slice is exactly what a missing or unreadable `MANIFEST.sha256`
+/// parses to, which makes this the behaviour on a host where the manifest was
+/// already removed by hand.
+#[test]
+fn uninstall_never_removes_a_policy_it_cannot_prove_it_wrote() {
+    use sudo_secretspec_cli::uninstall::Action;
+
+    let plan = sudo_secretspec_cli::uninstall::plan_uninstall(
+        &sudo_secretspec_cli::install::installed_artifacts(),
+        &[],
+        std::path::Path::new("/private/etc/sudoers.d"),
+    );
+    assert!(
+        !matches!(plan[0].action, Action::Remove),
+        "an unproven policy must never be planned for removal: {:?}",
+        plan[0]
+    );
+}
+
 // `plan_prune` is the half of snapshot GC that decides what may be deleted, so
 // it is tested here without root for the same reason `plan_restore` is: the
 // retention decision is the part worth pinning.

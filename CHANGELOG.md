@@ -17,6 +17,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with declaration auto-detection and TTY prompts; long flags are overrides.
 - Fork docs: `sudo-secretspec/README.md`, `README.downstream.md`, `FORK-AI.md`.
 
+- `sudo-secretspec uninstall` removes the privileged boundary this installer
+  owns. Add `--dry-run` to see the plan first; like `install`, it requires
+  interactive authentication. The sudo policy is removed before the binaries it
+  grants, and only ever this project's own drop-in at
+  `/etc/sudoers.d/sudo-secretspec` — never `/etc/sudoers`, and never another
+  vendor's file in that directory. The policy is checked against the install
+  manifest before it is unlinked and left in place with a warning if its bytes
+  do not match, since the path is predictable and a file sitting there is not
+  proof this installer wrote it. Rollback snapshots are removed too, because
+  they restore artifacts that no longer exist.
+
+  The vault and the service identity survive by default; each has its own
+  opt-in flag with its own confirmation. `--purge-vault` deletes the vault
+  directory and every secret in it. `--remove-service-user` deletes the service
+  user and group, and refuses any identity that does not look like one this
+  installer created — an adopted account may have other dependents, so it is
+  reported rather than deleted. Both are settled before anything is removed, so
+  a refusal cannot arrive part-way through.
 - The generated sudoers policy now sets `timestamp_timeout=0` on the installed
   client path, so `install` and `rollback` require interactive authentication
   every time. Previously the gate was sudo's shared timestamp — five minutes by

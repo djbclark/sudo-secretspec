@@ -1,6 +1,7 @@
 # Design note: privilege boundary, packaging, and the authentication gate
 
-**Status:** analysis complete; F1, F2, F4, F6 implemented; F3 outstanding
+**Status:** analysis complete; F1, F2, F3, F4, F6 implemented. Phase 2 is done
+apart from item 8's `sudoers.d` neighbour report.
 **Date:** 2026-08-13
 **Scope:** fork-only (`djbclark/sudo-secretspec`). Not upstream material.
 **Prompted by:** resolving the Homebrew link conflict after the
@@ -199,6 +200,51 @@ Uninstall is that list plus three policy decisions:
 Gate it like `install`: add `Uninstall` to the non-broker match at
 `main.rs:126` so it is refused through the `NOPASSWD` path.
 
+**Implemented**, in `uninstall.rs`, with four departures from the sketch above
+worth recording.
+
+*No change was needed at the broker guard.* That match is an **allowlist** —
+`Broker | Doctor` — not a denylist, so `Uninstall` is refused by not appearing
+in it, the same way `Install` and `Rollback` already were. The guard's comment
+now says so, because the sketch's instruction reads as though a new command
+must ask to be refused; the opposite is true, and a future lifecycle command
+inherits the refusal for free.
+
+*Ownership is proven by hash for the sudo policy only, not for every artifact.*
+The asymmetry is the point. `sudoers.d` is a shared directory with live
+neighbours, so a predictable name proves nothing there. The other seven paths
+are exact names inside a prefix only root can write, and `install` already
+overwrites each of them unconditionally; refusing to remove a client binary
+because it had been upgraded out of band would leave a half-removed boundary
+and no command left to finish the job. Non-regular files are refused everywhere
+though — `symlink_metadata` stats rather than opens, so a fifo left at an owned
+path can neither block the root process nor be followed out of the owned set.
+
+*Both opt-in removals are settled before anything is unlinked.* The first draft
+checked them at the point of use, at the end of the run. That is wrong for the
+same reason the sudoers-first ordering is right: a refusal arriving after the
+artifacts are gone leaves the operator with a half-removed boundary and no
+client left to finish. `--dry-run` returns those verdicts too, so an ineligible
+flag combination is discovered before it is committed to. Verified live on this
+host: `uninstall --dry-run --remove-service-user` exits 2 with
+`/Users/_secretspec has id 503, outside the 400-499 range this installer
+allocates` and removes nothing.
+
+*The service-identity guard is "does this look like one we created", not a
+name check.* A leading underscore **and** an id inside the 400-499 window
+`ensure_service_user`/`ensure_service_group` allocate from. This host is the
+motivating case: the deployed configuration adopts `_secretspec:staff`, where
+the group is ordinary system group `staff` (gid 20) and the user is uid 503.
+Both fail, which is correct — neither was created here, and `_secretspec` still
+has the legacy stayturgid wrapper as a consumer.
+
+Snapshot GC is reused rather than reimplemented: `prune_snapshots(libexec, 0)`.
+Once the artifacts are gone every snapshot restores paths that no longer exist,
+and going through the existing pruner means those directories are vetted by
+exactly the guards a normal install prunes them under. The `share/` directory is
+removed with `remove_dir`, never `remove_dir_all` — its refusal on a non-empty
+directory *is* the guard that anything still in there is not ours.
+
 ### F4 — Homebrew ships a binary that should never be linked
 
 The keg's `bin/sudo-secretspec` is only ever a *bootstrap* — the thing run
@@ -345,7 +391,7 @@ re-run, and re-running `install` churns snapshot directories, so the GC fix
 must ship in the same version.
 
 5. ~~`timestamp_timeout=0` on the client path (F1).~~ **Done.**
-6. `sudo-secretspec uninstall` (F3).
+6. ~~`sudo-secretspec uninstall` (F3).~~ **Done.**
 7. ~~`doctor`: `CLIENT_SHADOWED` and unsafe-prefix checks (F2).~~ **Done.**
 8. `doctor`: report broken neighbours in `sudoers.d`; GC rollback snapshots
    (F6). Snapshot GC is done; the `sudoers.d` neighbour report is not.

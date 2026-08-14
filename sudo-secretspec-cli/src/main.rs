@@ -16,6 +16,9 @@ const SUDO: &str = "/usr/bin/sudo";
 /// path it may only serve the operations that policy is meant to expose.
 const BROKER_PATH: &str = "/usr/local/libexec/sudo-secretspec";
 
+/// Installed protected configuration, written by `install`.
+const CONFIG_PATH: &str = "/usr/local/etc/sudo-secretspec.toml";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "sudo-secretspec",
@@ -89,6 +92,29 @@ enum Cmd {
         #[arg(long)]
         non_interactive: bool,
     },
+    /// Remove the privileged boundary this installer owns.
+    ///
+    /// Leaves the vault and the service identity alone unless asked; both
+    /// outlive any single install.
+    ///
+    /// Typical short form:
+    ///   sudo-secretspec uninstall --dry-run
+    ///   sudo-secretspec uninstall
+    Uninstall {
+        #[arg(long)]
+        dry_run: bool,
+        /// Also delete the vault directory and every secret in it.
+        #[arg(long)]
+        purge_vault: bool,
+        /// Also delete the service user and group.
+        #[arg(long)]
+        remove_service_user: bool,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Never prompt; the opt-in flags are taken as the confirmation.
+        #[arg(long)]
+        non_interactive: bool,
+    },
     Doctor {
         #[arg(long)]
         json: bool,
@@ -131,6 +157,10 @@ fn main() {
     // The libexec path is NOPASSWD for the operator. Boundary lifecycle must
     // stay behind an interactive authentication, so refuse anything other than
     // the mediated operations when we were invoked through that path.
+    //
+    // This is an allowlist, deliberately: `install`, `rollback` and `uninstall`
+    // are refused here by not appearing, and any lifecycle command added later
+    // inherits the refusal instead of having to remember to ask for it.
     if invoked_as_privileged_broker() && !matches!(cli.cmd, Cmd::Broker { .. } | Cmd::Doctor { .. })
     {
         eprintln!(
@@ -166,6 +196,19 @@ fn main() {
             service_user,
             service_group,
             operator,
+            non_interactive,
+        ),
+        Cmd::Uninstall {
+            dry_run,
+            purge_vault,
+            remove_service_user,
+            config,
+            non_interactive,
+        } => run_uninstall(
+            dry_run,
+            purge_vault,
+            remove_service_user,
+            config,
             non_interactive,
         ),
         Cmd::Doctor {
@@ -444,6 +487,78 @@ fn run_install(
     }
 }
 
+fn run_uninstall(
+    dry_run: bool,
+    purge_vault: bool,
+    remove_service_user: bool,
+    config: Option<PathBuf>,
+    non_interactive: bool,
+) {
+    // Confirm here, while still unprivileged and still attached to the
+    // operator's terminal. The elevated re-exec below passes
+    // `--non-interactive`, so this is the only place a prompt can happen —
+    // and both of these destroy state that outlives the install.
+    if !non_interactive && !dry_run && is_tty() {
+        if purge_vault
+            && !prompt_yes_no(
+                "Delete the vault and every secret in it? This cannot be undone.",
+                false,
+            )
+        {
+            eprintln!("uninstall aborted");
+            std::process::exit(2);
+        }
+        if remove_service_user
+            && !prompt_yes_no(
+                "Delete the service user and group? Other tools may still depend on them.",
+                false,
+            )
+        {
+            eprintln!("uninstall aborted");
+            std::process::exit(2);
+        }
+    }
+
+    // Uninstall is boundary lifecycle: interactive sudo/Touch ID, never the
+    // NOPASSWD broker path.
+    if unsafe { libc::geteuid() } != 0 {
+        let mut cmd = Command::new(SUDO);
+        cmd.arg(self_exe()).arg("uninstall");
+        if dry_run {
+            cmd.arg("--dry-run");
+        }
+        if purge_vault {
+            cmd.arg("--purge-vault");
+        }
+        if remove_service_user {
+            cmd.arg("--remove-service-user");
+        }
+        if let Some(cfg) = &config {
+            cmd.arg("--config").arg(cfg);
+        }
+        cmd.arg("--non-interactive");
+        match cmd.status() {
+            Ok(s) if s.success() => return,
+            Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+            Err(e) => {
+                eprintln!("cannot elevate uninstall: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let req = sudo_secretspec_cli::uninstall::UninstallRequest {
+        dry_run,
+        purge_vault,
+        remove_service_user,
+        config: config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH)),
+    };
+    if let Err(e) = sudo_secretspec_cli::uninstall::run(req) {
+        eprintln!("uninstall denied: {e}");
+        std::process::exit(2);
+    }
+}
+
 fn lifecycle(op: &str, name: &str, reason: &str) {
     let mut cmd = Command::new(SUDO);
     cmd.arg("-n")
@@ -611,7 +726,7 @@ fn doctor(json: bool, config: Option<PathBuf>, caller_path: Option<OsString>) {
         }
     }
 
-    let config = config.unwrap_or_else(|| PathBuf::from("/usr/local/etc/sudo-secretspec.toml"));
+    let config = config.unwrap_or_else(|| PathBuf::from(CONFIG_PATH));
     let layout = match sudo_secretspec_cli::load_config(&config) {
         Ok(l) => l,
         Err(e) => {

@@ -37,7 +37,17 @@ fn help_exposes_typed_boundary_commands() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     for command in [
-        "get", "set", "add", "delete", "check", "export", "run", "install", "doctor", "rollback",
+        "get",
+        "set",
+        "add",
+        "delete",
+        "check",
+        "export",
+        "run",
+        "install",
+        "uninstall",
+        "doctor",
+        "rollback",
     ] {
         assert!(stdout.contains(command), "missing {command}");
     }

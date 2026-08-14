@@ -51,3 +51,9 @@ The dry-run still uses `sudo` because protected metadata cannot be validated hon
 ```bash
 sudo-secretspec rollback /usr/local/libexec/sudo-secretspec-rollback-<timestamp>
 ```
+
+Removing the boundary is `sudo-secretspec uninstall`, and it is an operator
+action, not an automation one. Never run it to work around a failed check. It
+too requires interactive authentication, and `--dry-run` prints the plan without
+changing anything. It preserves the vault and the service identity unless
+`--purge-vault` or `--remove-service-user` is passed; do not pass either.

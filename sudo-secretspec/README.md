@@ -49,6 +49,25 @@ Privileged boundary creation always requires an explicit `sudo-secretspec
 install` (Touch ID/sudo); see [`../packaging/README.md`](../packaging/README.md)
 for the Homebrew safety boundary.
 
+## Removing it
+
+```bash
+sudo-secretspec uninstall --dry-run   # print the plan, change nothing
+sudo-secretspec uninstall
+```
+
+Removes exactly the paths in the table above, sudo policy first. The vault and
+the service identity are left alone: `--purge-vault` deletes the vault and every
+secret in it, and `--remove-service-user` deletes the service user and group.
+Each prompts for its own confirmation, and `--remove-service-user` refuses an
+identity this installer did not create — an adopted account such as
+`_secretspec` has other consumers.
+
+The sudo policy is checked against the install manifest before it is unlinked.
+If its bytes do not match, it is left in place with a warning: the path is
+predictable and other vendors keep drop-ins in the same directory, so a file
+sitting there is not proof this installer wrote it.
+
 ## Security model
 
 - Singular mediated path for credential CRUD/use
@@ -59,7 +78,8 @@ for the Homebrew safety boundary.
 - Doctor/drift is metadata-only and never repairs; advisory findings are
   reported without failing the check
 - The NOPASSWD policy covers only mediated broker operations and `doctor`;
-  `install` and `rollback` always require interactive authentication
+  `install`, `rollback`, and `uninstall` always require interactive
+  authentication
 - Rollback snapshots restore installed artifacts, not vault secret values, and
   are verified against the snapshot manifest before anything is written
 

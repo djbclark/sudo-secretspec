@@ -13,7 +13,7 @@ use std::process::Command;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const PREFIX: &str = "/usr/local";
+pub(crate) const PREFIX: &str = "/usr/local";
 const CONFIG_PATH: &str = "/usr/local/etc/sudo-secretspec.toml";
 const SUDOERS_PATH: &str = "/private/etc/sudoers.d/sudo-secretspec";
 /// Any file installed under here is a sudo policy and must be validated before
@@ -233,7 +233,12 @@ pub fn plan_prune(snapshots: &[Snapshot], keep: usize) -> Vec<PathBuf> {
 /// A directory failing any of them is left alone rather than removed: it is
 /// not ours, and deleting it as root on a guess is the worse error.
 /// Returns the number removed. Never fails an install: pruning is hygiene.
-fn prune_snapshots(dir: &Path, keep: usize) -> usize {
+///
+/// `uninstall` calls this with `keep = 0`: once the artifacts are gone every
+/// snapshot restores paths that no longer exist, and reusing this rather than
+/// walking the directory itself means they are vetted by exactly the same
+/// guards a normal install prunes them under.
+pub(crate) fn prune_snapshots(dir: &Path, keep: usize) -> usize {
     let mut removed = 0;
     for path in plan_prune(&list_snapshots(dir), keep) {
         let Ok(meta) = fs::symlink_metadata(&path) else {
