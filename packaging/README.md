@@ -1,30 +1,40 @@
 # sudo-secretspec downstream packaging
 
-This downstream release is built from upstream SecretSpec `0.19.1` and stamps the
-whole workspace — including the `secretspec` crate — with the downstream version
-`0.19.1-djbclark.1`. `release.py` verifies both halves: that the upstream tag it
-descends from carries `version = "0.19.1"`, and that this tree's root
-`Cargo.toml` carries the downstream version.
+Downstream releases are built from upstream SecretSpec `0.19.1` and stamp the
+whole workspace — including the `secretspec` crate — with a downstream version
+of the form `0.19.1-djbclark.N`. `release.py` verifies both halves: that the
+upstream tag it descends from carries `version = "0.19.1"`, and that this tree's
+root `Cargo.toml` carries the downstream version being cut.
 
-- Tag: `v0.19.1-djbclark.1`
-- Release title: `SecretSpec 0.19.1 — sudo-secretspec downstream 1`
+- Tag: `v0.19.1-djbclark.N`
+- Release title: `SecretSpec 0.19.1 — sudo-secretspec downstream N`
 - Fork: `djbclark/sudo-secretspec` (parent `cachix/secretspec`)
+
+The upstream base is a constant in `release.py`. Which downstream serial to cut
+is a `--version` argument; rebasing onto a newer upstream tag is a separate,
+larger decision and the script refuses to do it implicitly.
 
 ## Release
 
 The maintainer entrypoint is `packaging/release.py`. It validates a clean
-`main`/`master` tree, HTTPS remotes, the upstream `v0.19.1` ancestry/version,
-and GitHub fork parent before any write.
+`sudo-main` tree, HTTPS remotes, the upstream `v0.19.1` ancestry/version, the
+GitHub fork parent, that the workspace is stamped at the version being cut, and
+that the tag is not already published — all before any write.
+
+Bump `version` in the root `Cargo.toml` (and the two inter-crate `version =`
+constraints beside it) first; preflight refuses to release a workspace stamped
+at anything else.
 
 ```bash
 # Safe preview; performs no writes.
-python3 packaging/release.py --dry-run
+python3 packaging/release.py --version 0.19.1-djbclark.2 --dry-run
 
-# Live release after packaging and companion changes are committed on main.
-python3 packaging/release.py
+# Live release after packaging and companion changes are committed on sudo-main.
+python3 packaging/release.py --version 0.19.1-djbclark.2
 
 # Alternate local tap clone.
-python3 packaging/release.py --tap-path ~/src/homebrew-sudo-secretspec
+python3 packaging/release.py --version 0.19.1-djbclark.2 \
+  --tap-path ~/src/homebrew-sudo-secretspec
 ```
 
 The live flow runs focused Python and Rust tests, creates and pushes an

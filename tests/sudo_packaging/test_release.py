@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -28,8 +29,27 @@ def release():
     return load_release()
 
 
+@pytest.fixture
+def cut(release):
+    """The release this checkout is stamped at, so a version bump is inert here."""
+    return workspace_release(release)
+
+
 def completed(argv, stdout="", returncode=0):
     return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr="")
+
+
+def workspace_release(release):
+    """The release the checked-in workspace version corresponds to.
+
+    `preflight` reads the real `Cargo.toml`, so the tests have to agree with
+    whatever it is stamped at. Deriving it keeps a version bump from breaking
+    tests that are not about the version.
+    """
+    text = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+    match = re.search(r'version = "(\d+\.\d+\.\d+-djbclark\.\d+)"', text)
+    assert match, "workspace Cargo.toml is not stamped with a downstream version"
+    return release.parse_release(match.group(1))
 
 
 # The git half of a passing preflight; each test supplies its own `gh` response.
@@ -54,13 +74,32 @@ PREFLIGHT_GIT_OUTPUTS = {
 }
 
 
-def test_release_identity_is_pinned(release):
-    assert release.VERSION == "0.19.1-djbclark.1"
-    assert release.TAG == "v0.19.1-djbclark.1"
-    assert release.RELEASE_TITLE == "SecretSpec 0.19.1 — sudo-secretspec downstream 1"
-    release.validate_version(release.VERSION)
-    with pytest.raises(release.ReleaseError):
-        release.validate_version("0.19.1-djbclark.2")
+def test_release_identity_is_derived_from_the_serial(release, cut):
+    cut = release.parse_release("0.19.1-djbclark.2")
+    assert cut.serial == 2
+    assert cut.version == "0.19.1-djbclark.2"
+    assert cut.tag == "v0.19.1-djbclark.2"
+    assert cut.title == "SecretSpec 0.19.1 — sudo-secretspec downstream 2"
+    assert cut.archive_url == (
+        "https://github.com/djbclark/sudo-secretspec/archive/refs/tags/"
+        "v0.19.1-djbclark.2.tar.gz"
+    )
+
+
+def test_only_downstream_versions_on_the_pinned_upstream_base_are_accepted(release):
+    # The upstream base stays a constant: rebasing onto a new upstream tag is a
+    # separate decision, not something a --version argument may do implicitly.
+    for bad in (
+        "0.20.0-djbclark.1",
+        "0.19.1",
+        "v0.19.1-djbclark.1",
+        "0.19.1-djbclark.0",
+        "0.19.1-djbclark.01",
+        "0.19.1-other.1",
+        "",
+    ):
+        with pytest.raises(release.ReleaseError):
+            release.parse_release(bad)
 
 
 def test_https_release_url_guard(release):
@@ -72,17 +111,60 @@ def test_https_release_url_guard(release):
             release.validate_release_url(url)
 
 
-def test_formula_rewrite_is_exact(tmp_path: Path, release):
+def test_formula_rewrite_restamps_every_version_site(tmp_path: Path, release, cut):
+    # Rewriting only the `url` shipped a formula that fetched the new tarball
+    # while declaring and asserting the previous version, so `brew test` failed
+    # after the tag and the GitHub Release were already published.
     formula = tmp_path / "sudo-secretspec.rb"
     formula.write_text(
-        '  url "https://github.com/djbclark/sudo-secretspec/archive/refs/tags/v0.0.0.tar.gz"\n'
+        '  url "https://github.com/djbclark/sudo-secretspec/archive/refs/tags/'
+        'v0.19.1-djbclark.1.tar.gz"\n'
+        '  version "0.19.1-djbclark.1"\n'
+        f'  sha256 "{"0" * 64}"\n'
+        "  test do\n"
+        '    assert_match "0.19.1-djbclark.1", shell_output("secretspec --version")\n'
+        '    assert_match "sudo-secretspec 0.19.1-djbclark.1", shell_output("x")\n'
+        "  end\n",
+        encoding="utf-8",
+    )
+    cut = release.parse_release("0.19.1-djbclark.2")
+
+    release.rewrite_formula(formula, cut, "a" * 64)
+
+    text = formula.read_text(encoding="utf-8")
+    assert "0.19.1-djbclark.1" not in text, text
+    assert text.count("0.19.1-djbclark.2") == release.FORMULA_VERSION_SITES
+    assert f'url "{cut.archive_url}"' in text
+    assert f'sha256 "{"a" * 64}"' in text
+
+
+def test_formula_rewrite_refuses_an_unexpected_number_of_version_sites(
+    tmp_path: Path, release
+):
+    formula = tmp_path / "sudo-secretspec.rb"
+    formula.write_text(
+        '  url "https://github.com/djbclark/sudo-secretspec/archive/refs/tags/'
+        'v0.19.1-djbclark.1.tar.gz"\n'
         f'  sha256 "{"0" * 64}"\n',
         encoding="utf-8",
     )
-    release.rewrite_formula(formula, release.VERSION, "a" * 64)
-    text = formula.read_text(encoding="utf-8")
-    assert f"tags/{release.TAG}.tar.gz" in text
-    assert f'sha256 "{"a" * 64}"' in text
+    with pytest.raises(release.ReleaseError, match="version references"):
+        release.rewrite_formula(
+            formula, release.parse_release("0.19.1-djbclark.2"), "a" * 64
+        )
+
+
+def test_the_real_formula_has_exactly_the_expected_version_sites(release):
+    """The count `rewrite_formula` enforces must match the shipped formula.
+
+    This is the regression test for the bug above: the explicit `version`
+    stanza and the two `brew test` assertions were added to the formula long
+    after the rewriter was written, and nothing tied the two together.
+    """
+    text = release.FORMULA.read_text(encoding="utf-8")
+    assert (
+        len(release.ANY_VERSION_RE.findall(text)) == release.FORMULA_VERSION_SITES
+    ), text
 
 
 def test_preflight_validates_branch_remotes_lineage_and_fork(monkeypatch, release):
@@ -131,8 +213,57 @@ def test_preflight_validates_branch_remotes_lineage_and_fork(monkeypatch, releas
         return completed(argv, outputs.get(key, ""))
 
     monkeypatch.setattr(release, "run", fake_run)
-    release.preflight(allow_dirty=False)
+    release.preflight(workspace_release(release), allow_dirty=False)
     assert ["git", "merge-base", "--is-ancestor", "v0.19.1", "HEAD"] in calls
+
+
+def test_preflight_refuses_a_serial_that_is_already_published(monkeypatch, release):
+    """Catch a re-used serial before the tests run and a local tag exists.
+
+    The remote is the authority, not the local tag list: a serial can have been
+    published from another checkout entirely.
+    """
+
+    def fake_run(argv, **kwargs):
+        if argv[:2] == ["git", "ls-remote"]:
+            return completed(argv, "9f4c…\trefs/tags/v0.19.1-djbclark.9\n")
+        if argv[:4] == ["gh", "repo", "view", "djbclark/sudo-secretspec"]:
+            return completed(
+                argv,
+                json.dumps(
+                    {
+                        "nameWithOwner": "djbclark/sudo-secretspec",
+                        "parent": {"nameWithOwner": "cachix/secretspec"},
+                        "defaultBranchRef": {"name": "sudo-main"},
+                    }
+                ),
+            )
+        return completed(argv, PREFLIGHT_GIT_OUTPUTS.get(tuple(argv), ""))
+
+    monkeypatch.setattr(release, "run", fake_run)
+    with pytest.raises(release.ReleaseError, match="already published"):
+        release.preflight(workspace_release(release), allow_dirty=False)
+
+
+def test_preflight_refuses_a_workspace_stamped_at_another_version(monkeypatch, release):
+    def fake_run(argv, **kwargs):
+        if argv[:4] == ["gh", "repo", "view", "djbclark/sudo-secretspec"]:
+            return completed(
+                argv,
+                json.dumps(
+                    {
+                        "nameWithOwner": "djbclark/sudo-secretspec",
+                        "parent": {"nameWithOwner": "cachix/secretspec"},
+                        "defaultBranchRef": {"name": "sudo-main"},
+                    }
+                ),
+            )
+        return completed(argv, PREFLIGHT_GIT_OUTPUTS.get(tuple(argv), ""))
+
+    monkeypatch.setattr(release, "run", fake_run)
+    # A serial nobody will ever cut, so it cannot match the real Cargo.toml.
+    with pytest.raises(release.ReleaseError, match="bump Cargo.toml"):
+        release.preflight(release.parse_release("0.19.1-djbclark.999"), allow_dirty=False)
 
 
 def test_parent_slug_accepts_every_gh_parent_shape(release):
@@ -178,7 +309,7 @@ def test_preflight_accepts_gh_parent_without_name_with_owner(monkeypatch, releas
         return completed(argv, PREFLIGHT_GIT_OUTPUTS.get(tuple(argv), ""))
 
     monkeypatch.setattr(release, "run", fake_run)
-    release.preflight(allow_dirty=False)
+    release.preflight(workspace_release(release), allow_dirty=False)
 
 
 def test_preflight_rejects_wrong_fork_parent(monkeypatch, release):
@@ -221,41 +352,41 @@ def test_preflight_rejects_wrong_fork_parent(monkeypatch, release):
 
     monkeypatch.setattr(release, "run", fake_run)
     with pytest.raises(release.ReleaseError, match="parent"):
-        release.preflight(allow_dirty=False)
+        release.preflight(workspace_release(release), allow_dirty=False)
 
 
-def test_dry_run_lists_remote_actions_without_running(monkeypatch, release, capsys):
-    monkeypatch.setattr(release, "preflight", lambda **kwargs: None)
+def test_dry_run_lists_remote_actions_without_running(monkeypatch, release, capsys, cut):
+    monkeypatch.setattr(release, "preflight", lambda _release, **kwargs: None)
     monkeypatch.setattr(release, "run_tests", lambda **kwargs: None)
-    assert release.main(["--dry-run", "--skip-tests"]) == 0
+    assert release.main(["--version", cut.version, "--dry-run", "--skip-tests"]) == 0
     output = capsys.readouterr().out
-    assert f"git tag -a {release.TAG}" in output
-    assert f"git push origin {release.TAG}" in output
+    assert f"git tag -a {cut.tag}" in output
+    assert f"git push origin {cut.tag}" in output
     assert "gh release create" in output
     assert "Formula/sudo-secretspec.rb" in output
 
 
-def test_dry_run_still_validates_preflight(monkeypatch, release):
+def test_dry_run_still_validates_preflight(monkeypatch, release, cut):
     seen = []
     monkeypatch.setattr(
-        release, "preflight", lambda **kwargs: seen.append(kwargs) or None
+        release, "preflight", lambda _release, **kwargs: seen.append(kwargs) or None
     )
     monkeypatch.setattr(release, "run", lambda argv, **kwargs: completed(argv))
-    assert release.main(["--dry-run", "--skip-tests"]) == 0
+    assert release.main(["--version", cut.version, "--dry-run", "--skip-tests"]) == 0
     assert seen == [{"allow_dirty": False}]
 
 
-def test_dry_run_aborts_when_preflight_fails(monkeypatch, release):
-    def boom(**kwargs):
+def test_dry_run_aborts_when_preflight_fails(monkeypatch, release, cut):
+    def boom(_release, **kwargs):
         raise release.ReleaseError("fork parent must be cachix/secretspec, got None")
 
     monkeypatch.setattr(release, "preflight", boom)
     with pytest.raises(release.ReleaseError, match="fork parent"):
-        release.main(["--dry-run", "--skip-tests"])
+        release.main(["--version", cut.version, "--dry-run", "--skip-tests"])
 
 
 def test_verify_readback_accepts_gh_parent_without_name_with_owner(
-    monkeypatch, release
+    monkeypatch, release, cut
 ):
     def fake_run(argv, **kwargs):
         if argv[:3] == ["gh", "repo", "view"]:
@@ -273,24 +404,24 @@ def test_verify_readback_accepts_gh_parent_without_name_with_owner(
                 argv,
                 json.dumps(
                     {
-                        "tagName": release.TAG,
-                        "name": release.RELEASE_TITLE,
+                        "tagName": cut.tag,
+                        "name": cut.title,
                         "isDraft": False,
                     }
                 ),
             )
         if argv[:2] == ["gh", "api"]:
-            return completed(argv, json.dumps({"ref": f"refs/tags/{release.TAG}"}))
+            return completed(argv, json.dumps({"ref": f"refs/tags/{cut.tag}"}))
         if argv[-1:] == ["--version"]:
-            return completed(argv, f"secretspec {release.VERSION}\n")
+            return completed(argv, f"secretspec {cut.version}\n")
         return completed(argv)
 
     monkeypatch.setattr(release, "run", fake_run)
-    release.verify_readback("/opt/homebrew/opt/sudo-secretspec")
+    release.verify_readback(cut, "/opt/homebrew/opt/sudo-secretspec")
 
 
 def test_verify_readback_checks_repo_tag_release_and_installed_version(
-    monkeypatch, release
+    monkeypatch, release, cut
 ):
     calls = []
 
@@ -311,8 +442,8 @@ def test_verify_readback_checks_repo_tag_release_and_installed_version(
                 argv,
                 json.dumps(
                     {
-                        "tagName": release.TAG,
-                        "name": release.RELEASE_TITLE,
+                        "tagName": cut.tag,
+                        "name": cut.title,
                         "isDraft": False,
                     }
                 ),
@@ -320,21 +451,21 @@ def test_verify_readback_checks_repo_tag_release_and_installed_version(
         if argv[:3] == [
             "gh",
             "api",
-            f"repos/{release.FORK_REPO}/git/ref/tags/{release.TAG}",
+            f"repos/{release.FORK_REPO}/git/ref/tags/{cut.tag}",
         ]:
-            return completed(argv, json.dumps({"ref": f"refs/tags/{release.TAG}"}))
+            return completed(argv, json.dumps({"ref": f"refs/tags/{cut.tag}"}))
         if argv[-1:] == ["--version"]:
-            return completed(argv, f"secretspec {release.VERSION}\n")
+            return completed(argv, f"secretspec {cut.version}\n")
         return completed(argv)
 
     monkeypatch.setattr(release, "run", fake_run)
-    release.verify_readback("/opt/homebrew/opt/sudo-secretspec")
+    release.verify_readback(cut, "/opt/homebrew/opt/sudo-secretspec")
     assert any(argv[:3] == ["gh", "release", "view"] for argv in calls)
     assert any(argv[-1:] == ["--version"] for argv in calls)
 
 
 def test_interruption_cleanup_removes_only_created_tag_and_formula_change(
-    monkeypatch, release
+    monkeypatch, release, cut
 ):
     calls = []
     monkeypatch.setattr(
@@ -343,9 +474,9 @@ def test_interruption_cleanup_removes_only_created_tag_and_formula_change(
     state = release.CleanupState(
         tag_created=True, tag_pushed=False, formula_changed=True
     )
-    release.cleanup_interrupted(state)
+    release.cleanup_interrupted(cut, state)
     assert calls == [
-        ["git", "tag", "-d", release.TAG],
+        ["git", "tag", "-d", cut.tag],
         [
             "git",
             "restore",
@@ -363,6 +494,6 @@ def test_interruption_cleanup_never_deletes_pushed_tag(monkeypatch, release):
         release, "run", lambda argv, **kwargs: calls.append(argv) or completed(argv)
     )
     release.cleanup_interrupted(
-        release.CleanupState(tag_created=True, tag_pushed=True, formula_changed=False)
+        cut, release.CleanupState(tag_created=True, tag_pushed=True, formula_changed=False)
     )
     assert calls == []

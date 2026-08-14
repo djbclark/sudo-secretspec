@@ -11,9 +11,18 @@ fn version_identifies_downstream_distribution() {
         .output()
         .expect("run sudo-secretspec");
     assert!(output.status.success());
+    let reported = String::from_utf8(output.stdout).unwrap().trim().to_string();
+
+    // Assert the shape, not a literal: the point is that the binary announces
+    // itself as the downstream distribution rather than plain upstream, and
+    // pinning the number here only meant editing this test on every release.
     assert_eq!(
-        String::from_utf8(output.stdout).unwrap().trim(),
-        "sudo-secretspec 0.19.1-djbclark.1"
+        reported,
+        format!("sudo-secretspec {}", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(
+        reported.contains("-djbclark."),
+        "version must identify the fork: {reported}"
     );
 }
 

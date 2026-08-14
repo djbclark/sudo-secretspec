@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
-"""Release sudo-secretspec downstream v0.19.1-djbclark.1 and its tap.
+"""Release a sudo-secretspec downstream version and its tap.
 
-The release descends from upstream 0.19.1 and stamps the whole workspace with
-the downstream version 0.19.1-djbclark.1. Use ``--dry-run`` to print
-all mutating commands. The live path validates fork lineage, creates an
-annotated tag and GitHub Release, rewrites the formula checksum, synchronizes
-the tap, and performs a live Homebrew readback test.
+The release descends from a pinned upstream tag and stamps the whole workspace
+with a downstream version such as ``0.19.1-djbclark.2``. Which one is a
+command-line argument::
+
+    packaging/release.py --version 0.19.1-djbclark.2 --dry-run
+
+The upstream base stays a constant in this file. Rebasing onto a newer upstream
+tag is a different and much larger decision than cutting the next downstream
+patch, and ``preflight`` verifies the pinned base really is an ancestor of what
+is being released.
+
+``--dry-run`` prints all mutating commands. The live path validates fork
+lineage, creates an annotated tag and GitHub Release, rewrites the formula
+version and checksum, synchronizes the tap, and performs a live Homebrew
+readback test.
 """
 
 from __future__ import annotations
@@ -26,10 +36,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.19.1-djbclark.1"
-TAG = f"v{VERSION}"
-UPSTREAM_TAG = "v0.19.1"
-RELEASE_TITLE = "SecretSpec 0.19.1 — sudo-secretspec downstream 1"
+UPSTREAM_VERSION = "0.19.1"
+UPSTREAM_TAG = f"v{UPSTREAM_VERSION}"
 FORK_REPO = "djbclark/sudo-secretspec"
 UPSTREAM_REPO = "cachix/secretspec"
 ORIGIN_URL = f"https://github.com/{FORK_REPO}.git"
@@ -38,12 +46,47 @@ FORMULA_REL = Path("packaging/homebrew/sudo-secretspec.rb")
 FORMULA = ROOT / FORMULA_REL
 DEFAULT_TAP = Path.home() / "src" / "homebrew-sudo-secretspec"
 FORMULA_NAME = "djbclark/sudo-secretspec/sudo-secretspec"
-ARCHIVE_URL = f"https://github.com/{FORK_REPO}/archive/refs/tags/{TAG}.tar.gz"
-VERSION_RE = re.compile(r"^0\.19\.1-djbclark\.1$")
+VERSION_RE = re.compile(rf"^{re.escape(UPSTREAM_VERSION)}-djbclark\.([1-9][0-9]*)$")
+# Any downstream version, anywhere in a file. Used to restamp the formula.
+ANY_VERSION_RE = re.compile(rf"{re.escape(UPSTREAM_VERSION)}-djbclark\.[0-9]+")
+# Places the formula names its own version: the source `url`, the explicit
+# `version` stanza, and both `brew test` assertions. Pinned as a count so that
+# adding a fifth site fails this script loudly instead of shipping a formula
+# that is only half restamped.
+FORMULA_VERSION_SITES = 4
 
 
 class ReleaseError(RuntimeError):
     """Release invariant failed."""
+
+
+@dataclass(frozen=True)
+class Release:
+    """Every version-derived value for one downstream release.
+
+    Built from the serial so that cutting the next release is an argument
+    rather than an edit to this file — which is what it was through
+    ``0.19.1-djbclark.1``, when the version was a module constant guarded by a
+    regex that refused every other value.
+    """
+
+    serial: int
+
+    @property
+    def version(self) -> str:
+        return f"{UPSTREAM_VERSION}-djbclark.{self.serial}"
+
+    @property
+    def tag(self) -> str:
+        return f"v{self.version}"
+
+    @property
+    def title(self) -> str:
+        return f"SecretSpec {UPSTREAM_VERSION} — sudo-secretspec downstream {self.serial}"
+
+    @property
+    def archive_url(self) -> str:
+        return f"https://github.com/{FORK_REPO}/archive/refs/tags/{self.tag}.tar.gz"
 
 
 def log(message: str) -> None:
@@ -69,11 +112,20 @@ def output(argv: list[str], **kwargs: object) -> str:
     return (run(argv, **kwargs).stdout or "").strip()
 
 
-def validate_version(version: str) -> None:
-    if not VERSION_RE.fullmatch(version):
+def parse_release(version: str) -> Release:
+    """Build a [`Release`] from a full downstream version string.
+
+    The full string rather than a bare serial: it is what appears in the tag,
+    the formula, and the changelog, so there is one spelling to get right and
+    no way to cut ``djbclark.2`` while believing you asked for ``0.20.0``.
+    """
+    match = VERSION_RE.fullmatch(version)
+    if not match:
         raise ReleaseError(
-            f"this downstream release is pinned to {VERSION}, got {version!r}"
+            f"downstream version must be {UPSTREAM_VERSION}-djbclark.N with N >= 1, "
+            f"got {version!r}"
         )
+    return Release(serial=int(match.group(1)))
 
 
 def validate_release_url(url: str) -> None:
@@ -108,7 +160,7 @@ def _require(value: bool, message: str) -> None:
         raise ReleaseError(message)
 
 
-def preflight(*, allow_dirty: bool) -> None:
+def preflight(release: Release, *, allow_dirty: bool) -> None:
     status = output(["git", "status", "--porcelain"])
     _require(
         allow_dirty or not status,
@@ -128,12 +180,20 @@ def preflight(*, allow_dirty: bool) -> None:
     run(["git", "merge-base", "--is-ancestor", UPSTREAM_TAG, "HEAD"])
     manifest = output(["git", "show", f"{UPSTREAM_TAG}:Cargo.toml"])
     _require(
-        'version = "0.19.1"' in manifest,
-        f"{UPSTREAM_TAG} is not upstream workspace version 0.19.1",
+        f'version = "{UPSTREAM_VERSION}"' in manifest,
+        f"{UPSTREAM_TAG} is not upstream workspace version {UPSTREAM_VERSION}",
     )
     _require(
-        f'version = "{VERSION}"' in (ROOT / "Cargo.toml").read_text(encoding="utf-8"),
-        "workspace downstream version mismatch",
+        f'version = "{release.version}"'
+        in (ROOT / "Cargo.toml").read_text(encoding="utf-8"),
+        f"workspace is not stamped {release.version}; bump Cargo.toml first",
+    )
+    # Catch a re-used serial here rather than after the test suite has run and
+    # a local tag already exists. The remote is the authority: a serial can be
+    # published from another checkout.
+    _require(
+        not output(["git", "ls-remote", "--tags", "origin", release.tag]),
+        f"{release.tag} is already published on origin; pick the next serial",
     )
     repo = json.loads(
         output(
@@ -169,31 +229,40 @@ def run_tests(*, dry_run: bool) -> None:
     )
 
 
-def rewrite_formula(path: Path, version: str, sha256: str) -> None:
-    validate_version(version)
+def rewrite_formula(path: Path, release: Release, sha256: str) -> None:
+    """Restamp the formula onto `release`.
+
+    Every place the formula names a downstream version is rewritten, not just
+    the source `url`. The explicit `version` stanza and the `brew test`
+    assertions were added to the formula after this function was first written,
+    and rewriting the url alone published a formula that fetched the new
+    tarball while declaring — and asserting — the previous version.
+    """
     text = path.read_text(encoding="utf-8")
-    text, urls = re.subn(
-        r'url "https://github\.com/djbclark/sudo-secretspec/archive/refs/tags/v[^\"]+\.tar\.gz"',
-        f'url "https://github.com/{FORK_REPO}/archive/refs/tags/v{version}.tar.gz"',
-        text,
-        count=1,
-    )
-    text, hashes = re.subn(
-        r'sha256 "[0-9a-f]{64}"', f'sha256 "{sha256}"', text, count=1
-    )
-    if urls != 1 or hashes != 1:
-        raise ReleaseError(f"failed to rewrite exactly one URL and checksum in {path}")
+    text, versions = ANY_VERSION_RE.subn(release.version, text)
+    if versions != FORMULA_VERSION_SITES:
+        raise ReleaseError(
+            f"expected {FORMULA_VERSION_SITES} downstream version references in {path}, "
+            f"rewrote {versions}"
+        )
+    text, hashes = re.subn(r'sha256 "[0-9a-f]{64}"', f'sha256 "{sha256}"', text, count=1)
+    if hashes != 1:
+        raise ReleaseError(f"failed to rewrite exactly one checksum in {path}")
+    # The version substitution above is textual; confirm it actually produced
+    # the archive URL this release will publish.
+    if f'url "{release.archive_url}"' not in text:
+        raise ReleaseError(f"formula url is not {release.archive_url}")
     path.write_text(text, encoding="utf-8")
 
 
-def archive_sha256(*, dry_run: bool) -> str:
-    validate_release_url(ARCHIVE_URL)
+def archive_sha256(release: Release, *, dry_run: bool) -> str:
+    validate_release_url(release.archive_url)
     if dry_run:
-        log(f"[dry-run] hash {ARCHIVE_URL}")
+        log(f"[dry-run] hash {release.archive_url}")
         return "0" * 64
     digest = hashlib.sha256()
     request = urllib.request.Request(
-        ARCHIVE_URL, headers={"User-Agent": "sudo-secretspec-release"}
+        release.archive_url, headers={"User-Agent": "sudo-secretspec-release"}
     )
     with urllib.request.urlopen(request, timeout=60) as response:
         while chunk := response.read(1024 * 1024):
@@ -201,12 +270,14 @@ def archive_sha256(*, dry_run: bool) -> str:
     return digest.hexdigest()
 
 
-def create_tag_and_release(notes: str, state: CleanupState, *, dry_run: bool) -> None:
-    if output(["git", "tag", "--list", TAG]) and not dry_run:
-        raise ReleaseError(f"local tag already exists: {TAG}")
-    run(["git", "tag", "-a", TAG, "-m", RELEASE_TITLE], dry_run=dry_run)
+def create_tag_and_release(
+    release: Release, notes: str, state: CleanupState, *, dry_run: bool
+) -> None:
+    if output(["git", "tag", "--list", release.tag]) and not dry_run:
+        raise ReleaseError(f"local tag already exists: {release.tag}")
+    run(["git", "tag", "-a", release.tag, "-m", release.title], dry_run=dry_run)
     state.tag_created = not dry_run
-    run(["git", "push", "origin", TAG], dry_run=dry_run)
+    run(["git", "push", "origin", release.tag], dry_run=dry_run)
     state.tag_pushed = not dry_run
     if dry_run:
         run(
@@ -214,11 +285,11 @@ def create_tag_and_release(notes: str, state: CleanupState, *, dry_run: bool) ->
                 "gh",
                 "release",
                 "create",
-                TAG,
+                release.tag,
                 "--repo",
                 FORK_REPO,
                 "--title",
-                RELEASE_TITLE,
+                release.title,
                 "--notes-file",
                 "<temporary-notes>",
             ],
@@ -233,40 +304,45 @@ def create_tag_and_release(notes: str, state: CleanupState, *, dry_run: bool) ->
                 "gh",
                 "release",
                 "create",
-                TAG,
+                release.tag,
                 "--repo",
                 FORK_REPO,
                 "--title",
-                RELEASE_TITLE,
+                release.title,
                 "--notes-file",
                 notes_file.name,
             ]
         )
 
 
-def update_formula_commit(*, dry_run: bool, state: CleanupState) -> None:
-    sha = archive_sha256(dry_run=dry_run)
+def update_formula_commit(
+    release: Release, *, dry_run: bool, state: CleanupState
+) -> None:
+    sha = archive_sha256(release, dry_run=dry_run)
     if dry_run:
-        log(f"[dry-run] rewrite {FORMULA_REL} for {TAG} sha256={sha}")
+        log(f"[dry-run] rewrite {FORMULA_REL} for {release.tag} sha256={sha}")
         run(["git", "add", str(FORMULA_REL)], dry_run=True)
-        run(["git", "commit", "-m", f"Update Homebrew formula for {TAG}"], dry_run=True)
+        run(
+            ["git", "commit", "-m", f"Update Homebrew formula for {release.tag}"],
+            dry_run=True,
+        )
         run(["git", "push", "origin", "HEAD"], dry_run=True)
         return
-    rewrite_formula(FORMULA, VERSION, sha)
+    rewrite_formula(FORMULA, release, sha)
     state.formula_changed = True
     run(["git", "add", str(FORMULA_REL)])
-    run(["git", "commit", "-m", f"Update Homebrew formula for {TAG}"])
+    run(["git", "commit", "-m", f"Update Homebrew formula for {release.tag}"])
     state.formula_changed = False
     run(["git", "push", "origin", "HEAD"])
 
 
-def sync_tap(tap_path: Path, *, dry_run: bool) -> None:
+def sync_tap(release: Release, tap_path: Path, *, dry_run: bool) -> None:
     destination = tap_path / "Formula" / "sudo-secretspec.rb"
     if dry_run:
         log(f"[dry-run] copy {FORMULA_REL} -> {destination}")
         run(["git", "add", "Formula/sudo-secretspec.rb"], cwd=tap_path, dry_run=True)
         run(
-            ["git", "commit", "-m", f"sudo-secretspec {VERSION}"],
+            ["git", "commit", "-m", f"sudo-secretspec {release.version}"],
             cwd=tap_path,
             dry_run=True,
         )
@@ -281,11 +357,11 @@ def sync_tap(tap_path: Path, *, dry_run: bool) -> None:
     shutil.copy2(FORMULA, destination)
     run(["git", "add", "Formula/sudo-secretspec.rb"], cwd=tap_path)
     if output(["git", "diff", "--cached", "--name-only"], cwd=tap_path):
-        run(["git", "commit", "-m", f"sudo-secretspec {VERSION}"], cwd=tap_path)
+        run(["git", "commit", "-m", f"sudo-secretspec {release.version}"], cwd=tap_path)
         run(["git", "push", "origin", "HEAD"], cwd=tap_path)
 
 
-def brew_refresh_and_test(*, dry_run: bool) -> str:
+def brew_refresh_and_test(release: Release, *, dry_run: bool) -> str:
     run(["brew", "update", "--force"], dry_run=dry_run, capture=False)
     tap_repo = output(
         ["brew", "--repository", "djbclark/sudo-secretspec"], dry_run=dry_run
@@ -296,7 +372,8 @@ def brew_refresh_and_test(*, dry_run: bool) -> str:
         run(["git", "fetch", "origin", "main"], cwd=tap, capture=False)
         run(["git", "merge", "--ff-only", "origin/main"], cwd=tap, capture=False)
         _require(
-            TAG in (tap / "Formula/sudo-secretspec.rb").read_text(encoding="utf-8"),
+            release.tag
+            in (tap / "Formula/sudo-secretspec.rb").read_text(encoding="utf-8"),
             "live tap formula is stale",
         )
     run(["brew", "reinstall", FORMULA_NAME], dry_run=dry_run, capture=False)
@@ -308,7 +385,7 @@ def brew_refresh_and_test(*, dry_run: bool) -> str:
     return prefix
 
 
-def verify_readback(prefix: str) -> None:
+def verify_readback(release: Release, prefix: str) -> None:
     repo = json.loads(
         output(["gh", "repo", "view", FORK_REPO, "--json", "nameWithOwner,parent"])
     )
@@ -317,15 +394,17 @@ def verify_readback(prefix: str) -> None:
         parent_slug(repo) == UPSTREAM_REPO,
         "fork lineage readback mismatch",
     )
-    ref = json.loads(output(["gh", "api", f"repos/{FORK_REPO}/git/ref/tags/{TAG}"]))
-    _require(ref.get("ref") == f"refs/tags/{TAG}", "tag readback mismatch")
-    release = json.loads(
+    ref = json.loads(
+        output(["gh", "api", f"repos/{FORK_REPO}/git/ref/tags/{release.tag}"])
+    )
+    _require(ref.get("ref") == f"refs/tags/{release.tag}", "tag readback mismatch")
+    published = json.loads(
         output(
             [
                 "gh",
                 "release",
                 "view",
-                TAG,
+                release.tag,
                 "--repo",
                 FORK_REPO,
                 "--json",
@@ -334,11 +413,14 @@ def verify_readback(prefix: str) -> None:
         )
     )
     _require(
-        release == {"tagName": TAG, "name": RELEASE_TITLE, "isDraft": False},
+        published
+        == {"tagName": release.tag, "name": release.title, "isDraft": False},
         "release readback mismatch",
     )
     version = output([str(Path(prefix) / "bin" / "secretspec"), "--version"])
-    _require(VERSION in version, f"installed engine version mismatch: {version!r}")
+    _require(
+        release.version in version, f"installed engine version mismatch: {version!r}"
+    )
 
 
 @dataclass
@@ -348,21 +430,21 @@ class CleanupState:
     formula_changed: bool = False
 
 
-def cleanup_interrupted(state: CleanupState) -> None:
+def cleanup_interrupted(release: Release, state: CleanupState) -> None:
     if state.tag_created and not state.tag_pushed:
-        run(["git", "tag", "-d", TAG])
+        run(["git", "tag", "-d", release.tag])
     if state.formula_changed:
         run(["git", "restore", "--staged", "--worktree", "--", str(FORMULA_REL)])
 
 
 @contextmanager
-def interrupt_cleanup(state: CleanupState) -> Iterator[None]:
+def interrupt_cleanup(release: Release, state: CleanupState) -> Iterator[None]:
     previous = {
         number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)
     }
 
     def handler(number: int, _frame: object) -> None:
-        cleanup_interrupted(state)
+        cleanup_interrupted(release, state)
         raise ReleaseError(f"interrupted by {signal.Signals(number).name}")
 
     for number in previous:
@@ -376,7 +458,7 @@ def interrupt_cleanup(state: CleanupState) -> Iterator[None]:
 
 def default_notes() -> str:
     return (
-        "Downstream packaging release based on upstream SecretSpec 0.19.1.\n\n"
+        f"Downstream packaging release based on upstream SecretSpec {UPSTREAM_VERSION}.\n\n"
         "Adds the opt-in `sudo-secretspec` privilege-boundary companion. Homebrew installs files only; "
         "run `sudo-secretspec install` explicitly to configure privileged state.\n"
     )
@@ -384,6 +466,11 @@ def default_notes() -> str:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--version",
+        required=True,
+        help=f"downstream version to cut, e.g. {UPSTREAM_VERSION}-djbclark.2",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--allow-dirty", action="store_true")
     parser.add_argument("--skip-tests", action="store_true")
@@ -395,10 +482,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    validate_version(VERSION)
+    release = parse_release(args.version)
     # Preflight is read-only, so it runs on the dry-run path too: a rehearsal
     # that skips validation hides exactly the failures it exists to surface.
-    preflight(allow_dirty=args.allow_dirty)
+    preflight(release, allow_dirty=args.allow_dirty)
     if not args.skip_tests:
         run_tests(dry_run=args.dry_run)
     notes = (
@@ -407,15 +494,15 @@ def main(argv: list[str] | None = None) -> int:
         else default_notes()
     )
     state = CleanupState()
-    with interrupt_cleanup(state):
-        create_tag_and_release(notes, state, dry_run=args.dry_run)
+    with interrupt_cleanup(release, state):
+        create_tag_and_release(release, notes, state, dry_run=args.dry_run)
         if not args.skip_homebrew:
-            update_formula_commit(dry_run=args.dry_run, state=state)
-            sync_tap(args.tap_path, dry_run=args.dry_run)
-            prefix = brew_refresh_and_test(dry_run=args.dry_run)
+            update_formula_commit(release, dry_run=args.dry_run, state=state)
+            sync_tap(release, args.tap_path, dry_run=args.dry_run)
+            prefix = brew_refresh_and_test(release, dry_run=args.dry_run)
             if not args.dry_run:
-                verify_readback(prefix)
-    log(f"done: {RELEASE_TITLE} ({TAG})")
+                verify_readback(release, prefix)
+    log(f"done: {release.title} ({release.tag})")
     return 0
 
 
