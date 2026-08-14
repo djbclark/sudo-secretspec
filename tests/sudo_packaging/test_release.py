@@ -32,6 +32,28 @@ def completed(argv, stdout="", returncode=0):
     return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr="")
 
 
+# The git half of a passing preflight; each test supplies its own `gh` response.
+PREFLIGHT_GIT_OUTPUTS = {
+    ("git", "status", "--porcelain"): "",
+    ("git", "branch", "--show-current"): "sudo-main\n",
+    (
+        "git",
+        "remote",
+        "get-url",
+        "origin",
+    ): "https://github.com/djbclark/sudo-secretspec.git\n",
+    (
+        "git",
+        "remote",
+        "get-url",
+        "upstream",
+    ): "https://github.com/cachix/secretspec.git\n",
+    ("git", "rev-parse", "v0.19.1^{commit}"): "abc\n",
+    ("git", "merge-base", "--is-ancestor", "v0.19.1", "HEAD"): "",
+    ("git", "show", "v0.19.1:Cargo.toml"): '[workspace.package]\nversion = "0.19.1"\n',
+}
+
+
 def test_release_identity_is_pinned(release):
     assert release.VERSION == "0.19.1-djbclark.1"
     assert release.TAG == "v0.19.1-djbclark.1"
@@ -113,6 +135,52 @@ def test_preflight_validates_branch_remotes_lineage_and_fork(monkeypatch, releas
     assert ["git", "merge-base", "--is-ancestor", "v0.19.1", "HEAD"] in calls
 
 
+def test_parent_slug_accepts_every_gh_parent_shape(release):
+    # gh 2.97 omits nameWithOwner inside parent and returns its parts instead.
+    assert (
+        release.parent_slug(
+            {
+                "parent": {
+                    "id": "R_x",
+                    "name": "secretspec",
+                    "owner": {"login": "cachix"},
+                }
+            }
+        )
+        == "cachix/secretspec"
+    )
+    # Older/other versions supply the composed slug directly.
+    assert (
+        release.parent_slug({"parent": {"nameWithOwner": "cachix/secretspec"}})
+        == "cachix/secretspec"
+    )
+    for repo in ({"parent": None}, {}, {"parent": {}}, {"parent": {"name": "x"}}):
+        assert release.parent_slug(repo) is None
+
+
+def test_preflight_accepts_gh_parent_without_name_with_owner(monkeypatch, release):
+    def fake_run(argv, **kwargs):
+        if argv[:4] == ["gh", "repo", "view", "djbclark/sudo-secretspec"]:
+            return completed(
+                argv,
+                json.dumps(
+                    {
+                        "nameWithOwner": "djbclark/sudo-secretspec",
+                        "parent": {
+                            "id": "R_kgDOPHAtAA",
+                            "name": "secretspec",
+                            "owner": {"login": "cachix"},
+                        },
+                        "defaultBranchRef": {"name": "sudo-main"},
+                    }
+                ),
+            )
+        return completed(argv, PREFLIGHT_GIT_OUTPUTS.get(tuple(argv), ""))
+
+    monkeypatch.setattr(release, "run", fake_run)
+    release.preflight(allow_dirty=False)
+
+
 def test_preflight_rejects_wrong_fork_parent(monkeypatch, release):
     def fake_run(argv, **kwargs):
         if argv[:4] == ["gh", "repo", "view", "djbclark/sudo-secretspec"]:
@@ -165,6 +233,60 @@ def test_dry_run_lists_remote_actions_without_running(monkeypatch, release, caps
     assert f"git push origin {release.TAG}" in output
     assert "gh release create" in output
     assert "Formula/sudo-secretspec.rb" in output
+
+
+def test_dry_run_still_validates_preflight(monkeypatch, release):
+    seen = []
+    monkeypatch.setattr(
+        release, "preflight", lambda **kwargs: seen.append(kwargs) or None
+    )
+    monkeypatch.setattr(release, "run", lambda argv, **kwargs: completed(argv))
+    assert release.main(["--dry-run", "--skip-tests"]) == 0
+    assert seen == [{"allow_dirty": False}]
+
+
+def test_dry_run_aborts_when_preflight_fails(monkeypatch, release):
+    def boom(**kwargs):
+        raise release.ReleaseError("fork parent must be cachix/secretspec, got None")
+
+    monkeypatch.setattr(release, "preflight", boom)
+    with pytest.raises(release.ReleaseError, match="fork parent"):
+        release.main(["--dry-run", "--skip-tests"])
+
+
+def test_verify_readback_accepts_gh_parent_without_name_with_owner(
+    monkeypatch, release
+):
+    def fake_run(argv, **kwargs):
+        if argv[:3] == ["gh", "repo", "view"]:
+            return completed(
+                argv,
+                json.dumps(
+                    {
+                        "nameWithOwner": release.FORK_REPO,
+                        "parent": {"name": "secretspec", "owner": {"login": "cachix"}},
+                    }
+                ),
+            )
+        if argv[:3] == ["gh", "release", "view"]:
+            return completed(
+                argv,
+                json.dumps(
+                    {
+                        "tagName": release.TAG,
+                        "name": release.RELEASE_TITLE,
+                        "isDraft": False,
+                    }
+                ),
+            )
+        if argv[:2] == ["gh", "api"]:
+            return completed(argv, json.dumps({"ref": f"refs/tags/{release.TAG}"}))
+        if argv[-1:] == ["--version"]:
+            return completed(argv, f"secretspec {release.VERSION}\n")
+        return completed(argv)
+
+    monkeypatch.setattr(release, "run", fake_run)
+    release.verify_readback("/opt/homebrew/opt/sudo-secretspec")
 
 
 def test_verify_readback_checks_repo_tag_release_and_installed_version(

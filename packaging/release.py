@@ -82,6 +82,27 @@ def validate_release_url(url: str) -> None:
         raise ReleaseError(f"refuse non-GitHub HTTPS release URL: {url!r}")
 
 
+def parent_slug(repo: dict) -> str | None:
+    """Return the fork parent's ``owner/name`` slug, or None if absent.
+
+    ``gh repo view --json parent`` does not put ``nameWithOwner`` inside the
+    parent object on every gh version -- 2.97 returns ``id``/``name``/``owner``
+    instead -- so compose the slug from its parts when that key is missing.
+    """
+    parent = repo.get("parent")
+    if not isinstance(parent, dict):
+        return None
+    slug = parent.get("nameWithOwner")
+    if isinstance(slug, str) and slug:
+        return slug
+    owner = parent.get("owner")
+    login = owner.get("login") if isinstance(owner, dict) else None
+    name = parent.get("name")
+    if isinstance(login, str) and login and isinstance(name, str) and name:
+        return f"{login}/{name}"
+    return None
+
+
 def _require(value: bool, message: str) -> None:
     if not value:
         raise ReleaseError(message)
@@ -131,7 +152,7 @@ def preflight(*, allow_dirty: bool) -> None:
         (repo.get("defaultBranchRef") or {}).get("name") == branch,
         "current branch is not the fork default branch",
     )
-    parent = (repo.get("parent") or {}).get("nameWithOwner")
+    parent = parent_slug(repo)
     _require(
         parent == UPSTREAM_REPO, f"fork parent must be {UPSTREAM_REPO}, got {parent!r}"
     )
@@ -293,7 +314,7 @@ def verify_readback(prefix: str) -> None:
     )
     _require(repo.get("nameWithOwner") == FORK_REPO, "repository readback mismatch")
     _require(
-        (repo.get("parent") or {}).get("nameWithOwner") == UPSTREAM_REPO,
+        parent_slug(repo) == UPSTREAM_REPO,
         "fork lineage readback mismatch",
     )
     ref = json.loads(output(["gh", "api", f"repos/{FORK_REPO}/git/ref/tags/{TAG}"]))
@@ -375,8 +396,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     validate_version(VERSION)
-    if not args.dry_run:
-        preflight(allow_dirty=args.allow_dirty)
+    # Preflight is read-only, so it runs on the dry-run path too: a rehearsal
+    # that skips validation hides exactly the failures it exists to surface.
+    preflight(allow_dirty=args.allow_dirty)
     if not args.skip_tests:
         run_tests(dry_run=args.dry_run)
     notes = (
