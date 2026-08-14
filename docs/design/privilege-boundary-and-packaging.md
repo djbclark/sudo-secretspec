@@ -303,9 +303,12 @@ this host, three of them empty. `PENDING_ROLLBACK` only scans the *vault* for
 The shared-directory coupling is real and has been paid for twice: the scoped
 `visudo -c` handling in `install.rs:270-292` and `rollback.rs:104-131` exists
 solely because another vendor's broken file can fail the combined parse. This
-host has a live instance (`/etc/sudoers.d/yabai` has a mode that makes sudo
-ignore it). But F1 — the shared *timestamp* — is the bigger problem than the
-shared *directory*.
+host had a live instance: `/etc/sudoers.d/yabai` sat at mode 0640, which
+`visudo -c` rejects. (An earlier revision of this note said that mode made
+*sudo* ignore the file. It does not — see item 8, where the two were probed
+apart. Sudo applied yabai's rules the whole time; only `visudo -c` refused it,
+which is exactly the shared-parser coupling being described here.) But F1 —
+the shared *timestamp* — is the bigger problem than the shared *directory*.
 
 Options considered:
 
@@ -399,32 +402,65 @@ must ship in the same version.
    `check_sudoers_neighbours` (`drift.rs`), advisory-only under
    `SUDOERS_NEIGHBOUR_IGNORED` and `SUDOERS_NEIGHBOUR_SKIPPED`.
 
-   The rules were **probed on sudo 1.9.17p2, not derived**, and two of them are
-   not what the generic `sudo_secure_file` description implies:
+   **Sudo and `visudo -c` do not agree, and the difference is the finding.**
+   The first implementation of this check assumed they did, and was wrong in a
+   way that mattered: it reported live drop-ins as dead.
 
-   - The mode test is **equality with `0440`**, not "not group- or
-     world-writable". `0400` and `0444` are both refused.
-   - Ownership must be uid 0 **and** gid 0, so `root:staff` is refused.
-   - `#includedir` skips any name containing `.` or ending in `~` *before* it
-     stats the file, so a `foo.conf` is invisible at any mode. That is a
-     separate code because the fix is a rename, not a `chmod`.
+   Probed on sudo 1.9.17p2 by planting a real `NOPASSWD` rule and observing
+   whether `sudo -k -n` honoured it — `-k` invalidates the timestamp and `-n`
+   refuses to prompt, so success proves the file was read:
+
+   | State | sudo reads it | `visudo -c` accepts it |
+   | --- | --- | --- |
+   | `root:wheel 0440` | yes | yes |
+   | `root:wheel 0640` | **yes** | no |
+   | `root:wheel 0444` / `0400` | **yes** | no |
+   | `root:wheel 0460` (group-writable, gid 0) | **yes** | no |
+   | `root:staff 0440` | **yes** | no |
+   | `root:staff 0460` / `0420` | no | no |
+   | `root:wheel 0442` (world-writable) | no | no |
+   | `djbclark:wheel 0440` | no | no |
+   | name contains `.` or ends `~` | no | not mentioned |
+   | dangling symlink | no | not mentioned |
+
+   So sudo's loader (`sudo_secure_file`) asks only that the file be root-owned
+   and unwritable by anyone who is not root: not world-writable, and not
+   group-writable unless the group is gid 0. `visudo -c`'s `check_mode` and
+   `check_owner` are strictly tighter — mode exactly `0440`, gid exactly 0.
+
+   **`/etc/sudoers.d/yabai` was therefore never being ignored.** Its rules were
+   in force the whole time at mode 0640. What was actually broken is that
+   `visudo -c` fails over it, and `visudo -c` validates the entire directory at
+   once — which is precisely why `install.rs:270-292` and `rollback.rs:104-131`
+   scope their check to a single file, and why `install` printed a warning
+   about "a problem elsewhere in the sudoers configuration". The earlier note
+   in this document that sudo ignores it was wrong; that claim is corrected in
+   the "Should we stop using sudoers?" section too.
+
+   Hence three codes rather than one, with different consequences and fixes:
+   `SUDOERS_NEIGHBOUR_IGNORED` (rules are dead), `SUDOERS_NEIGHBOUR_SKIPPED`
+   (rules are dead, fix is a rename), and `SUDOERS_NEIGHBOUR_VISUDO_REJECTED`
+   (rules are live, but every `visudo -c` on the host fails).
+
+   Two further mechanics, both probed:
+
    - **Symlinks are followed.** Sudo opens the entry and stats the descriptor,
      so a link to a root:wheel `0440` file loads normally. This check therefore
      uses `fs::metadata` where the rest of `drift.rs` deliberately uses
      `symlink_metadata`: the job is to model what sudo does, not to decide
-     whether a path is trustworthy. Using `symlink_metadata` here reported
-     every symlinked drop-in as broken.
+     whether a path is trustworthy. Using `symlink_metadata` reported every
+     symlinked drop-in as broken.
+   - **The name rule is decided before anything is stated**, so a `foo.conf` is
+     invisible at any mode and any ownership.
 
-   A first probe using `visudo -c -f` was discarded as measuring the wrong
-   thing: with `-f`, visudo checks syntax only and applies **none** of the
-   ownership or mode rules. Only an unscoped `visudo -c` against the live tree
-   exercises them.
+   A first probe built on `visudo -c -f` was discarded as measuring the wrong
+   thing twice over: with `-f`, visudo checks syntax only and applies **none**
+   of the ownership or mode rules, and visudo's verdict is not sudo's in any
+   case. Only planting a live rule answers the question that matters.
 
-   Verified live as root against the real `/etc/sudoers.d` with three planted
-   subjects. The check found all three; `visudo -c` found only one, staying
-   silent on both the skipped name and the dangling symlink. `.DS_Store` and
-   our own drop-in are correctly not reported, and `report.ok` stayed `true`
-   throughout.
+   Verified live as root against the real `/etc/sudoers.d` with planted
+   subjects. `.DS_Store` and our own drop-in are correctly not reported, and
+   `report.ok` stayed `true` throughout.
 
    Findings are advisory for two reasons, not one: the general rule that a
    permanent non-advisory finding wedges every agent told to treat a `doctor`

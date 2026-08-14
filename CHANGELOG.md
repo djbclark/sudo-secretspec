@@ -55,17 +55,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replaces `PATH` with the policy's `secure_path`; a fixed list of standard
   directories is always scanned, so this can only widen the check.
 - `sudo-secretspec doctor` now reports neighbouring drop-ins in
-  `/etc/sudoers.d` that sudo is silently not applying. A file sudo refuses —
-  wrong mode, wrong owner, not a regular file, or a broken symlink — is
-  reported as `SUDOERS_NEIGHBOUR_IGNORED`, and one whose name makes
-  `#includedir` skip it (any name containing `.` or ending in `~`) as
-  `SUDOERS_NEIGHBOUR_SKIPPED`, which needs a rename rather than a `chmod`.
-  Both are advisory and never fail the check: these files belong to other
-  vendors, and this project neither edits nor removes them. Two of the cases
-  are invisible to `visudo -c`, which passes a skipped name and a dangling
-  symlink without comment. Note that sudo wants mode exactly `0440` — `0400`
-  and `0444` are both refused — and owner exactly `root:wheel`. Dotfiles such
-  as `.DS_Store` are not reported.
+  `/etc/sudoers.d` that are not doing what their owner expects. Three advisory
+  codes, because sudo and `visudo -c` disagree about what is acceptable and the
+  two failures have different consequences and different fixes:
+
+  - `SUDOERS_NEIGHBOUR_IGNORED` — sudo will not read the file, so its rules
+    never take effect. That means a file not owned by root, one that is
+    world-writable, one that is group-writable with a group other than gid 0,
+    a directory or special file, or a dangling symlink.
+  - `SUDOERS_NEIGHBOUR_SKIPPED` — the name makes `#includedir` skip the file
+    before it is ever read (any name containing `.` or ending in `~`). The fix
+    is a rename, not a `chmod`.
+  - `SUDOERS_NEIGHBOUR_VISUDO_REJECTED` — sudo reads and applies the file
+    normally, but `visudo -c` rejects it, because visudo demands mode exactly
+    `0440` and group gid 0 where sudo asks only that nobody outside root can
+    write it. `visudo -c` validates the whole directory at once, so a single
+    neighbour in this state fails the syntax check for every tool on the host.
+    This is the state `/etc/sudoers.d/yabai` was in, and the reason `install`
+    and `rollback` scope their own `visudo` check to a single file.
+
+  All three are advisory and never fail the check: these files belong to other
+  vendors, and this project neither edits nor removes them. Dotfiles such as
+  `.DS_Store` are not reported. Note that a drop-in at mode `0640` is **not**
+  ignored by sudo — its rules are live — even though `visudo -c` complains
+  about it.
 
 ### Security
 

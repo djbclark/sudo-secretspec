@@ -88,22 +88,26 @@ impl Layout {
 
 /// Findings that require operator review but do not invalidate the boundary.
 ///
-/// Both describe state the operator must clean up by hand — non-secret tool
-/// state left under the vault, and a mutation backup a crash left behind — and
-/// neither means a credential operation would be unsafe. They must not fail
-/// `doctor`: agents are instructed to treat a drift failure as a hard stop, so
-/// a permanent advisory would wedge every automated caller indefinitely.
-/// The two `SUDOERS_NEIGHBOUR_*` codes are advisory for a second reason on top
-/// of that one: the files they describe belong to other vendors. `uninstall`
-/// already refuses to touch a neighbour's drop-in, so a finding here is
-/// something only the operator can act on, and failing `doctor` over it would
-/// hand every automated caller a stop condition this project cannot clear.
+/// Each describes state the operator must clean up by hand — non-secret tool
+/// state left under the vault, a mutation backup a crash left behind, a
+/// harmless second copy of the client — and none means a credential operation
+/// would be unsafe. They must not fail `doctor`: agents are instructed to treat
+/// a drift failure as a hard stop, so a permanent advisory would wedge every
+/// automated caller indefinitely.
+///
+/// The three `SUDOERS_NEIGHBOUR_*` codes are advisory for a second reason on
+/// top of that one: the files they describe belong to other vendors.
+/// `uninstall` already refuses to touch a neighbour's drop-in, so a finding
+/// here is something only the operator can act on, and failing `doctor` over it
+/// would hand every automated caller a stop condition this project cannot
+/// clear.
 const ADVISORY_CODES: &[&str] = &[
     "LEGACY_VAULT_CLUTTER",
     "PENDING_ROLLBACK",
     "CLIENT_DUPLICATE",
     "SUDOERS_NEIGHBOUR_IGNORED",
     "SUDOERS_NEIGHBOUR_SKIPPED",
+    "SUDOERS_NEIGHBOUR_VISUDO_REJECTED",
 ];
 
 /// Directories scanned unconditionally for a second copy of the public client.
@@ -522,44 +526,90 @@ fn skipped_by_name(name: &str) -> bool {
     name.contains('.') || name.ends_with('~')
 }
 
-/// Why sudo would decline to apply a drop-in, or `None` when it loads.
+/// What sudo and `visudo -c` each make of one `sudoers.d` entry.
 ///
-/// Every rule here was probed against sudo 1.9.17p2 rather than taken from the
-/// generic `sudo_secure_file` description, and two of them are not what that
-/// description implies:
+/// They disagree, and that disagreement is the whole reason this is three
+/// verdicts rather than one boolean. Sudo's loader (`sudo_secure_file`) asks
+/// only that the file be root-owned and not writable by anyone who is not root.
+/// `visudo -c` additionally demands gid 0 and a mode of exactly `0440`. A
+/// drop-in can therefore be **fully live** while `visudo -c` fails the host
+/// over it — which is exactly what `/etc/sudoers.d/yabai` was doing here.
 ///
-/// * The mode test is **equality with 0440**, not "not group- or
-///   world-writable". `0400` and `0444` are both refused.
-/// * Ownership must be uid 0 **and** gid 0, so `root:staff` is refused even
-///   though root owns it.
+/// Probed against sudo 1.9.17p2, not derived. The first version of this check
+/// assumed `visudo -c`'s verdict *was* sudo's and reported working drop-ins as
+/// dead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Neighbour {
+    /// Sudo reads it and `visudo -c` accepts it.
+    Fine,
+    /// `#includedir` skips the name before it ever stats the file.
+    SkippedByName,
+    /// Sudo will not read it, so its rules do not apply.
+    NotLoaded(String),
+    /// Sudo reads and applies it, but `visudo -c` fails over it.
+    VisudoRejects(String),
+}
+
+/// Decide what one neighbouring drop-in means.
 ///
-/// `None` facts mean the path could not be resolved at all — a dangling
-/// symlink. Sudo skips those silently, which is precisely why they are worth
-/// reporting: nothing anywhere else will mention them.
-fn refusal_for(facts: Option<EntryFacts>) -> Option<String> {
+/// Split from the filesystem so every branch is testable without root: an
+/// unprivileged test cannot create a uid-0 file, which is the case that must be
+/// proven to load.
+fn classify_neighbour(name: &str, facts: Option<EntryFacts>) -> Neighbour {
+    if skipped_by_name(name) {
+        return Neighbour::SkippedByName;
+    }
     let Some(f) = facts else {
-        return Some("it cannot be resolved (dangling symlink or unreadable)".into());
+        // A dangling symlink. Sudo passes over it in silence and `visudo -c`
+        // does not mention it either, so if this check stays quiet, nothing on
+        // the host will say anything at all.
+        return Neighbour::NotLoaded(
+            "it cannot be resolved (dangling symlink or unreadable)".into(),
+        );
     };
     if f.is_dir {
-        return Some("it is a directory".into());
+        return Neighbour::NotLoaded("it is a directory".into());
     }
     if !f.is_regular_file {
-        return Some("it is not a regular file".into());
+        return Neighbour::NotLoaded("it is not a regular file".into());
     }
-    if f.uid != 0 || f.gid != 0 {
-        return Some(format!(
-            "it is owned by {}:{}, and sudo requires root:wheel (uid 0, gid 0)",
-            owner_name(f.uid),
+
+    // sudo_secure_file: root-owned, never world-writable, and not
+    // group-writable unless the owning group is gid 0. Each of these three was
+    // observed refusing a live NOPASSWD rule.
+    if f.uid != 0 {
+        return Neighbour::NotLoaded(format!(
+            "it is owned by {} rather than root",
+            owner_name(f.uid)
+        ));
+    }
+    if f.mode & 0o002 != 0 {
+        return Neighbour::NotLoaded(format!("it is world-writable (mode {:04o})", f.mode));
+    }
+    if f.gid != 0 && f.mode & 0o020 != 0 {
+        return Neighbour::NotLoaded(format!(
+            "it is group-writable (mode {:04o}) and its group {} is not gid 0",
+            f.mode,
+            group_name(f.gid)
+        ));
+    }
+
+    // Past this point sudo is applying the file. What remains is visudo's
+    // stricter opinion of it, which matters because `visudo -c` checks the
+    // whole directory at once.
+    if f.gid != 0 {
+        return Neighbour::VisudoRejects(format!(
+            "its group is {} rather than gid 0",
             group_name(f.gid)
         ));
     }
     if f.mode != 0o440 {
-        return Some(format!(
-            "its mode is {:04o}, and sudo requires exactly 0440",
+        return Neighbour::VisudoRejects(format!(
+            "its mode is {:04o} rather than exactly 0440",
             f.mode
         ));
     }
-    None
+    Neighbour::Fine
 }
 
 /// Read the facts sudo would read about `path`.
@@ -616,20 +666,31 @@ fn check_sudoers_neighbours(layout: &Layout, findings: &mut Vec<Finding>) {
         if name.starts_with('.') {
             continue;
         }
-        if skipped_by_name(&name) {
-            findings.push(finding(
+        let (code, detail) = match classify_neighbour(&name, sudoers_facts(&path)) {
+            Neighbour::Fine => continue,
+            Neighbour::SkippedByName => (
                 "SUDOERS_NEIGHBOUR_SKIPPED",
-                Some(&path),
                 "sudo's `#includedir` skips this drop-in because its name contains `.` or ends \
-                 in `~`, so its rules never take effect; rename it to activate it",
-            ));
-        } else if let Some(reason) = refusal_for(sudoers_facts(&path)) {
-            findings.push(finding(
+                 in `~`, so its rules never take effect; rename it to activate it"
+                    .to_string(),
+            ),
+            Neighbour::NotLoaded(why) => (
                 "SUDOERS_NEIGHBOUR_IGNORED",
-                Some(&path),
-                format!("sudo will not apply this drop-in because {reason}"),
-            ));
-        }
+                format!(
+                    "sudo does not read this drop-in because {why}, so its rules never take effect"
+                ),
+            ),
+            Neighbour::VisudoRejects(why) => (
+                "SUDOERS_NEIGHBOUR_VISUDO_REJECTED",
+                format!(
+                    "sudo reads and applies this drop-in, but `visudo -c` rejects it because \
+                     {why}. `visudo -c` validates the whole directory at once, so this fails the \
+                     syntax check for every tool on the host — including this installer's own \
+                     install and rollback, which is why both scope their check to a single file"
+                ),
+            ),
+        };
+        findings.push(finding(code, Some(&path), detail));
     }
 }
 
@@ -1204,62 +1265,109 @@ service_group = "_sudo_secretspec"
         })
     }
 
+    fn neighbour(uid: u32, gid: u32, mode: u32) -> Neighbour {
+        classify_neighbour("ordinary-name", facts(uid, gid, mode))
+    }
+
     #[test]
     fn a_correctly_installed_neighbour_is_not_reported() {
-        assert_eq!(refusal_for(facts(0, 0, 0o440)), None);
+        assert_eq!(neighbour(0, 0, 0o440), Neighbour::Fine);
     }
 
     #[test]
-    fn sudo_requires_exactly_0440_not_merely_unwritable() {
-        // The counterintuitive half of this check, and the reason it was probed
-        // rather than derived: `sudo_secure_file`'s documented behaviour is a
-        // "not group- or world-writable" test, which 0400 and 0444 both pass.
-        // Real sudo 1.9.17p2 compares for equality and refuses both.
-        for mode in [0o400, 0o444, 0o640, 0o600, 0o444, 0o460, 0o442, 0o644] {
+    fn sudo_still_applies_a_drop_in_that_visudo_rejects() {
+        // The finding that rewrote this check. `visudo -c` compares the mode for
+        // equality with 0440, so it refuses 0640, 0444, 0400 and 0460 — but
+        // sudo's loader asks only that nobody outside root can write the file,
+        // and it happily applies every one of them. Each was confirmed against
+        // sudo 1.9.17p2 by observing a live NOPASSWD rule take effect.
+        //
+        // Calling these "ignored by sudo" told the operator their rules were
+        // dead when they were in force the whole time.
+        for mode in [0o640, 0o444, 0o400, 0o460, 0o600, 0o644] {
             assert!(
-                refusal_for(facts(0, 0, mode)).is_some(),
-                "mode {mode:04o} must be refused"
+                matches!(neighbour(0, 0, mode), Neighbour::VisudoRejects(_)),
+                "mode {mode:04o} is applied by sudo and refused by visudo"
             );
         }
-        assert_eq!(refusal_for(facts(0, 0, 0o440)), None);
+        // root:staff, not group-writable: sudo applies it, visudo refuses it.
+        assert!(matches!(
+            neighbour(0, 20, 0o440),
+            Neighbour::VisudoRejects(_)
+        ));
     }
 
     #[test]
-    fn root_ownership_alone_is_not_enough() {
-        // gid must be 0 too: root:staff is refused, which is what a drop-in
-        // written by a careless installer on macOS actually looks like.
-        let refusal = refusal_for(facts(0, 20, 0o440)).expect("root:staff must be refused");
-        assert!(refusal.contains("uid 0, gid 0"), "{refusal}");
-        assert!(refusal_for(facts(501, 0, 0o440)).is_some());
+    fn sudo_refuses_only_what_someone_other_than_root_can_write() {
+        // World-writable at any ownership.
+        assert!(matches!(neighbour(0, 0, 0o442), Neighbour::NotLoaded(_)));
+        // Group-writable *and* a group that is not gid 0. Confirmed both ways:
+        // the same mode with gid 0 is applied, because only root is in wheel.
+        assert!(matches!(neighbour(0, 20, 0o460), Neighbour::NotLoaded(_)));
+        assert!(matches!(neighbour(0, 20, 0o420), Neighbour::NotLoaded(_)));
+        assert!(matches!(
+            neighbour(0, 0, 0o460),
+            Neighbour::VisudoRejects(_)
+        ));
+        // Not owned by root.
+        assert!(matches!(neighbour(501, 0, 0o440), Neighbour::NotLoaded(_)));
     }
 
     #[test]
     fn an_unresolvable_neighbour_is_reported() {
-        // A dangling symlink: sudo skips it in silence, so if this check does
-        // not mention it, nothing on the host will.
-        let refusal = refusal_for(None).expect("must be refused");
-        assert!(refusal.contains("cannot be resolved"), "{refusal}");
+        // A dangling symlink: sudo passes over it in silence and `visudo -c`
+        // does not mention it either, so if this check stays quiet nothing on
+        // the host will say anything.
+        let Neighbour::NotLoaded(why) = classify_neighbour("dangling", None) else {
+            panic!("a dangling symlink must be reported as not loaded");
+        };
+        assert!(why.contains("cannot be resolved"), "{why}");
     }
 
     #[test]
     fn a_directory_or_special_file_is_reported() {
-        let dir = refusal_for(Some(EntryFacts {
-            is_regular_file: false,
-            is_dir: true,
-            uid: 0,
-            gid: 0,
-            mode: 0o440,
-        }));
-        assert!(dir.expect("dir must be refused").contains("directory"));
+        let dir = classify_neighbour(
+            "adir",
+            Some(EntryFacts {
+                is_regular_file: false,
+                is_dir: true,
+                uid: 0,
+                gid: 0,
+                mode: 0o440,
+            }),
+        );
+        assert!(matches!(&dir, Neighbour::NotLoaded(w) if w.contains("directory")));
 
-        let fifo = refusal_for(Some(EntryFacts {
-            is_regular_file: false,
-            is_dir: false,
-            uid: 0,
-            gid: 0,
-            mode: 0o440,
-        }));
-        assert!(fifo.expect("fifo must be refused").contains("regular file"));
+        let fifo = classify_neighbour(
+            "afifo",
+            Some(EntryFacts {
+                is_regular_file: false,
+                is_dir: false,
+                uid: 0,
+                gid: 0,
+                mode: 0o440,
+            }),
+        );
+        assert!(matches!(&fifo, Neighbour::NotLoaded(w) if w.contains("regular file")));
+    }
+
+    #[test]
+    fn the_name_rule_is_decided_before_anything_is_stated() {
+        // Sudo skips the name before it stats the file, so a perfectly-moded
+        // `foo.conf` is still dead and a broken-moded one still needs a rename
+        // rather than a chmod.
+        assert_eq!(
+            classify_neighbour("custom.conf", facts(0, 0, 0o440)),
+            Neighbour::SkippedByName
+        );
+        assert_eq!(
+            classify_neighbour("custom.conf", facts(501, 20, 0o777)),
+            Neighbour::SkippedByName
+        );
+        assert_eq!(
+            classify_neighbour("backup~", None),
+            Neighbour::SkippedByName
+        );
     }
 
     #[test]
@@ -1369,6 +1477,21 @@ service_group = "_sudo_secretspec"
                 dir.join("zebra").display().to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn every_neighbour_code_is_advisory() {
+        // A neighbour belongs to another vendor and this project refuses to
+        // touch it, so none of these may ever clear `ok` — an agent told to
+        // treat a `doctor` failure as a hard stop would wedge on a file only
+        // the operator can fix.
+        for code in [
+            "SUDOERS_NEIGHBOUR_IGNORED",
+            "SUDOERS_NEIGHBOUR_SKIPPED",
+            "SUDOERS_NEIGHBOUR_VISUDO_REJECTED",
+        ] {
+            assert!(finding(code, None, "x").advisory, "{code} must be advisory");
+        }
     }
 
     #[test]
