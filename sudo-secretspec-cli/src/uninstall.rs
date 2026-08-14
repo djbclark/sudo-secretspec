@@ -196,8 +196,12 @@ pub fn run(req: UninstallRequest) -> Result<(), UninstallError> {
     // through would leave the operator with a half-removed boundary and no
     // client left to finish the job. `--dry-run` returns these verdicts too,
     // so an ineligible flag combination is discovered before it is committed
-    // to.
     let vault_real = match (req.purge_vault, &layout) {
+        (true, Some(layout)) if layout.adopted_vault => {
+            return Err(UninstallError::Denied(
+                "the vault was adopted rather than created by this installer; remove it by hand if that is really what you want".into(),
+            ));
+        }
         (true, Some(layout)) => Some(resolve_purgeable_vault(&layout.vault)?),
         _ => None,
     };

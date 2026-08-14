@@ -622,13 +622,15 @@ fn config_toml(req: &InstallRequest, vault_real: &Path) -> String {
          declarations = \"{prefix}/share/sudo-secretspec/secretspec.toml\"\n\
          service_user = \"{user}\"\n\
          service_group = \"{group}\"\n\
-         profile = \"{profile}\"\n",
+         profile = \"{profile}\"\n\
+         adopted_vault = {adopted}\n",
         prefix = PREFIX,
         vault = req.vault.display(),
         vault_real = vault_real.display(),
         user = req.service_user,
         group = req.service_group,
         profile = req.profile,
+        adopted = req.adopt_existing,
     )
 }
 
@@ -679,21 +681,6 @@ pub fn sudoers_text(operator: &str) -> String {
         prefix = PREFIX,
         operator = operator,
     )
-}
-
-fn retired_toml() -> &'static str {
-    "# RETIRED SECRETSPEC PATH — NO SECRET VALUES\n\
-     # This path is not a credential store. Use /usr/local/bin/sudo-secretspec.\n\
-     # Do not create, copy, symlink, regenerate, relocate, or select an alternate\n\
-     # manifest or provider.\n"
-}
-
-fn guidance_text() -> &'static str {
-    // Keep installer self-contained so packaging does not depend on relative
-    // source layout after cargo install.
-    "# AI and automation contract for sudo-secretspec\n\n\
-     Use only /usr/local/bin/sudo-secretspec. Never select manifests, providers,\n\
-     profiles, or backing files. Fail closed if the broker is unavailable.\n"
 }
 
 /// Run the installer. Returns Ok(()) on success.
@@ -817,9 +804,21 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
         ));
     }
 
-    // Self binary sources.
+    // Source media layout.
     let self_exe = std::env::current_exe()
         .map_err(|e| InstallError::Denied(format!("cannot resolve current exe: {e}")))?;
+    let source_root = self_exe
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| InstallError::Denied("current exe is not nested in libexec".into()))?;
+
+    let client_src = source_root.join("bin/sudo-secretspec");
+    let broker_src = source_root.join("libexec/sudo-secretspec");
+    let share_src = source_root.join("share/sudo-secretspec");
+    let guidance_src = share_src.join("AI-GUIDANCE.md");
+    let retired_src = share_src.join("sudo-secretspec-retired.toml");
+    let manifest_src = share_src.join("MANIFEST.sha256");
+
     let client_dst = PathBuf::from(PREFIX).join("bin/sudo-secretspec");
     let broker_dst = PathBuf::from(PREFIX).join("libexec/sudo-secretspec");
     let share = PathBuf::from(PREFIX).join("share/sudo-secretspec");
@@ -852,22 +851,27 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     let rollback = libexec.join(format!("{SNAPSHOT_PREFIX}{stamp}"));
     let captured = capture_snapshot(&rollback)?;
 
-    install_file(&self_exe, &client_dst, require_mode(&client_dst)?)?;
-    install_file(&self_exe, &broker_dst, require_mode(&broker_dst)?)?;
+    install_file(&client_src, &client_dst, require_mode(&client_dst)?)?;
+    install_file(&broker_src, &broker_dst, require_mode(&broker_dst)?)?;
     install_file(
         &req.declarations,
         &declarations_dst,
         require_mode(&declarations_dst)?,
     )?;
-    write_bytes(
+    install_file(
+        &retired_src,
         &retired_dst,
-        retired_toml().as_bytes(),
         require_mode(&retired_dst)?,
     )?;
-    write_bytes(
+    install_file(
+        &guidance_src,
         &guidance_dst,
-        guidance_text().as_bytes(),
         require_mode(&guidance_dst)?,
+    )?;
+    install_file(
+        &manifest_src,
+        &manifest_dst,
+        require_mode(&manifest_dst)?,
     )?;
     write_bytes(
         &config_dst,
@@ -881,25 +885,6 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
         &sudoers_dst,
         &sudoers_text(&req.operator),
         require_mode(&sudoers_dst)?,
-    )?;
-
-    // Release manifest of installed artifacts.
-    let mut manifest = String::new();
-    for path in [
-        &client_dst,
-        &broker_dst,
-        &declarations_dst,
-        &retired_dst,
-        &guidance_dst,
-        &config_dst,
-        &sudoers_dst,
-    ] {
-        manifest.push_str(&format!("{}  {}\n", sha256_file(path)?, path.display()));
-    }
-    write_bytes(
-        &manifest_dst,
-        manifest.as_bytes(),
-        require_mode(&manifest_dst)?,
     )?;
 
     // Runtime files for fresh install only.

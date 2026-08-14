@@ -47,6 +47,7 @@ pub struct Layout {
     pub guidance: PathBuf,
     pub sudoers: PathBuf,
     pub source_manifest: PathBuf,
+    pub adopted_vault: bool,
 }
 
 impl Layout {
@@ -82,6 +83,7 @@ impl Layout {
             sudoers: PathBuf::from("/private/etc/sudoers.d/sudo-secretspec"),
             source_manifest: share.join("MANIFEST.sha256"),
             config: config_path,
+            adopted_vault: cfg.adopted_vault,
         }
     }
 }
@@ -987,6 +989,7 @@ service_group = "_sudo_secretspec"
             guidance: tmp.path().join("guidance"),
             sudoers: tmp.path().join("sudoers"),
             source_manifest: tmp.path().join("MANIFEST.sha256"),
+            adopted_vault: false,
         };
         let report = inspect(&layout, &InspectOptions::default());
         assert!(
@@ -1018,6 +1021,7 @@ service_group = "_sudo_secretspec"
             guidance: tmp.join("guidance"),
             sudoers: tmp.join("sudoers"),
             source_manifest: tmp.join("MANIFEST.sha256"),
+            adopted_vault: false,
         }
     }
 
@@ -1519,6 +1523,7 @@ service_group = "_sudo_secretspec"
             guidance: root.join("guidance"),
             sudoers: root.join("sudoers"),
             source_manifest: root.join("MANIFEST.sha256"),
+            adopted_vault: false,
         }
     }
 }

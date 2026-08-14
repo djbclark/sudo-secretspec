@@ -37,6 +37,8 @@ pub struct Config {
     /// them together, so that combination is not reachable.
     #[serde(default = "default_profile")]
     pub profile: String,
+    #[serde(default)]
+    pub adopted_vault: bool,
 }
 
 fn default_profile() -> String {
