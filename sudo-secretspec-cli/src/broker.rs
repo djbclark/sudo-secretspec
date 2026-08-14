@@ -279,10 +279,65 @@ fn actor_from_env() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Ambient environment
+// ---------------------------------------------------------------------------
+
+/// True for any variable that could steer the engine's control plane.
+///
+/// A predicate rather than a list, because a list is only correct on the day it
+/// is written. The engine reads roughly twenty `SECRETSPEC_*` knobs today, four
+/// of which (`SECRETSPEC_OPCLI_PATH` and its `BWS`/`PASSBOLT`/`PROTONPASS`
+/// siblings) name an executable it will spawn — and this process is root. The
+/// `XDG_*` family is here for the same reason: it decides which directory the
+/// engine's user-global config is read from.
+pub(crate) fn is_ambient_control_var(key: &str) -> bool {
+    key.starts_with("SECRETSPEC_") || key.starts_with("XDG_")
+}
+
+/// Drop every ambient variable that could redirect the engine, then pin the
+/// environment its user-global config resolves from.
+///
+/// Called at the top of [`run`], before the operation is even dispatched:
+/// nothing between here and execution has any business consulting ambient
+/// state, so there is no window in which a later reader could see the caller's
+/// values.
+fn purge_ambient_env() {
+    // `vars_os`, not `vars`: the latter panics on a non-UTF-8 environment, and
+    // the caller controls this environment entirely.
+    for (key, _) in std::env::vars_os() {
+        if is_ambient_control_var(&key.to_string_lossy()) {
+            // SAFETY: single-threaded broker process; no concurrent env readers.
+            unsafe { std::env::remove_var(&key) }
+        }
+    }
+
+    // Clearing `XDG_CONFIG_HOME` is not enough on its own: the engine resolves
+    // its user-global config through etcetera's XDG strategy, which falls back
+    // to `$HOME/.config`, and `sudo` on this platform hands the *caller's*
+    // `HOME` to the broker. Left alone, a root process reads a config file an
+    // unprivileged caller can write — one whose `[audit] path` aims a root
+    // writer at any absolute path, and whose `[defaults] profile` picks which
+    // profile of the protected manifest resolves. Root's own home is the only
+    // one inside the boundary.
+    //
+    // `set` rather than `remove`: with `HOME` unset, etcetera falls back to
+    // `getpwuid(0)`, which is `/var/root` here anyway — but if that directory
+    // lookup ever failed, `GlobalConfig::load()` would error and fail the
+    // broker closed on a healthy system. An explicit value makes the resolved
+    // path a constant rather than a directory-service round trip.
+    //
+    // SAFETY: single-threaded broker process; no concurrent env readers.
+    unsafe {
+        std::env::set_var("HOME", "/var/root");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Operations
 // ---------------------------------------------------------------------------
 
 fn run(broker: &Broker) -> Result<(), i32> {
+    purge_ambient_env();
     match broker.operation.as_str() {
         "audit-verify" => run_audit_verify(broker),
         "source-get"
@@ -420,19 +475,8 @@ fn run_audit_verify(_broker: &Broker) -> Result<(), i32> {
 }
 
 fn execute(broker: &Broker, cfg: &Config) -> (u8, Vec<String>) {
-    // Prevent ambient SecretSpec env from selecting another control plane.
-    for key in [
-        "SECRETSPEC_PROVIDER",
-        "SECRETSPEC_FILE",
-        "SECRETSPEC_PROFILE",
-        "SECRETSPEC_SCOPE",
-    ] {
-        // SAFETY: single-threaded broker process; no concurrent env readers.
-        unsafe {
-            std::env::remove_var(key);
-        }
-    }
-
+    // The ambient environment was purged in `run` before dispatch; see
+    // `purge_ambient_env`.
     let manifest = cfg.vault.join("secretspec.toml");
     let dotenv = cfg.vault.join(".env");
     // Pin dotenv provider to the protected vault file — never cwd-relative `.env`.
@@ -441,6 +485,10 @@ fn execute(broker: &Broker, cfg: &Config) -> (u8, Vec<String>) {
     let secrets = match secretspec::Secrets::load_from(&manifest) {
         Ok(mut s) => {
             s.set_provider(provider);
+            // Pin the profile from the protected config. Without this the
+            // engine's `resolve_profile_name` falls through to its user-global
+            // config — which, inside a root process, is the caller's file.
+            s.set_profile(cfg.profile.clone());
             s = s.with_reason(broker.reason.clone());
             s
         }
@@ -520,5 +568,73 @@ fn execute(broker: &Broker, cfg: &Config) -> (u8, Vec<String>) {
             }
         }
         _ => (2, vec![]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `SECRETSPEC_*` name the engine reads, as of the pinned upstream.
+    ///
+    /// The predicate is what ships, so this list is a *witness* rather than the
+    /// implementation: it proves the prefix rule covers the names that exist
+    /// today, and a name added upstream tomorrow is covered without an edit
+    /// here. The four `*_CLI_PATH` entries are the reason this matters — each
+    /// names an executable the engine spawns, and the broker is root.
+    const ENGINE_VARS: &[&str] = &[
+        "SECRETSPEC_AGENT",
+        "SECRETSPEC_BWS_CLI_PATH",
+        "SECRETSPEC_FILE",
+        "SECRETSPEC_KDBX_PASSWORD",
+        "SECRETSPEC_OPCLI_PATH",
+        "SECRETSPEC_PASSBOLT_CLI_PATH",
+        "SECRETSPEC_PASSBOLT_PASSPHRASE",
+        "SECRETSPEC_PASSBOLT_PRIVATE_KEY",
+        "SECRETSPEC_PASSBOLT_PRIVATE_KEY_FILE",
+        "SECRETSPEC_PASSBOLT_SERVER",
+        "SECRETSPEC_PROFILE",
+        "SECRETSPEC_PROTONPASS_CLI_PATH",
+        "SECRETSPEC_PROVIDER",
+        "SECRETSPEC_PROVIDER_CONCURRENCY",
+        "SECRETSPEC_REASON",
+        "SECRETSPEC_SCOPE",
+    ];
+
+    /// The XDG names etcetera consults. `XDG_CONFIG_HOME` is the one that
+    /// decides where the engine's user-global config is read from; the rest are
+    /// covered by the same prefix so none of them can be the next surprise.
+    const XDG_VARS: &[&str] = &[
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+        "XDG_STATE_HOME",
+    ];
+
+    // The predicate is tested directly rather than by exercising
+    // `purge_ambient_env`: `std::env::set_var` is process-global and the test
+    // harness is multi-threaded, so mutating the environment to observe the
+    // loop would race every other test in this binary.
+    #[test]
+    fn ambient_control_predicate_covers_every_engine_and_xdg_variable() {
+        for name in ENGINE_VARS.iter().chain(XDG_VARS) {
+            assert!(
+                is_ambient_control_var(name),
+                "{name} must be purged before the engine runs"
+            );
+        }
+    }
+
+    #[test]
+    fn ambient_control_predicate_leaves_unrelated_variables_alone() {
+        // `SUDO_USER` in particular: the broker reads it to attribute the audit
+        // event, so purging it would blind the ledger.
+        for name in ["SUDO_USER", "HOME", "PATH", "TERM", "SECRETSPE", "XDG"] {
+            assert!(
+                !is_ambient_control_var(name),
+                "{name} must survive the purge"
+            );
+        }
     }
 }

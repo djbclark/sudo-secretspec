@@ -8,6 +8,7 @@ fn install_request_defaults_are_generic() {
     assert_eq!(req.vault, PathBuf::from("/var/db/sudo-secretspec"));
     assert_eq!(req.service_user, "_sudo_secretspec");
     assert_eq!(req.service_group, "_sudo_secretspec");
+    assert_eq!(req.profile, "default");
     assert!(req.dry_run);
     assert!(!req.adopt_existing);
 }
@@ -176,6 +177,19 @@ fn the_shipped_policy_parses_and_gates_boundary_lifecycle() {
         !policy.contains("NOPASSWD: /usr/local/bin/sudo-secretspec"),
         "{policy}"
     );
+    // The broker must not inherit the caller's HOME: the engine resolves its
+    // user-global config from it, and that config can aim a root writer at an
+    // arbitrary path. `env_reset` does NOT cover this — macOS ships
+    // `env_keep += "HOME"` globally and it wins. Probed on sudo 1.9.17p2:
+    // `env_reset` alone gave the caller's home; each of these gave /var/root.
+    for flag in ["env_keep-=\"HOME\"", "always_set_home"] {
+        assert!(
+            policy.lines().any(|line| line
+                .starts_with("Defaults!/usr/local/libexec/sudo-secretspec ")
+                && line.contains(flag)),
+            "libexec policy line must carry {flag}:\n{policy}"
+        );
+    }
 }
 
 #[test]

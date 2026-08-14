@@ -37,6 +37,49 @@ fn rejects_unknown_keys_and_noncanonical_vaults() {
 }
 
 #[test]
+fn a_config_without_a_profile_still_parses_and_pins_the_default() {
+    // `deny_unknown_fields` tolerates a new key but not a missing one, so this
+    // is what lets an older installer's config be read by a newer broker.
+    // Without the default it would be a hard parse failure on upgrade.
+    assert!(!valid().contains("profile"));
+    assert_eq!(Config::parse(valid()).unwrap().profile, "default");
+}
+
+#[test]
+fn an_explicit_profile_is_taken_from_the_protected_config() {
+    let pinned = format!("{}profile = \"production\"\n", valid());
+    assert_eq!(Config::parse(&pinned).unwrap().profile, "production");
+}
+
+#[test]
+fn rejects_profile_names_that_are_not_plain_manifest_keys() {
+    // A profile name reaches the engine as a table key, never as a path. These
+    // are the shapes that would mean something else if it ever did.
+    for bad in [
+        "",
+        "../other",
+        "a/b",
+        "with space",
+        "-leading",
+        "9leading",
+        "sémantique",
+    ] {
+        let cfg = format!("{}profile = \"{bad}\"\n", valid());
+        assert!(
+            Config::parse(&cfg).is_err(),
+            "profile {bad:?} must be rejected"
+        );
+    }
+    for good in ["default", "production", "staging-2", "ci_runner", "A1"] {
+        let cfg = format!("{}profile = \"{good}\"\n", valid());
+        assert!(
+            Config::parse(&cfg).is_ok(),
+            "profile {good:?} must be accepted"
+        );
+    }
+}
+
+#[test]
 fn rejects_invalid_service_identity_and_relative_paths() {
     assert!(Config::parse(&valid().replace("_sudo_secretspec", "root")).is_err());
     assert!(

@@ -55,6 +55,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replaces `PATH` with the policy's `secure_path`; a fixed list of standard
   directories is always scanned, so this can only widen the check.
 
+### Security
+
+- The privileged broker no longer reads configuration the calling user can
+  write. `sudo` on macOS hands the caller's `HOME` to the elevated process
+  (the stock `/etc/sudoers` keeps `HOME` in `env_keep`, which overrides
+  `env_reset`), and the SecretSpec engine resolves its user-global
+  `config.toml` from that `HOME`. A root process was therefore reading
+  `~/.config/secretspec/config.toml`, whose `[audit] path` aims a root writer
+  at any absolute path — creating directories, appending the plaintext reason,
+  and truncating the file once `max_size_bytes` is passed — and whose
+  `[defaults] profile` selects which profile of the protected manifest
+  resolves. The broker now pins `HOME` to `/var/root` and clears the whole
+  `XDG_*` family before dispatching any operation, and the installed sudoers
+  policy carries `env_keep-="HOME"` and `always_set_home` so the same
+  guarantee holds before the process even starts. Re-run
+  `sudo-secretspec install` to update the policy.
+- The broker now clears **every** `SECRETSPEC_*` variable rather than four of
+  them. The engine reads roughly twenty, and four (`SECRETSPEC_OPCLI_PATH`,
+  `SECRETSPEC_BWS_CLI_PATH`, `SECRETSPEC_PASSBOLT_CLI_PATH`,
+  `SECRETSPEC_PROTONPASS_CLI_PATH`) name an executable it launches — as root.
+  The purge is now a prefix rule, so a knob added upstream is covered the day
+  it lands, and it runs before dispatch rather than partway through.
+- The manifest profile the broker resolves from is now recorded in the
+  root-owned `/usr/local/etc/sudo-secretspec.toml` (new `profile` key,
+  defaulting to `default`, settable with `sudo-secretspec install --profile`).
+  It was previously allowed to fall through to the caller's user-global
+  SecretSpec config. Existing configuration files without the key keep
+  working.
+
 ### Fixed
 
 - `sudo-secretspec doctor --json` now emits only the JSON report. `visudo`

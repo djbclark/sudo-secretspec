@@ -135,7 +135,7 @@ The same binary dispatches via hidden `__broker` subcommand.
 
 ```bash
 cargo test -p sudo-secretspec-cli
-# 58 tests: config(3), drift(8), install_rollback(2), cli(3), audit(21 lib + 19 integration)
+# 102 tests: lib(50), audit(19), install_rollback(16), drift(11), cli(3), config(3)
 ```
 
 ---

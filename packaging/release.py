@@ -220,6 +220,14 @@ def preflight(release: Release, *, allow_dirty: bool) -> None:
 
 def run_tests(*, dry_run: bool) -> None:
     run(["pytest", "tests/sudo_packaging", "-q"], dry_run=dry_run, capture=False)
+    # The companion is the crate that carries privilege, so its suite is the one
+    # that has to gate a release. Building the engine proves nothing about the
+    # broker, the audit ledger, or the sudoers policy this project installs.
+    run(
+        ["cargo", "test", "-p", "sudo-secretspec-cli", "--locked"],
+        dry_run=dry_run,
+        capture=False,
+    )
     # Core is unchanged; compile the pinned upstream engine without invoking
     # provider integration tests that depend on optional host CLIs (for example sops).
     run(

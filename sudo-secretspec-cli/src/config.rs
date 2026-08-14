@@ -21,6 +21,26 @@ pub struct Config {
     pub declarations: PathBuf,
     pub service_user: String,
     pub service_group: String,
+    /// Manifest profile the broker resolves secrets from.
+    ///
+    /// Part of the protected control plane rather than an ambient fallback.
+    /// The engine's `resolve_profile_name` falls through to its *user-global*
+    /// config when nothing else selects a profile, and inside the root broker
+    /// that file belongs to the unprivileged caller — so which secrets resolve
+    /// would be the caller's choice. Naming it here puts it in a root-owned,
+    /// `0444`, boundary-validated file instead.
+    ///
+    /// `serde(default)` because `deny_unknown_fields` tolerates a *new* field
+    /// but not a *missing* one: a config written by an older installer must
+    /// still parse. The inverse — a new config met by an older broker — is
+    /// rejected, but the two are installed as a pair and `rollback` restores
+    /// them together, so that combination is not reachable.
+    #[serde(default = "default_profile")]
+    pub profile: String,
+}
+
+fn default_profile() -> String {
+    "default".into()
 }
 
 impl Config {
@@ -49,6 +69,9 @@ impl Config {
         {
             return Err(ConfigError::Invalid("invalid service identity"));
         }
+        if !valid_profile_name(&self.profile) {
+            return Err(ConfigError::Invalid("invalid profile name"));
+        }
         Ok(())
     }
 
@@ -75,6 +98,20 @@ fn direct_child<'a>(path: &'a Path, parent: &Path) -> Result<&'a std::ffi::OsStr
         return Err(ConfigError::Invalid("vault must be one direct child"));
     }
     Ok(name.as_os_str())
+}
+
+/// A profile name is a manifest table key, not a path. Constrain it here so a
+/// hand-edited config cannot smuggle a traversal or a separator into the value
+/// the broker hands the engine.
+fn valid_profile_name(value: &str) -> bool {
+    if value.is_empty() || value.len() > 64 {
+        return false;
+    }
+    value.bytes().enumerate().all(|(index, byte)| match byte {
+        b'a'..=b'z' | b'A'..=b'Z' => true,
+        b'0'..=b'9' | b'_' | b'-' => index > 0,
+        _ => false,
+    })
 }
 
 fn valid_service_identity(value: &str, require_underscore: bool) -> bool {

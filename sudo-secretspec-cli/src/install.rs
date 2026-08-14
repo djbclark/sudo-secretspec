@@ -22,6 +22,8 @@ pub(crate) const SUDOERS_DIR: &str = "/private/etc/sudoers.d";
 const DEFAULT_VAULT: &str = "/var/db/sudo-secretspec";
 const DEFAULT_USER: &str = "_sudo_secretspec";
 const DEFAULT_GROUP: &str = "_sudo_secretspec";
+/// Manifest profile assumed when the operator does not name one.
+const DEFAULT_PROFILE: &str = "default";
 /// Directory-name prefix for rollback snapshots under `<PREFIX>/libexec`.
 /// `rollback::run` refuses any snapshot path outside this namespace.
 pub(crate) const SNAPSHOT_PREFIX: &str = "sudo-secretspec-rollback-";
@@ -46,6 +48,9 @@ pub struct InstallRequest {
     pub service_user: String,
     pub service_group: String,
     pub operator: String,
+    /// Manifest profile the broker will resolve from. Written into the
+    /// root-owned config so it is not left to the caller's environment.
+    pub profile: String,
     pub source_root: Option<PathBuf>,
 }
 
@@ -62,6 +67,7 @@ impl InstallRequest {
             service_user: DEFAULT_USER.into(),
             service_group: DEFAULT_GROUP.into(),
             operator,
+            profile: DEFAULT_PROFILE.into(),
             source_root: None,
         }
     }
@@ -588,12 +594,14 @@ fn config_toml(req: &InstallRequest, vault_real: &Path) -> String {
          vault_realpath = \"{vault_real}\"\n\
          declarations = \"{prefix}/share/sudo-secretspec/secretspec.toml\"\n\
          service_user = \"{user}\"\n\
-         service_group = \"{group}\"\n",
+         service_group = \"{group}\"\n\
+         profile = \"{profile}\"\n",
         prefix = PREFIX,
         vault = req.vault.display(),
         vault_real = vault_real.display(),
         user = req.service_user,
         group = req.service_group,
+        profile = req.profile,
     )
 }
 
@@ -621,9 +629,22 @@ fn config_toml(req: &InstallRequest, vault_real: &Path) -> String {
 /// `libexec` bootstrap directly is outside the policy — that path exists for a
 /// first install, when there is no policy yet, and `doctor`'s `CLIENT_SHADOWED`
 /// check is what keeps it from becoming the everyday entry point.
+///
+/// `env_keep-="HOME"` and `always_set_home` are what stop the broker inheriting
+/// the *caller's* `HOME`. That matters because the engine resolves its
+/// user-global config through etcetera's XDG strategy — `$XDG_CONFIG_HOME`,
+/// else `$HOME/.config` — and that file's `[audit] path` would aim a root
+/// writer at any absolute path the caller chose. `env_reset` alone does not
+/// close this: macOS ships `env_keep += "HOME"` in the global `/etc/sudoers`,
+/// which wins. Measured on sudo 1.9.17p2 with a throwaway drop-in gating
+/// `/usr/bin/printenv`: `env_reset` alone yielded the caller's home, while
+/// either flag below yielded `/var/root`. Both are set because which one is
+/// load-bearing depends on a platform default this project does not own; the
+/// broker also pins `HOME` in-process (`broker::purge_ambient_env`), so the
+/// guarantee does not rest on the policy alone.
 pub fn sudoers_text(operator: &str) -> String {
     format!(
-        "Defaults!{prefix}/libexec/sudo-secretspec env_reset,secure_path=/usr/bin:/bin:/usr/sbin:/sbin,umask=0077\n\
+        "Defaults!{prefix}/libexec/sudo-secretspec env_reset,env_keep-=\"HOME\",secure_path=/usr/bin:/bin:/usr/sbin:/sbin,umask=0077,always_set_home\n\
          Defaults!{prefix}/bin/sudo-secretspec timestamp_timeout=0\n\
          {operator} ALL=(root) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker *\n\
          {operator} ALL=(root) NOPASSWD: {prefix}/libexec/sudo-secretspec doctor\n\

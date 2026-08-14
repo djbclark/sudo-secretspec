@@ -88,6 +88,13 @@ enum Cmd {
         service_group: Option<String>,
         #[arg(long)]
         operator: Option<String>,
+        /// Manifest profile the broker resolves secrets from.
+        ///
+        /// Recorded in the root-owned config rather than read from the
+        /// environment at operation time, so the profile cannot be chosen by
+        /// whoever calls the broker. Defaults to `default`.
+        #[arg(long)]
+        profile: Option<String>,
         /// Never prompt; fail if required values cannot be defaulted.
         #[arg(long)]
         non_interactive: bool,
@@ -187,6 +194,7 @@ fn main() {
             service_user,
             service_group,
             operator,
+            profile,
             non_interactive,
         } => run_install(
             declarations,
@@ -196,6 +204,7 @@ fn main() {
             service_user,
             service_group,
             operator,
+            profile,
             non_interactive,
         ),
         Cmd::Uninstall {
@@ -391,6 +400,7 @@ fn run_install(
     service_user: Option<String>,
     service_group: Option<String>,
     operator: Option<String>,
+    profile: Option<String>,
     non_interactive: bool,
 ) {
     let declarations = match resolve_declarations(declarations, non_interactive) {
@@ -437,6 +447,9 @@ fn run_install(
     if let Some(g) = service_group {
         req.service_group = g;
     }
+    if let Some(p) = profile {
+        req.profile = p;
+    }
     if let Some(o) = operator {
         req.operator = o;
     } else if !non_interactive && is_tty() {
@@ -470,6 +483,8 @@ fn run_install(
             .arg(&req.service_group)
             .arg("--operator")
             .arg(&req.operator)
+            .arg("--profile")
+            .arg(&req.profile)
             .arg("--non-interactive")
             .status();
         match status {
