@@ -100,18 +100,34 @@ pub fn run(snapshot: &Path) -> Result<(), RollbackError> {
         fs::rename(&tmp, dest)?;
     }
 
-    // Isolated validity is not combined validity; check the whole config.
+    // Isolated validity is not combined validity; check the whole config. As in
+    // the installer, only a fault in our own file is ours to fail on — an
+    // unrelated bad policy elsewhere in sudoers.d is a warning.
     let combined_ok = Command::new("/usr/sbin/visudo")
         .arg("-c")
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
     if !combined_ok {
-        return Err(RollbackError::Denied(
-            "sudoers configuration is invalid after restore; inspect \
-             /etc/sudoers.d/sudo-secretspec before elevating again"
-                .into(),
-        ));
+        let ours = Path::new(SUDOERS_DIR).join("sudo-secretspec");
+        let ours_ok = !ours.exists()
+            || Command::new("/usr/sbin/visudo")
+                .args(["-c", "-f"])
+                .arg(&ours)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+        if !ours_ok {
+            return Err(RollbackError::Denied(
+                "restored sudoers policy is invalid; inspect \
+                 /etc/sudoers.d/sudo-secretspec before elevating again"
+                    .into(),
+            ));
+        }
+        eprintln!(
+            "warning: `visudo -c` reports a problem elsewhere in the sudoers configuration;\n\
+             warning: the restored sudo-secretspec policy itself is valid."
+        );
     }
 
     println!("sudo-secretspec artifacts restored; runtime vault preserved");

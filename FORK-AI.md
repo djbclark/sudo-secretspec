@@ -11,10 +11,12 @@ This file is **downstream-only**. Do not port it upstream to `cachix/secretspec`
 | `packaging/` | Release script + Homebrew formula |
 | `skills/sudo-secretspec/` | Distributable AI skill |
 
-`sudo-main` is the only branch. Work commits directly to it; there are no
-feature branches and no PRs. "main" and "master" both mean `sudo-main`. The
-downstream version scheme lives in `CLAUDE.md`, which is loaded into agent
-context automatically.
+All downstream work commits directly to `sudo-main`; there are no feature
+branches and no PRs. "main" and "master" both mean `sudo-main`. `main` itself
+is only the upstream mirror — do not develop on it, and do not merge it into
+`sudo-main` unasked, since it carries post-0.19.1 upstream work held for a
+future release. The downstream version scheme lives in `CLAUDE.md`, which is
+loaded into agent context automatically.
 
 ## High-value lessons (save time)
 

@@ -265,12 +265,33 @@ fn install_sudoers(dst: &Path, text: &str, mode: u32) -> Result<(), InstallError
 
     // Valid in isolation is not the same as valid in combination; re-check the
     // whole configuration now that the file is live.
+    //
+    // A failure here is only ours to act on if *our* file is the one at fault.
+    // Unrelated policies in sudoers.d — another package shipping a file with
+    // the wrong mode, say — must not make this installer unusable, so re-check
+    // our own file and treat anyone else's problem as a warning.
     let combined_ok = Command::new("/usr/sbin/visudo")
         .arg("-c")
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
     if combined_ok {
+        return Ok(());
+    }
+
+    let ours_ok = Command::new("/usr/sbin/visudo")
+        .args(["-c", "-f"])
+        .arg(dst)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ours_ok {
+        eprintln!(
+            "warning: `visudo -c` reports a problem elsewhere in the sudoers configuration.\n\
+             warning: {} itself is valid and has been installed. Review the output above;\n\
+             warning: sudo ignores files in sudoers.d with the wrong mode or a dot in the name.",
+            dst.display()
+        );
         return Ok(());
     }
 

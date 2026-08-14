@@ -31,4 +31,4 @@ sudo-secretspec run --reason "start app" -- your-command
 | Release process and Homebrew packaging | [`packaging/README.md`](packaging/README.md) |
 | Downstream version scheme | [`CLAUDE.md`](CLAUDE.md) |
 
-All work lives on `sudo-main`, the fork's only branch.
+All downstream work lives on `sudo-main`. `main` is the upstream mirror only.
