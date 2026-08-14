@@ -173,3 +173,58 @@ service_group = "_sudo_secretspec"
     );
     assert!(sudo_secretspec_cli::load_config(&path).is_ok());
 }
+
+/// `doctor` is supposed to answer "which binary would actually run", not only
+/// "is the installed one intact". This drives the whole public entry point so
+/// the `InspectOptions` plumbing is covered, not just the classifier.
+#[test]
+fn inspect_reports_a_client_the_callers_path_would_reach_first() {
+    let dir = TempDir::new().unwrap();
+    let path = write_config(&dir, minimal_toml());
+    let layout = sudo_secretspec_cli::load_config(&path).unwrap();
+
+    let shadow_dir = dir.path().join("shadow");
+    std::fs::create_dir_all(&shadow_dir).unwrap();
+    let shadow = shadow_dir.join("sudo-secretspec");
+    std::fs::write(&shadow, b"not the installed client").unwrap();
+
+    let caller_path = std::env::join_paths([shadow_dir.as_path()]).unwrap();
+    let report = sudo_secretspec_cli::inspect(
+        &layout,
+        &sudo_secretspec_cli::InspectOptions {
+            caller_path: Some(caller_path),
+        },
+    );
+
+    let found = report
+        .findings
+        .iter()
+        .find(|f| f.path.as_deref() == Some(shadow.display().to_string().as_str()))
+        .unwrap_or_else(|| panic!("no finding for {}: {:?}", shadow.display(), report.findings));
+    assert_eq!(found.code, "CLIENT_SHADOWED");
+    assert!(!found.advisory);
+    assert!(!report.ok);
+}
+
+/// Without a caller `PATH` the scan still runs, and it never invents a finding
+/// for a directory that holds no `sudo-secretspec`.
+#[test]
+fn inspect_without_a_caller_path_ignores_unrelated_directories() {
+    let dir = TempDir::new().unwrap();
+    let path = write_config(&dir, minimal_toml());
+    let layout = sudo_secretspec_cli::load_config(&path).unwrap();
+
+    let empty = dir.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+
+    let report =
+        sudo_secretspec_cli::inspect(&layout, &sudo_secretspec_cli::InspectOptions::default());
+    assert!(
+        !report.findings.iter().any(|f| f
+            .path
+            .as_deref()
+            .is_some_and(|p| p.starts_with(empty.display().to_string().as_str()))),
+        "{:?}",
+        report.findings
+    );
+}

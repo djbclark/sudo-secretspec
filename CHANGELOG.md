@@ -17,6 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with declaration auto-detection and TTY prompts; long flags are overrides.
 - Fork docs: `sudo-secretspec/README.md`, `README.downstream.md`, `FORK-AI.md`.
 
+- `sudo-secretspec doctor` now checks which `sudo-secretspec` would actually
+  run, not only whether the installed one is intact. A different binary found on
+  the executable search path is reported as `CLIENT_SHADOWED` and fails the
+  check; so is any copy reachable through a directory that is not root-owned or
+  is group/world-writable, such as `/opt/homebrew/bin`, because anyone who can
+  write there chooses what the operator runs. A byte-identical copy in a
+  root-owned search directory is reported as the advisory `CLIENT_DUPLICATE`.
+  The client passes its own search path to the privileged check, since `sudo`
+  replaces `PATH` with the policy's `secure_path`; a fixed list of standard
+  directories is always scanned, so this can only widen the check.
+
 ### Fixed
 
 - `sudo-secretspec install` now prunes rollback snapshots instead of leaving one

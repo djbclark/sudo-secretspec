@@ -94,6 +94,14 @@ enum Cmd {
         json: bool,
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Executable search path of the unprivileged caller.
+        ///
+        /// Set by the public client when it elevates: `sudo` replaces `PATH`
+        /// with the policy's `secure_path`, so the privileged process cannot
+        /// otherwise tell which `sudo-secretspec` the operator would run. It
+        /// only widens the shadow scan and is not an operator-facing knob.
+        #[arg(long, hide = true)]
+        caller_path: Option<OsString>,
     },
     Rollback {
         snapshot: PathBuf,
@@ -160,7 +168,11 @@ fn main() {
             operator,
             non_interactive,
         ),
-        Cmd::Doctor { json, config } => doctor(json, config),
+        Cmd::Doctor {
+            json,
+            config,
+            caller_path,
+        } => doctor(json, config, caller_path),
         Cmd::Rollback { snapshot } => {
             if unsafe { libc::geteuid() } != 0 {
                 let status = Command::new(SUDO)
@@ -528,24 +540,73 @@ fn run_target(reason: &str, command: &[OsString]) {
     std::process::exit(127);
 }
 
-fn doctor(json: bool, config: Option<PathBuf>) {
+fn doctor(json: bool, config: Option<PathBuf>, caller_path: Option<OsString>) {
+    // `sudo` replaces PATH with the policy's secure_path, so the shadow check
+    // has to be told what the caller's PATH was before elevating. Trust the
+    // ambient value only while still unprivileged.
+    let unprivileged = unsafe { libc::geteuid() } != 0;
+    let caller_path = caller_path.or_else(|| {
+        if unprivileged {
+            std::env::var_os("PATH")
+        } else {
+            None
+        }
+    });
+
     // Privileged checks (sudoers/vault) need root. Prefer NOPASSWD libexec.
-    if unsafe { libc::geteuid() } != 0 {
+    if unprivileged {
         let broker = privileged_broker();
-        let mut cmd = Command::new(SUDO);
-        cmd.arg("-n").arg(&broker).arg("doctor");
-        if json {
-            cmd.arg("--json");
+        let elevated = |with_caller_path: bool| {
+            let mut cmd = Command::new(SUDO);
+            cmd.arg("-n").arg(&broker).arg("doctor");
+            if json {
+                cmd.arg("--json");
+            }
+            if let Some(cfg) = &config {
+                cmd.arg("--config").arg(cfg);
+            }
+            if let (true, Some(path)) = (with_caller_path, &caller_path) {
+                cmd.arg("--caller-path").arg(path);
+            }
+            cmd
+        };
+
+        // A client from a newer build can meet an older installed broker: brew
+        // hands over a new bootstrap binary before `install` replaces the pair.
+        // The older broker rejects `--caller-path` with clap's usage exit, so
+        // capture that attempt rather than letting a bare argument-parsing error
+        // stand in for the health check. `doctor` itself exits 0 or 1, so a 2
+        // from this path means the broker did not understand the request.
+        let mut can_elevate = true;
+        if caller_path.is_some() {
+            match elevated(true).output() {
+                Ok(out) if out.status.code() == Some(2) => {
+                    // Retry without the flag; the shadow check then runs against
+                    // the fixed search list only.
+                }
+                Ok(out) => {
+                    let _ = io::stdout().write_all(&out.stdout);
+                    let _ = io::stderr().write_all(&out.stderr);
+                    match out.status.code() {
+                        Some(0) => return,
+                        code => std::process::exit(code.unwrap_or(1)),
+                    }
+                }
+                Err(e) => {
+                    eprintln!("cannot elevate doctor via {}: {e}", broker.display());
+                    can_elevate = false;
+                }
+            }
         }
-        if let Some(cfg) = &config {
-            cmd.arg("--config").arg(cfg);
-        }
-        match cmd.status() {
-            Ok(s) if s.success() => return,
-            Ok(s) => std::process::exit(s.code().unwrap_or(1)),
-            Err(e) => {
-                eprintln!("cannot elevate doctor via {}: {e}", broker.display());
-                // Fall through to unprivileged best-effort.
+
+        if can_elevate {
+            match elevated(false).status() {
+                Ok(s) if s.success() => return,
+                Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+                Err(e) => {
+                    eprintln!("cannot elevate doctor via {}: {e}", broker.display());
+                    // Fall through to unprivileged best-effort.
+                }
             }
         }
     }
@@ -566,7 +627,10 @@ fn doctor(json: bool, config: Option<PathBuf>) {
         }
     };
 
-    let report = sudo_secretspec_cli::inspect(&layout);
+    let report = sudo_secretspec_cli::inspect(
+        &layout,
+        &sudo_secretspec_cli::InspectOptions { caller_path },
+    );
     if json {
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
     } else if report.ok {

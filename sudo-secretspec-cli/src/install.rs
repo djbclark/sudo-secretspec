@@ -525,6 +525,31 @@ fn ensure_service_user(name: &str, gid: u32, create: bool) -> Result<(), Install
     Ok(())
 }
 
+/// True when `path` is a real directory rather than a symlink to one.
+fn is_real_dir(path: &Path) -> bool {
+    path.is_dir() && !path.is_symlink()
+}
+
+/// True when only root can add, replace, or remove entries in `path`.
+fn is_root_only_dir(path: &Path) -> bool {
+    match fs::metadata(path) {
+        Ok(meta) => meta.uid() == 0 && (meta.permissions().mode() & 0o022) == 0,
+        Err(_) => false,
+    }
+}
+
+/// True when `path` is a directory nobody but root can substitute files in.
+///
+/// This is the single predicate for "safe to deliver a privileged component
+/// through". The installer requires it of every directory it writes into, and
+/// `drift` applies the same one to every directory that could hand a caller a
+/// `sudo-secretspec` binary — a copy under an `admin`-writable prefix such as
+/// `/opt/homebrew/bin` is an unprivileged-write-to-privileged-exec path even
+/// when its bytes are currently identical.
+pub(crate) fn is_protected_dir(path: &Path) -> bool {
+    is_real_dir(path) && is_root_only_dir(path)
+}
+
 fn validate_protected_ancestors() -> Result<(), InstallError> {
     for dir in [
         "/usr",
@@ -536,13 +561,12 @@ fn validate_protected_ancestors() -> Result<(), InstallError> {
         "/private/etc/sudoers.d",
     ] {
         let path = Path::new(dir);
-        if !path.is_dir() || path.is_symlink() {
+        if !is_real_dir(path) {
             return Err(InstallError::Denied(format!(
                 "unsafe protected directory {dir}"
             )));
         }
-        let meta = fs::metadata(path)?;
-        if meta.uid() != 0 || (meta.permissions().mode() & 0o022) != 0 {
+        if !is_root_only_dir(path) {
             return Err(InstallError::Denied(format!(
                 "unsafe protected directory metadata {dir}"
             )));

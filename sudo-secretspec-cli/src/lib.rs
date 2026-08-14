@@ -5,4 +5,4 @@ pub mod drift;
 pub mod install;
 pub mod rollback;
 
-pub use drift::{Finding, Layout, Report, inspect, load_config};
+pub use drift::{Finding, InspectOptions, Layout, Report, inspect, load_config};

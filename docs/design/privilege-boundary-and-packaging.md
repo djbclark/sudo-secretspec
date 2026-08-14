@@ -1,6 +1,6 @@
 # Design note: privilege boundary, packaging, and the authentication gate
 
-**Status:** analysis complete, partially implemented
+**Status:** analysis complete; F2, F4, F6 implemented; F1, F3 outstanding
 **Date:** 2026-08-13
 **Scope:** fork-only (`djbclark/sudo-secretspec`). Not upstream material.
 **Prompted by:** resolving the Homebrew link conflict after the
@@ -71,12 +71,40 @@ Observed on this host: `/opt/homebrew/bin` is `PATH` position 11,
 would silently shadow the installed client and `doctor` would still report
 OK.
 
-**Fix:** a `CLIENT_SHADOWED` finding that resolves the binary through `PATH`
-and compares against `layout.client` — advisory when versions match, failure
-when they do not. Plus an unsafe-prefix check for any privileged component
-reached through a directory that is not root-owned and non-group/world
--writable; `validate_protected_ancestors()` (`install.rs:425-448`) already
-implements exactly that predicate.
+**Fixed.** Implemented as `check_client_shadowing` in `drift.rs`, with two
+codes: `CLIENT_SHADOWED` (fails the check) and `CLIENT_DUPLICATE` (advisory).
+
+Three things changed from the original sketch, each for a reason worth keeping:
+
+- **Severity is not decided by version.** Asking a binary its version means
+  *executing* a binary we just concluded might not be ours. The classifier
+  compares content hashes and never runs the candidate. It also refuses to
+  hash anything that is not a regular file, because `fs::read` on a fifo
+  planted in a search directory would block this process as root.
+- **`PATH` is resolved on the caller's side, not the broker's.** `doctor`
+  re-execs itself through `sudo`, and our own policy sets
+  `secure_path=/usr/bin:/bin:/usr/sbin:/sbin` — so the privileged process
+  cannot see the `PATH` whose shadowing is the entire question. The client
+  passes its search path as `--caller-path` before elevating. Because a fixed
+  list of standard directories is scanned unconditionally, that caller-supplied
+  value can only *add* findings, never suppress one.
+- **The unsafe-prefix predicate is applied to the shadow, not re-applied to the
+  layout.** `check_ancestor_chain` (`drift.rs`) already walks each installed
+  path's ancestors and emits `REMOVABLE_ANCESTOR` for exactly the
+  not-root-owned-or-writable condition, so a second layout-side check would only
+  duplicate findings. What was genuinely missing is the same predicate applied
+  to wherever a *second* client is reachable from. `validate_protected_ancestors`
+  was refactored so both callers share one `is_protected_dir` (`install.rs`).
+
+A copy under a writable prefix fails even when it loses `PATH` order today:
+losing is an accident of ordering, while write access is a standing ability to
+swap the bytes.
+
+Version skew fell out of this: a client built from a newer tree can meet an
+older installed broker, since brew hands over a new bootstrap binary before
+`install` replaces the pair. The older broker rejects `--caller-path` with
+clap's usage exit, which would have turned a health check into an
+argument-parsing error. `doctor` now retries without the flag on exit 2.
 
 ### F3 — There is no uninstall
 
@@ -99,6 +127,17 @@ Uninstall is that list plus three policy decisions:
 - **Sudoers first, then binaries.** Close the grant before removing the path
   it names. Harmless on this host because `/usr/local/libexec` is root-owned,
   but correct in general and load-bearing for any prefix that is not.
+
+  To be explicit about scope, because "remove the sudoers policy" invites the
+  wrong reading: our policy is not lines appended to a shared file. `install`
+  writes a **dedicated drop-in**, `/private/etc/sudoers.d/sudo-secretspec`
+  (`SUDOERS_PATH`, `install.rs:18`), listed in `installed_artifacts()` at mode
+  `0440`. Uninstall removes that one file and never touches `/etc/sudoers`, and
+  never touches another vendor's drop-in — `/etc/sudoers.d/yabai` is a live
+  neighbour on this host. Uninstall must also verify the file is ours (hash it
+  against the install manifest) before unlinking, and leave it in place with a
+  warning if it is not: the path is predictable, so a file sitting there is not
+  proof we wrote it.
 - **Never auto-delete the vault.** Separate `--purge-vault` flag with its own
   confirmation; default is leave-it.
 - **Service user removal opt-in** (`--remove-service-user`). `_secretspec`
@@ -173,9 +212,9 @@ Options considered:
 | Approach | Verdict |
 | --- | --- |
 | Own setuid-root binary | **Rejected** |
-| launchd root daemon + socket/XPC | Principled long-term target |
-| Authorization Services / `SMAppService` | Authenticates; does not escalate |
-| Harden within sudoers | **Adopted for now** |
+| launchd root daemon + socket/XPC | **Rejected** — see below |
+| Authorization Services / `SMAppService` | **Rejected** with launchd |
+| Harden within sudoers | **Adopted**, and extended to other platforms |
 
 **Setuid — rejected.** Inherits sudo's entire hostile-environment problem:
 `argv[0]`, inherited file descriptors, rlimits, signal dispositions,
@@ -186,8 +225,28 @@ LocalAuthentication expects a signed binary in a GUI session context. And
 Homebrew cannot set the bit (it installs unprivileged), so our root installer
 would have to, meaning the packaging problem does not improve either.
 
-**launchd daemon — the real alternative.** A root LaunchDaemon owns the
-vault; the client connects over a socket in a root-owned directory.
+**launchd daemon — rejected (operator decision, 2026-08-13).** Two reasons,
+neither of them about the technical merits below:
+
+- **It is macOS-only, and this project is not going to be.** The direction is
+  the opposite one — keep `sudo` as the mechanism and extend it to other
+  operating systems and distributions, because `sudo` is the portable common
+  denominator. A launchd path would be a second, platform-specific privilege
+  mechanism to maintain alongside the one every other platform still needs.
+- **Someone else already built it.** Tools following the daemon pattern exist
+  and are documented in an issue. If that pattern turns out to be the right
+  one, the move is to adopt those tools, not to reimplement them here.
+
+Item 11 is therefore closed, not deferred. The sudoers path is the design, and
+investing in it further — F1's `timestamp_timeout`, F2's shadow check, F3's
+uninstall — is no longer contingent on this decision.
+
+The analysis below is retained because it is what closed the question, and
+because the `timestamp_timeout=0` fix (F1) is what recovers the per-operation
+guarantee that Authorization Services would otherwise have been needed for.
+
+The mechanics, for the record. A root LaunchDaemon owns the vault; the client
+connects over a socket in a root-owned directory.
 
 - Payoffs: no sudoers entry, so the shared-parser coupling vanishes; no grant
   pinned to a binary path, which also dissolves F2 and F4; authorization
@@ -234,9 +293,9 @@ must ship in the same version.
 
 5. `timestamp_timeout=0` on the client path (F1).
 6. `sudo-secretspec uninstall` (F3).
-7. `doctor`: `CLIENT_SHADOWED` and unsafe-prefix checks (F2).
+7. ~~`doctor`: `CLIENT_SHADOWED` and unsafe-prefix checks (F2).~~ **Done.**
 8. `doctor`: report broken neighbours in `sudoers.d`; GC rollback snapshots
-   (F6).
+   (F6). Snapshot GC is done; the `sudoers.d` neighbour report is not.
 
 Then re-run `install` to apply the new policy and confirm `doctor` is clean.
 
@@ -246,8 +305,20 @@ Then re-run `install` to apply the new policy and confirm `doctor` is clean.
    `_secretspec` (F5).
 10. Retire the wrapper onto the Rust broker (F5).
 
-### Open decision
+### Decided
 
-11. launchd + Authorization Services. Would subsume items 2 and 7 entirely.
-    Worth deciding before investing further in the sudoers path, though item 5
-    is cheap enough to do regardless.
+11. ~~launchd + Authorization Services.~~ **Rejected** (see above): macOS-only,
+    and existing tools already implement that pattern. `sudo` stays the
+    mechanism.
+
+### Next
+
+12. Extend the `sudo` path beyond macOS. Everything platform-specific is
+    currently compile-time constants and `Command` calls to macOS binaries:
+    `PREFIX`/`BROKER_PATH`, `dscl` for the service identity
+    (`ensure_service_group`/`ensure_service_user`), `/usr/sbin/visudo`,
+    `/usr/sbin/chown`, the `/private/etc` and `/private/var` spellings, and
+    `check_ancestor_chain`'s `/var`, `/etc`, `/tmp` alias-root exemptions.
+    Note the constraint established in F4: `PREFIX` being hardcoded is a
+    *security property*, not an oversight — a per-platform constant is fine, a
+    runtime-configurable one is not.

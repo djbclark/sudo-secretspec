@@ -200,7 +200,9 @@ use sudo_secretspec_cli::install::{Snapshot, list_snapshots, plan_prune};
 
 fn snapshot(stamp: u64, restorable: bool) -> Snapshot {
     Snapshot {
-        path: PathBuf::from(format!("/usr/local/libexec/sudo-secretspec-rollback-{stamp}")),
+        path: PathBuf::from(format!(
+            "/usr/local/libexec/sudo-secretspec-rollback-{stamp}"
+        )),
         stamp,
         restorable,
     }
@@ -210,11 +212,19 @@ fn snapshot(stamp: u64, restorable: bool) -> Snapshot {
 fn plan_prune_always_removes_unrestorable_snapshots() {
     // A first install captures nothing, and `plan_restore` rejects the result
     // outright, so keeping one only accumulates directories forever.
-    let snaps = [snapshot(300, false), snapshot(200, false), snapshot(100, true)];
+    let snaps = [
+        snapshot(300, false),
+        snapshot(200, false),
+        snapshot(100, true),
+    ];
     let doomed = plan_prune(&snaps, 3);
     assert_eq!(doomed.len(), 2, "{doomed:?}");
-    assert!(doomed.iter().all(|p| p.ends_with("sudo-secretspec-rollback-300")
-        || p.ends_with("sudo-secretspec-rollback-200")));
+    assert!(
+        doomed
+            .iter()
+            .all(|p| p.ends_with("sudo-secretspec-rollback-300")
+                || p.ends_with("sudo-secretspec-rollback-200"))
+    );
 }
 
 #[test]
@@ -228,8 +238,16 @@ fn plan_prune_keeps_the_newest_restorable_snapshots() {
     let doomed = plan_prune(&snaps, 2);
     // 400 and 300 are newest and survive; 200 and 100 age out.
     assert_eq!(doomed.len(), 2, "{doomed:?}");
-    assert!(doomed.iter().any(|p| p.ends_with("sudo-secretspec-rollback-100")));
-    assert!(doomed.iter().any(|p| p.ends_with("sudo-secretspec-rollback-200")));
+    assert!(
+        doomed
+            .iter()
+            .any(|p| p.ends_with("sudo-secretspec-rollback-100"))
+    );
+    assert!(
+        doomed
+            .iter()
+            .any(|p| p.ends_with("sudo-secretspec-rollback-200"))
+    );
 }
 
 #[test]
@@ -263,5 +281,8 @@ fn list_snapshots_ignores_directories_that_are_not_ours() {
     assert_eq!(found[0].stamp, 100);
     assert!(found[0].restorable);
     assert_eq!(found[1].stamp, 200);
-    assert!(!found[1].restorable, "no .prior file means nothing to restore");
+    assert!(
+        !found[1].restorable,
+        "no .prior file means nothing to restore"
+    );
 }

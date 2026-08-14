@@ -98,6 +98,12 @@ After adopt-existing install of the stayturgid vault, doctor may report:
   fail the check. Advisory codes must never clear `Report.ok` — agents treat a
   drift failure as a hard stop, so a permanent advisory would wedge every
   automated caller indefinitely.
+- `CLIENT_DUPLICATE` if a byte-identical `sudo-secretspec` sits in a second
+  root-owned search directory. Also **advisory**. The failing sibling is
+  `CLIENT_SHADOWED`, which means a *different* binary would run instead of the
+  installed client — that one is a hard stop, not residual noise. This host is
+  expected to have exactly one copy, at `/usr/local/bin/sudo-secretspec`; the
+  keg's `libexec` bootstrap is not on any search path and is not a shadow.
 - audit ledger ownership should be `_secretspec:staff` (fixed in current tree by
   chown-after-open when broker is root). The pre-open metadata check
   deliberately does not assert ownership; the post-open check does, so a
