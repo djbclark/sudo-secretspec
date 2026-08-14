@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `sudo-secretspec install` now prunes rollback snapshots instead of leaving one
+  behind on every run. Snapshots that captured nothing — which is every first
+  install, and which `rollback` refuses to restore from — are removed, and the
+  three most recent restorable snapshots are retained. Install output gained a
+  `pruned_snapshots=` line and reports `rollback_snapshot=none` when there was
+  nothing to capture.
 - The Homebrew formula now declares its version explicitly. Homebrew parsed the
   trailing `.1` of the `v0.19.1-djbclark.1` tag as the entire version, so kegs
   were recorded as version `1` and upgrade detection did not work.

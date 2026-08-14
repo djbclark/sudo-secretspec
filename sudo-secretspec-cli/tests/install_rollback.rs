@@ -191,3 +191,77 @@ fn installed_artifact_table_pins_the_sensitive_modes() {
     );
     assert_eq!(artifact_mode(std::path::Path::new("/etc/passwd")), None);
 }
+
+// `plan_prune` is the half of snapshot GC that decides what may be deleted, so
+// it is tested here without root for the same reason `plan_restore` is: the
+// retention decision is the part worth pinning.
+
+use sudo_secretspec_cli::install::{Snapshot, list_snapshots, plan_prune};
+
+fn snapshot(stamp: u64, restorable: bool) -> Snapshot {
+    Snapshot {
+        path: PathBuf::from(format!("/usr/local/libexec/sudo-secretspec-rollback-{stamp}")),
+        stamp,
+        restorable,
+    }
+}
+
+#[test]
+fn plan_prune_always_removes_unrestorable_snapshots() {
+    // A first install captures nothing, and `plan_restore` rejects the result
+    // outright, so keeping one only accumulates directories forever.
+    let snaps = [snapshot(300, false), snapshot(200, false), snapshot(100, true)];
+    let doomed = plan_prune(&snaps, 3);
+    assert_eq!(doomed.len(), 2, "{doomed:?}");
+    assert!(doomed.iter().all(|p| p.ends_with("sudo-secretspec-rollback-300")
+        || p.ends_with("sudo-secretspec-rollback-200")));
+}
+
+#[test]
+fn plan_prune_keeps_the_newest_restorable_snapshots() {
+    let snaps = [
+        snapshot(100, true),
+        snapshot(400, true),
+        snapshot(200, true),
+        snapshot(300, true),
+    ];
+    let doomed = plan_prune(&snaps, 2);
+    // 400 and 300 are newest and survive; 200 and 100 age out.
+    assert_eq!(doomed.len(), 2, "{doomed:?}");
+    assert!(doomed.iter().any(|p| p.ends_with("sudo-secretspec-rollback-100")));
+    assert!(doomed.iter().any(|p| p.ends_with("sudo-secretspec-rollback-200")));
+}
+
+#[test]
+fn plan_prune_keeping_more_than_exist_deletes_nothing() {
+    let snaps = [snapshot(100, true), snapshot(200, true)];
+    assert!(plan_prune(&snaps, 3).is_empty());
+}
+
+#[test]
+fn list_snapshots_ignores_directories_that_are_not_ours() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+
+    // Restorable: holds a captured artifact.
+    let restorable = root.join("sudo-secretspec-rollback-100");
+    std::fs::create_dir(&restorable).unwrap();
+    std::fs::write(restorable.join("0.prior"), b"bytes").unwrap();
+
+    // Unrestorable: the shape a first install leaves behind.
+    std::fs::create_dir(root.join("sudo-secretspec-rollback-200")).unwrap();
+
+    // Neither of these may ever become a pruning candidate: one is an unrelated
+    // neighbour in libexec, the other is not stamped with a number.
+    std::fs::create_dir(root.join("stayturgid-secretspec-wrapper.d")).unwrap();
+    std::fs::create_dir(root.join("sudo-secretspec-rollback-notanumber")).unwrap();
+
+    let mut found = list_snapshots(root);
+    found.sort_by_key(|s| s.stamp);
+
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(found[0].stamp, 100);
+    assert!(found[0].restorable);
+    assert_eq!(found[1].stamp, 200);
+    assert!(!found[1].restorable, "no .prior file means nothing to restore");
+}

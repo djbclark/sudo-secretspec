@@ -22,6 +22,12 @@ pub(crate) const SUDOERS_DIR: &str = "/private/etc/sudoers.d";
 const DEFAULT_VAULT: &str = "/var/db/sudo-secretspec";
 const DEFAULT_USER: &str = "_sudo_secretspec";
 const DEFAULT_GROUP: &str = "_sudo_secretspec";
+/// Directory-name prefix for rollback snapshots under `<PREFIX>/libexec`.
+/// `rollback::run` refuses any snapshot path outside this namespace.
+pub(crate) const SNAPSHOT_PREFIX: &str = "sudo-secretspec-rollback-";
+/// Restorable snapshots retained after a successful install. Every install
+/// captures one, so without a bound they accumulate for the life of the host.
+const SNAPSHOT_KEEP: usize = 3;
 
 #[derive(Debug, Error)]
 pub enum InstallError {
@@ -145,6 +151,102 @@ fn capture_snapshot(snapshot: &Path) -> Result<usize, InstallError> {
         0o600,
     )?;
     Ok(captured)
+}
+
+/// One rollback snapshot directory as it appears on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    pub path: PathBuf,
+    /// Unix seconds parsed from the directory name.
+    pub stamp: u64,
+    /// False when the directory holds no `.prior` file. `plan_restore` rejects
+    /// such a snapshot outright ("no restorable prior artifacts"), so it can
+    /// never be used for anything — a first install produces one every time.
+    pub restorable: bool,
+}
+
+/// Enumerate rollback snapshots directly under `dir`.
+///
+/// Only directories whose name carries [`SNAPSHOT_PREFIX`] followed by a
+/// numeric stamp are reported, so an unrelated neighbour in libexec can never
+/// become a pruning candidate.
+pub fn list_snapshots(dir: &Path) -> Vec<Snapshot> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(stamp) = name.strip_prefix(SNAPSHOT_PREFIX) else {
+            continue;
+        };
+        let Ok(stamp) = stamp.parse::<u64>() else {
+            continue;
+        };
+        let path = entry.path();
+        if path.is_symlink() || !path.is_dir() {
+            continue;
+        }
+        let restorable = fs::read_dir(&path)
+            .map(|mut e| {
+                e.any(|f| {
+                    f.map(|f| f.file_name().to_string_lossy().ends_with(".prior"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        found.push(Snapshot {
+            path,
+            stamp,
+            restorable,
+        });
+    }
+    found
+}
+
+/// Choose which snapshots to delete: every unrestorable one, plus restorable
+/// ones older than the newest `keep`.
+///
+/// Separated from [`prune_snapshots`] so the retention decision can be tested
+/// without root, the same way `rollback::plan_restore` separates its trust
+/// decisions from the filesystem work they authorise.
+pub fn plan_prune(snapshots: &[Snapshot], keep: usize) -> Vec<PathBuf> {
+    let mut restorable: Vec<&Snapshot> = snapshots.iter().filter(|s| s.restorable).collect();
+    // Newest first, so the tail past `keep` is what ages out.
+    restorable.sort_by(|a, b| b.stamp.cmp(&a.stamp));
+
+    let mut doomed: Vec<PathBuf> = snapshots
+        .iter()
+        .filter(|s| !s.restorable)
+        .map(|s| s.path.clone())
+        .collect();
+    doomed.extend(restorable.iter().skip(keep).map(|s| s.path.clone()));
+    doomed.sort();
+    doomed
+}
+
+/// Delete the snapshots [`plan_prune`] selects.
+///
+/// Each candidate is re-checked against the same guards `rollback::run`
+/// applies before it trusts a snapshot — root-owned, mode 0700, not a symlink.
+/// A directory failing any of them is left alone rather than removed: it is
+/// not ours, and deleting it as root on a guess is the worse error.
+/// Returns the number removed. Never fails an install: pruning is hygiene.
+fn prune_snapshots(dir: &Path, keep: usize) -> usize {
+    let mut removed = 0;
+    for path in plan_prune(&list_snapshots(dir), keep) {
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_dir() || meta.uid() != 0 || meta.permissions().mode() & 0o777 != 0o700 {
+            continue;
+        }
+        if fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 fn require_root() -> Result<(), InstallError> {
@@ -644,9 +746,8 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     // Preserve the outgoing artifacts before anything is overwritten, so the
     // snapshot this install reports is actually restorable.
     let stamp = chrono_like_stamp();
-    let rollback = PathBuf::from(PREFIX)
-        .join("libexec")
-        .join(format!("sudo-secretspec-rollback-{stamp}"));
+    let libexec = PathBuf::from(PREFIX).join("libexec");
+    let rollback = libexec.join(format!("{SNAPSHOT_PREFIX}{stamp}"));
     let captured = capture_snapshot(&rollback)?;
 
     install_file(&self_exe, &client_dst, require_mode(&client_dst)?)?;
@@ -726,11 +827,22 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
         }
     }
 
+    // Hygiene, after the install itself has succeeded: every install captures
+    // a snapshot, and a first install captures an empty one that can never be
+    // restored from. Unbounded, they accumulate for the life of the host.
+    let pruned = prune_snapshots(&libexec, SNAPSHOT_KEEP);
+
     println!("installed sudo-secretspec");
     println!("config={}", config_dst.display());
     println!("vault={}", req.vault.display());
-    println!("rollback_snapshot={}", rollback.display());
+    if captured == 0 {
+        // Pruned just above; naming it would point at a directory that is gone.
+        println!("rollback_snapshot=none");
+    } else {
+        println!("rollback_snapshot={}", rollback.display());
+    }
     println!("rollback_artifacts={captured}");
+    println!("pruned_snapshots={pruned}");
     if created_vault {
         println!("created_vault=1");
     }
