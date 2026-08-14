@@ -1,7 +1,8 @@
 # Design note: privilege boundary, packaging, and the authentication gate
 
-**Status:** analysis complete; F1, F2, F3, F4, F6 implemented. Phase 2 is done
-apart from item 8's `sudoers.d` neighbour report.
+**Status:** analysis complete; F1, F2, F3, F4, F6 implemented. **Phase 2 is
+complete.** Remaining open work is the separate workstream (items 9–10, F5) and
+item 12, cross-platform `sudo`.
 **Date:** 2026-08-13
 **Scope:** fork-only (`djbclark/sudo-secretspec`). Not upstream material.
 **Prompted by:** resolving the Homebrew link conflict after the
@@ -393,8 +394,43 @@ must ship in the same version.
 5. ~~`timestamp_timeout=0` on the client path (F1).~~ **Done.**
 6. ~~`sudo-secretspec uninstall` (F3).~~ **Done.**
 7. ~~`doctor`: `CLIENT_SHADOWED` and unsafe-prefix checks (F2).~~ **Done.**
-8. `doctor`: report broken neighbours in `sudoers.d`; GC rollback snapshots
-   (F6). Snapshot GC is done; the `sudoers.d` neighbour report is not.
+8. ~~`doctor`: report broken neighbours in `sudoers.d`; GC rollback snapshots
+   (F6).~~ **Done.** Snapshot GC shipped earlier; the neighbour report is
+   `check_sudoers_neighbours` (`drift.rs`), advisory-only under
+   `SUDOERS_NEIGHBOUR_IGNORED` and `SUDOERS_NEIGHBOUR_SKIPPED`.
+
+   The rules were **probed on sudo 1.9.17p2, not derived**, and two of them are
+   not what the generic `sudo_secure_file` description implies:
+
+   - The mode test is **equality with `0440`**, not "not group- or
+     world-writable". `0400` and `0444` are both refused.
+   - Ownership must be uid 0 **and** gid 0, so `root:staff` is refused.
+   - `#includedir` skips any name containing `.` or ending in `~` *before* it
+     stats the file, so a `foo.conf` is invisible at any mode. That is a
+     separate code because the fix is a rename, not a `chmod`.
+   - **Symlinks are followed.** Sudo opens the entry and stats the descriptor,
+     so a link to a root:wheel `0440` file loads normally. This check therefore
+     uses `fs::metadata` where the rest of `drift.rs` deliberately uses
+     `symlink_metadata`: the job is to model what sudo does, not to decide
+     whether a path is trustworthy. Using `symlink_metadata` here reported
+     every symlinked drop-in as broken.
+
+   A first probe using `visudo -c -f` was discarded as measuring the wrong
+   thing: with `-f`, visudo checks syntax only and applies **none** of the
+   ownership or mode rules. Only an unscoped `visudo -c` against the live tree
+   exercises them.
+
+   Verified live as root against the real `/etc/sudoers.d` with three planted
+   subjects. The check found all three; `visudo -c` found only one, staying
+   silent on both the skipped name and the dangling symlink. `.DS_Store` and
+   our own drop-in are correctly not reported, and `report.ok` stayed `true`
+   throughout.
+
+   Findings are advisory for two reasons, not one: the general rule that a
+   permanent non-advisory finding wedges every agent told to treat a `doctor`
+   failure as a hard stop, and the specific fact that these files belong to
+   other vendors — `uninstall` already refuses to touch them, so this project
+   cannot clear what it reports.
 
 Then re-run `install` to apply the new policy and confirm `doctor` is clean.
 

@@ -93,10 +93,17 @@ impl Layout {
 /// neither means a credential operation would be unsafe. They must not fail
 /// `doctor`: agents are instructed to treat a drift failure as a hard stop, so
 /// a permanent advisory would wedge every automated caller indefinitely.
+/// The two `SUDOERS_NEIGHBOUR_*` codes are advisory for a second reason on top
+/// of that one: the files they describe belong to other vendors. `uninstall`
+/// already refuses to touch a neighbour's drop-in, so a finding here is
+/// something only the operator can act on, and failing `doctor` over it would
+/// hand every automated caller a stop condition this project cannot clear.
 const ADVISORY_CODES: &[&str] = &[
     "LEGACY_VAULT_CLUTTER",
     "PENDING_ROLLBACK",
     "CLIENT_DUPLICATE",
+    "SUDOERS_NEIGHBOUR_IGNORED",
+    "SUDOERS_NEIGHBOUR_SKIPPED",
 ];
 
 /// Directories scanned unconditionally for a second copy of the public client.
@@ -493,6 +500,139 @@ fn check_client_shadowing(
     }
 }
 
+/// The facts sudo consults about a `sudoers.d` entry, as plain values.
+///
+/// Separated from the filesystem so every branch of [`refusal_for`] is testable
+/// without root: an unprivileged test cannot create a uid-0 file, which is
+/// exactly the case that must be proven to load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EntryFacts {
+    is_regular_file: bool,
+    is_dir: bool,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
+/// Sudo never reads a `#includedir` entry whose name contains a `.` or ends in
+/// `~`. The skip happens *before* any mode or ownership check, so such a file is
+/// invisible no matter how it is chmod'd — which makes it a different problem
+/// with a different fix (rename) from the ones [`refusal_for`] describes.
+fn skipped_by_name(name: &str) -> bool {
+    name.contains('.') || name.ends_with('~')
+}
+
+/// Why sudo would decline to apply a drop-in, or `None` when it loads.
+///
+/// Every rule here was probed against sudo 1.9.17p2 rather than taken from the
+/// generic `sudo_secure_file` description, and two of them are not what that
+/// description implies:
+///
+/// * The mode test is **equality with 0440**, not "not group- or
+///   world-writable". `0400` and `0444` are both refused.
+/// * Ownership must be uid 0 **and** gid 0, so `root:staff` is refused even
+///   though root owns it.
+///
+/// `None` facts mean the path could not be resolved at all — a dangling
+/// symlink. Sudo skips those silently, which is precisely why they are worth
+/// reporting: nothing anywhere else will mention them.
+fn refusal_for(facts: Option<EntryFacts>) -> Option<String> {
+    let Some(f) = facts else {
+        return Some("it cannot be resolved (dangling symlink or unreadable)".into());
+    };
+    if f.is_dir {
+        return Some("it is a directory".into());
+    }
+    if !f.is_regular_file {
+        return Some("it is not a regular file".into());
+    }
+    if f.uid != 0 || f.gid != 0 {
+        return Some(format!(
+            "it is owned by {}:{}, and sudo requires root:wheel (uid 0, gid 0)",
+            owner_name(f.uid),
+            group_name(f.gid)
+        ));
+    }
+    if f.mode != 0o440 {
+        return Some(format!(
+            "its mode is {:04o}, and sudo requires exactly 0440",
+            f.mode
+        ));
+    }
+    None
+}
+
+/// Read the facts sudo would read about `path`.
+///
+/// This follows symlinks, where the rest of this module deliberately does not.
+/// Sudo opens a drop-in and stats the descriptor, so a link to a root:wheel
+/// 0440 file loads normally — verified on this host. The job here is to model
+/// what sudo actually does, not to decide whether a path is trustworthy, and
+/// using `symlink_metadata` would report every symlinked drop-in as broken when
+/// sudo applies it happily.
+fn sudoers_facts(path: &Path) -> Option<EntryFacts> {
+    let meta = fs::metadata(path).ok()?;
+    Some(EntryFacts {
+        is_regular_file: meta.is_file(),
+        is_dir: meta.is_dir(),
+        uid: meta.uid(),
+        gid: meta.gid(),
+        mode: meta.permissions().mode() & 0o7777,
+    })
+}
+
+/// Report drop-ins beside ours that sudo silently declines to apply.
+///
+/// `doctor` already proves our own policy is installed and parses. It said
+/// nothing about a neighbour in a state that makes sudo ignore it, and such a
+/// file looks installed while doing nothing at all — `/etc/sudoers.d/yabai` sat
+/// at mode 0640 on the development host for a month in exactly that condition,
+/// visible only as a stray warning during `install`.
+///
+/// Scope is deliberately narrow: this reports, never repairs, and never widens
+/// to judging a neighbour's *contents*. What another vendor grants is that
+/// vendor's business; whether sudo is reading it at all is diagnosable fact.
+fn check_sudoers_neighbours(layout: &Layout, findings: &mut Vec<Finding>) {
+    let Some(dir) = layout.sudoers.parent() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    // `read_dir` order is not defined; sort so the report is stable run to run.
+    let mut names: Vec<OsString> = entries.flatten().map(|e| e.file_name()).collect();
+    names.sort();
+
+    for name in names {
+        let path = dir.join(&name);
+        // Ours is already judged as a protected file, with the same 0440
+        // root:wheel expectation, and by `visudo -c -f` below.
+        if path == layout.sudoers {
+            continue;
+        }
+        let name = name.to_string_lossy();
+        // Leading-dot names are not attempted rules. `.DS_Store` is on every
+        // macOS host and would otherwise be a permanent finding.
+        if name.starts_with('.') {
+            continue;
+        }
+        if skipped_by_name(&name) {
+            findings.push(finding(
+                "SUDOERS_NEIGHBOUR_SKIPPED",
+                Some(&path),
+                "sudo's `#includedir` skips this drop-in because its name contains `.` or ends \
+                 in `~`, so its rules never take effect; rename it to activate it",
+            ));
+        } else if let Some(reason) = refusal_for(sudoers_facts(&path)) {
+            findings.push(finding(
+                "SUDOERS_NEIGHBOUR_IGNORED",
+                Some(&path),
+                format!("sudo will not apply this drop-in because {reason}"),
+            ));
+        }
+    }
+}
+
 /// Inspect the live installation described by `layout`.
 ///
 /// This never repairs and never opens secret-bearing file contents for parsing.
@@ -570,6 +710,13 @@ pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
             )),
         }
     }
+
+    // Neighbours in the same directory that sudo is silently not applying.
+    //
+    // Scoped per-file above for a reason — another vendor's broken drop-in must
+    // never fail our own check — but "not our problem to fail on" is not the
+    // same as "not worth saying", and nothing else on the host reports it.
+    check_sudoers_neighbours(layout, &mut findings);
 
     // Vault metadata and allowlisted runtime entries only.
     if layout.vault.is_symlink() {
@@ -1045,6 +1192,191 @@ service_group = "_sudo_secretspec"
         let mut findings = Vec::new();
         check_client_shadowing(&layout, &[installed_dir, other], None, &mut findings);
         assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    fn facts(uid: u32, gid: u32, mode: u32) -> Option<EntryFacts> {
+        Some(EntryFacts {
+            is_regular_file: true,
+            is_dir: false,
+            uid,
+            gid,
+            mode,
+        })
+    }
+
+    #[test]
+    fn a_correctly_installed_neighbour_is_not_reported() {
+        assert_eq!(refusal_for(facts(0, 0, 0o440)), None);
+    }
+
+    #[test]
+    fn sudo_requires_exactly_0440_not_merely_unwritable() {
+        // The counterintuitive half of this check, and the reason it was probed
+        // rather than derived: `sudo_secure_file`'s documented behaviour is a
+        // "not group- or world-writable" test, which 0400 and 0444 both pass.
+        // Real sudo 1.9.17p2 compares for equality and refuses both.
+        for mode in [0o400, 0o444, 0o640, 0o600, 0o444, 0o460, 0o442, 0o644] {
+            assert!(
+                refusal_for(facts(0, 0, mode)).is_some(),
+                "mode {mode:04o} must be refused"
+            );
+        }
+        assert_eq!(refusal_for(facts(0, 0, 0o440)), None);
+    }
+
+    #[test]
+    fn root_ownership_alone_is_not_enough() {
+        // gid must be 0 too: root:staff is refused, which is what a drop-in
+        // written by a careless installer on macOS actually looks like.
+        let refusal = refusal_for(facts(0, 20, 0o440)).expect("root:staff must be refused");
+        assert!(refusal.contains("uid 0, gid 0"), "{refusal}");
+        assert!(refusal_for(facts(501, 0, 0o440)).is_some());
+    }
+
+    #[test]
+    fn an_unresolvable_neighbour_is_reported() {
+        // A dangling symlink: sudo skips it in silence, so if this check does
+        // not mention it, nothing on the host will.
+        let refusal = refusal_for(None).expect("must be refused");
+        assert!(refusal.contains("cannot be resolved"), "{refusal}");
+    }
+
+    #[test]
+    fn a_directory_or_special_file_is_reported() {
+        let dir = refusal_for(Some(EntryFacts {
+            is_regular_file: false,
+            is_dir: true,
+            uid: 0,
+            gid: 0,
+            mode: 0o440,
+        }));
+        assert!(dir.expect("dir must be refused").contains("directory"));
+
+        let fifo = refusal_for(Some(EntryFacts {
+            is_regular_file: false,
+            is_dir: false,
+            uid: 0,
+            gid: 0,
+            mode: 0o440,
+        }));
+        assert!(fifo.expect("fifo must be refused").contains("regular file"));
+    }
+
+    #[test]
+    fn skipped_by_name_matches_sudos_includedir_rule() {
+        assert!(skipped_by_name("custom.conf"));
+        assert!(skipped_by_name("policy.dpkg-old"));
+        assert!(skipped_by_name("policy~"));
+        assert!(!skipped_by_name("sudo-secretspec"));
+        assert!(!skipped_by_name("yabai"));
+        assert!(!skipped_by_name("90-my-rules"));
+    }
+
+    /// A layout whose sudoers policy sits inside a real, scannable directory.
+    fn layout_with_sudoers_dir(tmp: &Path) -> (Layout, PathBuf) {
+        let dir = tmp.join("sudoers.d");
+        fs::create_dir_all(&dir).unwrap();
+        let mut layout = layout_for(tmp);
+        layout.sudoers = dir.join("sudo-secretspec");
+        (layout, dir)
+    }
+
+    fn neighbour_findings(layout: &Layout) -> Vec<(String, String)> {
+        let mut findings = Vec::new();
+        check_sudoers_neighbours(layout, &mut findings);
+        findings
+            .into_iter()
+            .map(|f| (f.code, f.path.unwrap_or_default()))
+            .collect()
+    }
+
+    #[test]
+    fn a_broken_neighbour_is_reported_but_never_fails_the_report() {
+        // The whole point: these are other vendors' files. Agents are told to
+        // treat a `doctor` failure as a hard stop, and this project cannot fix
+        // a neighbour, so a failing code here would wedge automation forever.
+        let tmp = tempdir().unwrap();
+        let (layout, dir) = layout_with_sudoers_dir(tmp.path());
+        // Test runs unprivileged, so this file is not uid 0 and is refused for
+        // ownership — the same branch a real root:staff drop-in takes.
+        fs::write(dir.join("yabai"), "Defaults env_reset\n").unwrap();
+
+        let reported = neighbour_findings(&layout);
+        assert_eq!(
+            reported,
+            vec![(
+                "SUDOERS_NEIGHBOUR_IGNORED".to_string(),
+                dir.join("yabai").display().to_string()
+            )]
+        );
+        let mut findings = Vec::new();
+        check_sudoers_neighbours(&layout, &mut findings);
+        assert!(
+            Report::from_findings(findings).ok,
+            "a neighbour must not fail the report"
+        );
+    }
+
+    #[test]
+    fn the_name_skip_rule_wins_over_the_metadata_rule() {
+        // Precedence matters: sudo skips the name before it ever stats the
+        // file, so reporting `custom.conf` as a permissions problem would send
+        // the operator to chmod when the fix is a rename.
+        let tmp = tempdir().unwrap();
+        let (layout, dir) = layout_with_sudoers_dir(tmp.path());
+        fs::write(dir.join("custom.conf"), "Defaults env_reset\n").unwrap();
+
+        assert_eq!(
+            neighbour_findings(&layout),
+            vec![(
+                "SUDOERS_NEIGHBOUR_SKIPPED".to_string(),
+                dir.join("custom.conf").display().to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn dotfiles_and_our_own_policy_are_not_neighbours() {
+        // `.DS_Store` is on every macOS host and is not an attempted rule;
+        // our own drop-in is already judged by `check_protected_file`, so
+        // reporting it here would double every real finding about it.
+        let tmp = tempdir().unwrap();
+        let (layout, dir) = layout_with_sudoers_dir(tmp.path());
+        fs::write(dir.join(".DS_Store"), "junk").unwrap();
+        fs::write(&layout.sudoers, "Defaults env_reset\n").unwrap();
+
+        assert!(neighbour_findings(&layout).is_empty());
+    }
+
+    #[test]
+    fn neighbours_are_reported_in_a_stable_order() {
+        // `read_dir` order is unspecified; an unstable report is noise for
+        // anything diffing `doctor --json` between runs.
+        let tmp = tempdir().unwrap();
+        let (layout, dir) = layout_with_sudoers_dir(tmp.path());
+        for name in ["zebra", "alpha", "middle"] {
+            fs::write(dir.join(name), "Defaults env_reset\n").unwrap();
+        }
+        let paths: Vec<String> = neighbour_findings(&layout)
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                dir.join("alpha").display().to_string(),
+                dir.join("middle").display().to_string(),
+                dir.join("zebra").display().to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_sudoers_directory_is_not_an_error() {
+        let tmp = tempdir().unwrap();
+        let mut layout = layout_for(tmp.path());
+        layout.sudoers = tmp.path().join("absent").join("sudo-secretspec");
+        assert!(neighbour_findings(&layout).is_empty());
     }
 
     fn layout_for(root: &Path) -> Layout {

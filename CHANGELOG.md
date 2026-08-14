@@ -54,6 +54,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The client passes its own search path to the privileged check, since `sudo`
   replaces `PATH` with the policy's `secure_path`; a fixed list of standard
   directories is always scanned, so this can only widen the check.
+- `sudo-secretspec doctor` now reports neighbouring drop-ins in
+  `/etc/sudoers.d` that sudo is silently not applying. A file sudo refuses —
+  wrong mode, wrong owner, not a regular file, or a broken symlink — is
+  reported as `SUDOERS_NEIGHBOUR_IGNORED`, and one whose name makes
+  `#includedir` skip it (any name containing `.` or ending in `~`) as
+  `SUDOERS_NEIGHBOUR_SKIPPED`, which needs a rename rather than a `chmod`.
+  Both are advisory and never fail the check: these files belong to other
+  vendors, and this project neither edits nor removes them. Two of the cases
+  are invisible to `visudo -c`, which passes a skipped name and a dangling
+  symlink without comment. Note that sudo wants mode exactly `0440` — `0400`
+  and `0444` are both refused — and owner exactly `root:wheel`. Dotfiles such
+  as `.DS_Store` are not reported.
 
 ### Security
 
