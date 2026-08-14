@@ -148,13 +148,23 @@ enum Cmd {
 
 /// True when this process is the installed privileged broker, i.e. it was
 /// reached through the NOPASSWD sudoers rule rather than the public client.
+///
+/// The two ways of not knowing are **not** the same, and collapsing them is
+/// what made this fail open. Keep the asymmetry:
+///
+/// - `canonicalize(BROKER_PATH)` fails → no broker is installed → this process
+///   cannot be it → `false`. This is what lets the Homebrew `libexec`
+///   bootstrap run `install` at all, on a machine with no boundary yet.
+/// - `current_exe()` fails → we cannot identify ourselves → `true`, refusing
+///   boundary lifecycle. The allowlist in `main` is presented as the layer that
+///   catches a sudoers mistake, so it has to fail closed when it cannot tell.
 fn invoked_as_privileged_broker() -> bool {
-    let broker = std::fs::canonicalize(BROKER_PATH);
-    match (std::env::current_exe(), broker) {
+    match (std::env::current_exe(), std::fs::canonicalize(BROKER_PATH)) {
         (Ok(me), Ok(broker)) => std::fs::canonicalize(me)
             .map(|me| me == broker)
-            .unwrap_or(false),
-        _ => false,
+            .unwrap_or(true),
+        (Err(_), _) => true,
+        (_, Err(_)) => false,
     }
 }
 

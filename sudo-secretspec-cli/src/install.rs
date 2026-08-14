@@ -561,6 +561,33 @@ pub(crate) fn is_protected_dir(path: &Path) -> bool {
     is_real_dir(path) && is_root_only_dir(path)
 }
 
+/// Create a directory the installer is about to write into, then require that
+/// it is root-owned and not writable by anyone else.
+///
+/// Ordering matters both ways. Validating first would fail on a machine where
+/// the directory does not exist yet, which is every first install; creating
+/// without validating is what left the gap. `is_protected_dir`'s own contract
+/// says the installer requires this of every directory it writes into, but
+/// `validate_protected_ancestors` covered only the shared roots — not
+/// `<prefix>/{bin,libexec,etc,share}`, which is where the NOPASSWD broker
+/// binary lands. The case this closes is a host carrying a legacy
+/// Intel-Homebrew `chown -R` of `/usr/local`, where an unprivileged user owns
+/// the directory root is about to execute from.
+fn prepare_install_dir(path: &Path) -> Result<(), InstallError> {
+    fs::create_dir_all(path)?;
+    // `create_dir_all` takes the ambient umask, and the policy runs the broker
+    // with `umask=0077`. A 0700 `/usr/local/bin` would be unreadable to the
+    // operator it exists to serve, so set the mode rather than inherit it.
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    if !is_protected_dir(path) {
+        return Err(InstallError::Denied(format!(
+            "unsafe install directory {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn validate_protected_ancestors() -> Result<(), InstallError> {
     for dir in [
         "/usr",
@@ -803,10 +830,20 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     let config_dst = PathBuf::from(CONFIG_PATH);
     let sudoers_dst = PathBuf::from(SUDOERS_PATH);
 
-    fs::create_dir_all(PathBuf::from(PREFIX).join("bin"))?;
-    fs::create_dir_all(PathBuf::from(PREFIX).join("libexec"))?;
-    fs::create_dir_all(PathBuf::from(PREFIX).join("etc"))?;
-    fs::create_dir_all(&share)?;
+    // `is_protected_dir`'s contract is that the installer requires it of every
+    // directory it writes into, but `validate_protected_ancestors` covered only
+    // the shared roots — not `<prefix>/{bin,libexec,etc,share}`, which is where
+    // the NOPASSWD broker binary itself lands. A machine carrying a legacy
+    // Intel-Homebrew `chown -R` of the prefix would hand an unprivileged user
+    // write access to the path root then executes.
+    //
+    // Create first, then validate: on a first install these may not exist yet.
+    // The nested `share/sudo-secretspec` is created by the same loop for the
+    // same reason — it holds the manifest `rollback` verifies against.
+    for dir in ["bin", "libexec", "etc", "share"] {
+        prepare_install_dir(&PathBuf::from(PREFIX).join(dir))?;
+    }
+    prepare_install_dir(&share)?;
 
     // Preserve the outgoing artifacts before anything is overwritten, so the
     // snapshot this install reports is actually restorable.
@@ -921,4 +958,52 @@ fn chrono_like_stamp() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("{secs}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_install_directory_the_operator_owns_is_refused() {
+        // The scenario is a host carrying a legacy Intel-Homebrew `chown -R` of
+        // /usr/local: the directory exists, looks ordinary, and is writable by
+        // an unprivileged user — who could then replace the binary root
+        // executes through the NOPASSWD rule. A tempdir is owned by whoever
+        // runs the tests, which is the same condition.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bin");
+
+        let err = prepare_install_dir(&path).expect_err("a user-owned prefix must be refused");
+        assert!(
+            err.to_string().contains("unsafe install directory"),
+            "{err}"
+        );
+        // Created before it was judged: a first install has to be able to make
+        // these, so the refusal cannot be "it does not exist yet".
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn an_install_directory_is_created_at_0755_not_the_ambient_umask() {
+        // The policy runs the broker with umask=0077. Inheriting that would
+        // give /usr/local/bin mode 0700, unreadable to the operator it exists
+        // to serve, so the mode is set explicitly.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("libexec");
+        let previous = unsafe { libc::umask(0o077) };
+        let _ = prepare_install_dir(&path);
+        unsafe { libc::umask(previous) };
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "got {mode:o}");
+    }
+
+    #[test]
+    fn a_root_owned_system_directory_passes() {
+        // Control for the refusal above: the predicate is not simply always
+        // false. `/usr` is root-owned and not group- or world-writable on both
+        // platforms this suite runs on.
+        assert!(is_protected_dir(Path::new("/usr")));
+    }
 }

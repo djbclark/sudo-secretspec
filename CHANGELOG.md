@@ -86,6 +86,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The in-binary refusal of boundary lifecycle through the NOPASSWD path now
+  fails closed. It treated "this process cannot identify itself" and "no broker
+  is installed" as the same answer and allowed `install`/`rollback`/`uninstall`
+  in both. Only the second is a reason to allow them — that is the case a
+  first install runs in — so an unidentifiable process is now refused.
+- `install` now requires `/usr/local/{bin,libexec,etc,share}` to be root-owned
+  before writing into them, which it already documented but only enforced for
+  the shared roots above them. A host carrying a legacy Intel-Homebrew
+  `chown -R` of the prefix would otherwise let an unprivileged user replace
+  the binary root executes through the NOPASSWD rule. The directories are also
+  created at an explicit `0755` rather than inheriting the caller's umask.
+- The broker now requires the vault's manifest and dotenv to be exactly mode
+  `0600`. It previously accepted anything closed to group and world, so `0700`
+  and `0400` passed the enforcing check while `doctor` reported them — leaving
+  the enforcing side more permissive than the reporting one.
 - `sudo-secretspec doctor` no longer writes to the audit ledger it is
   reporting on. Its drift check reached the ledger through the ordinary
   verification path, which opens read-write and normalises on the way in —

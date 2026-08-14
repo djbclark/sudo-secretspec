@@ -170,8 +170,14 @@ fn require_boundary(cfg: &Config) -> Result<u32, i32> {
             eprintln!("broker: {name} owner is not the configured service user");
             return Err(2);
         }
-        if meta.permissions().mode() & 0o077 != 0 {
-            eprintln!("broker: {name} must not be group- or world-accessible");
+        // Exactly 0600, not merely "nothing for group or world". The looser
+        // rule also admitted 0700 and 0400, while `drift` already required
+        // exactly 0600 — leaving the *enforcing* side more permissive than the
+        // *reporting* one, which is backwards. A fresh install writes 0600
+        // (`install::run`) and an adopted vault is checked here, so there is no
+        // mode this rejects that the installer would have produced.
+        if meta.permissions().mode() & 0o777 != 0o600 {
+            eprintln!("broker: {name} must be mode 0600");
             return Err(2);
         }
     }
