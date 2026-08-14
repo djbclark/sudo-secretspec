@@ -10,6 +10,7 @@
 //! leaves the backups visible to `doctor` but the original state recoverable.
 
 use std::ffi::OsString;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use clap::Parser;
 use sha2::{Digest, Sha256};
@@ -91,23 +92,90 @@ fn load_config() -> Result<Config, i32> {
     })
 }
 
-fn require_boundary(cfg: &Config) -> Result<(), i32> {
+fn uid_for_user(name: &str) -> Option<u32> {
+    let c = std::ffi::CString::new(name).ok()?;
+    // SAFETY: `getpwnam` is called with a valid NUL-terminated string and the
+    // returned pointer is only dereferenced while non-null.
+    unsafe {
+        let pw = libc::getpwnam(c.as_ptr());
+        if pw.is_null() {
+            None
+        } else {
+            Some((*pw).pw_uid)
+        }
+    }
+}
+
+/// Validate the privilege boundary before any operation, and return the uid the
+/// protected state must be owned by.
+///
+/// Existence and symlink checks alone are not a boundary: they say nothing
+/// about who can rewrite the manifest that decides which secrets exist, or the
+/// dotenv that holds their values. Ownership, mode, and the resolved path chain
+/// are all enforced here rather than being left to `doctor`, which is
+/// out-of-band, non-repairing, and may never have run.
+fn require_boundary(cfg: &Config) -> Result<u32, i32> {
     let vault = &cfg.vault;
-    if !vault.exists() || vault.is_symlink() {
-        eprintln!("broker: vault missing or symlinked");
+    let meta = std::fs::symlink_metadata(vault).map_err(|e| {
+        eprintln!("broker: vault unreadable: {e}");
+        2
+    })?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        eprintln!("broker: vault missing, symlinked, or not a directory");
         return Err(2);
     }
-    let manifest = vault.join("secretspec.toml");
-    let dotenv = vault.join(".env");
-    if !manifest.is_file() || manifest.is_symlink() {
-        eprintln!("broker: manifest missing or symlinked");
+    if meta.permissions().mode() & 0o777 != 0o700 {
+        eprintln!("broker: vault must be mode 0700");
         return Err(2);
     }
-    if !dotenv.is_file() || dotenv.is_symlink() {
-        eprintln!("broker: dotenv missing or symlinked");
+
+    let service_uid = uid_for_user(&cfg.service_user).ok_or_else(|| {
+        eprintln!("broker: unknown service user {}", cfg.service_user);
+        2
+    })?;
+    if meta.uid() != service_uid {
+        eprintln!("broker: vault owner is not the configured service user");
         return Err(2);
     }
-    Ok(())
+
+    // The public `/var/db/...` spelling must resolve to the pinned private
+    // chain; anything else means the vault was moved or redirected.
+    match vault.canonicalize() {
+        Ok(resolved) if resolved == cfg.vault_realpath => {}
+        Ok(resolved) => {
+            eprintln!(
+                "broker: vault resolves to {}, expected {}",
+                resolved.display(),
+                cfg.vault_realpath.display()
+            );
+            return Err(2);
+        }
+        Err(e) => {
+            eprintln!("broker: vault path cannot be resolved: {e}");
+            return Err(2);
+        }
+    }
+
+    for name in ["secretspec.toml", ".env"] {
+        let path = vault.join(name);
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+            eprintln!("broker: {name} unreadable: {e}");
+            2
+        })?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            eprintln!("broker: {name} missing, symlinked, or not a regular file");
+            return Err(2);
+        }
+        if meta.uid() != service_uid {
+            eprintln!("broker: {name} owner is not the configured service user");
+            return Err(2);
+        }
+        if meta.permissions().mode() & 0o077 != 0 {
+            eprintln!("broker: {name} must not be group- or world-accessible");
+            return Err(2);
+        }
+    }
+    Ok(service_uid)
 }
 
 // ---------------------------------------------------------------------------
@@ -226,7 +294,7 @@ fn run(broker: &Broker) -> Result<(), i32> {
         | "source-template-check" => {
             require_root()?;
             let cfg = load_config()?;
-            require_boundary(&cfg)?;
+            let service_uid = require_boundary(&cfg)?;
 
             if broker.reason.trim().is_empty() {
                 eprintln!("broker: --reason is required");
@@ -256,7 +324,7 @@ fn run(broker: &Broker) -> Result<(), i32> {
                     command_basename: broker.command_basename.clone(),
                     names: names.clone(),
                     result_code: None,
-                    expected_uid: None,
+                    expected_uid: Some(service_uid),
                 },
             )
             .map_err(|e| {
@@ -308,12 +376,19 @@ fn run(broker: &Broker) -> Result<(), i32> {
                     command_basename: broker.command_basename.clone(),
                     names,
                     result_code: Some(terminal_rc),
-                    expected_uid: None,
+                    expected_uid: Some(service_uid),
                 },
             )
             .map_err(|e| {
+                // Fail closed, but do not report this as a plain policy error:
+                // the operation itself has already committed or rolled back, and
+                // only the ledger is incomplete. 126 distinguishes "outcome
+                // unrecorded" from an operation that simply failed.
                 eprintln!("broker: audit terminal failed: {e}");
-                2
+                eprintln!(
+                    "broker: operation outcome was rc={terminal_rc} but could not be recorded"
+                );
+                126
             })?;
 
             if terminal_rc != 0 {

@@ -3,12 +3,19 @@
 //! Restores previous installed binaries/config/sudoers from a protected
 //! snapshot directory. Never touches vault secret values.
 
+use std::collections::HashMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+fn sha256_file(path: &Path) -> Result<String, RollbackError> {
+    let bytes = fs::read(path)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
 
 #[derive(Debug, Error)]
 pub enum RollbackError {
@@ -27,14 +34,14 @@ fn require_root() -> Result<(), RollbackError> {
 
 /// Restore installed artifacts from a protected snapshot directory.
 ///
-/// Expected layout:
-/// - `MANIFEST.sha256` listing `hash  absolute-path` rows for prior artifacts
-/// - optional numbered backups or direct prior file copies named by sha path basenames
+/// Expected layout, as written by `install::capture_snapshot`:
+/// - `<index>.prior` — the captured bytes of one installed artifact
+/// - `<index>.path`  — that artifact's absolute destination
+/// - `MANIFEST.sha256` — `hash  absolute-path` rows covering every pair
 ///
-/// Current installer creates snapshot dirs as placeholders; a complete snapshot
-/// writer can store prior bytes beside the manifest. This restore verifies the
-/// snapshot directory metadata and reapplies any `*.prior` files found as:
-///   `<index>.prior` + `<index>.path` containing the destination absolute path.
+/// Every destination must be an owned install artifact and every prior file
+/// must match its manifest hash, so a writable snapshot directory cannot be
+/// turned into an arbitrary root-owned write. The snapshot is never executed.
 pub fn run(snapshot: &Path) -> Result<(), RollbackError> {
     require_root()?;
     let snapshot = fs::canonicalize(snapshot)
@@ -59,46 +66,23 @@ pub fn run(snapshot: &Path) -> Result<(), RollbackError> {
             "snapshot directory mode must be 0700".into(),
         ));
     }
-
-    // Prefer an explicit restore program if the snapshot contains one.
-    let restore_bin = snapshot.join("restore");
-    if restore_bin.is_file() {
-        let status = Command::new(&restore_bin).status()?;
-        if status.success() {
-            println!("sudo-secretspec artifacts restored; runtime vault preserved");
-            return Ok(());
-        }
+    if meta.uid() != 0 {
         return Err(RollbackError::Denied(
-            "snapshot restore program failed".into(),
+            "snapshot directory must be owned by root".into(),
         ));
     }
 
-    // Generic path-pair restore: N.path + N.prior
-    let mut pairs = Vec::new();
-    for entry in fs::read_dir(&snapshot)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if let Some(idx) = name.strip_suffix(".path") {
-            let prior = snapshot.join(format!("{idx}.prior"));
-            if prior.is_file() {
-                let dest = PathBuf::from(fs::read_to_string(entry.path())?.trim());
-                pairs.push((prior, dest));
-            }
-        }
-    }
-    if pairs.is_empty() {
-        return Err(RollbackError::Denied(
-            "snapshot contains no restorable prior artifacts".into(),
-        ));
-    }
+    let pairs = plan_restore(&snapshot)?;
 
-    for (prior, dest) in pairs.iter().rev() {
+    for (prior, dest, mode) in pairs.iter().rev() {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
         let tmp = dest.with_extension(format!("restore.{}", std::process::id()));
         fs::copy(prior, &tmp)?;
+        let mut perms = fs::metadata(&tmp)?.permissions();
+        perms.set_mode(*mode);
+        fs::set_permissions(&tmp, perms)?;
         fs::rename(&tmp, dest)?;
     }
 
@@ -115,4 +99,70 @@ pub fn run(snapshot: &Path) -> Result<(), RollbackError> {
 
     println!("sudo-secretspec artifacts restored; runtime vault preserved");
     Ok(())
+}
+
+/// Decide what an already-authorised snapshot directory is allowed to restore.
+///
+/// Returns `(prior file, destination, mode)` triples. Separated from [`run`] so
+/// the trust decisions — destination allowlist and manifest verification — can
+/// be tested without root.
+pub fn plan_restore(snapshot: &Path) -> Result<Vec<(PathBuf, PathBuf, u32)>, RollbackError> {
+    // The manifest is mandatory: it is what binds each destination to the
+    // bytes allowed to land there.
+    let manifest_path = snapshot.join("MANIFEST.sha256");
+    let manifest_text = fs::read_to_string(&manifest_path).map_err(|e| {
+        RollbackError::Denied(format!("snapshot manifest missing or unreadable: {e}"))
+    })?;
+    let mut expected: HashMap<PathBuf, String> = HashMap::new();
+    for line in manifest_text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (hash, dest) = line
+            .split_once(char::is_whitespace)
+            .ok_or_else(|| RollbackError::Denied("snapshot manifest row is malformed".into()))?;
+        expected.insert(PathBuf::from(dest.trim()), hash.to_string());
+    }
+
+    let owned: HashMap<PathBuf, u32> = crate::install::installed_artifacts().into_iter().collect();
+
+    let mut pairs = Vec::new();
+    for entry in fs::read_dir(snapshot)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(idx) = name.strip_suffix(".path") {
+            let prior = snapshot.join(format!("{idx}.prior"));
+            if !prior.is_file() {
+                continue;
+            }
+            let dest = PathBuf::from(fs::read_to_string(entry.path())?.trim().to_string());
+            let Some(mode) = owned.get(&dest).copied() else {
+                return Err(RollbackError::Denied(format!(
+                    "snapshot targets a path this installer does not own: {}",
+                    dest.display()
+                )));
+            };
+            let want = expected.get(&dest).ok_or_else(|| {
+                RollbackError::Denied(format!(
+                    "snapshot manifest does not cover {}",
+                    dest.display()
+                ))
+            })?;
+            if &sha256_file(&prior)? != want {
+                return Err(RollbackError::Denied(format!(
+                    "snapshot artifact does not match its manifest hash: {}",
+                    dest.display()
+                )));
+            }
+            pairs.push((prior, dest, mode));
+        }
+    }
+    if pairs.is_empty() {
+        return Err(RollbackError::Denied(
+            "snapshot contains no restorable prior artifacts".into(),
+        ));
+    }
+    Ok(pairs)
 }

@@ -9,11 +9,25 @@
 //!
 //! Before opening the database the module validates:
 //! - the protected directory is mode `0700` and owned by the expected UID,
-//! - any existing ledger is a regular file with mode `0600` (not a symlink),
-//! - after opening, the ledger inode is re-checked.
+//! - any existing ledger is a regular file with mode `0600` (not a symlink).
+//!
+//! After opening, the ledger is reassigned to the vault owner, its ownership is
+//! re-checked, and its `(dev, ino)` is compared against the pre-open identity so
+//! a file swapped in during the open is rejected.
 //!
 //! If any check fails the call returns an error before creating or touching a
 //! database — **fail-closed**.
+//!
+//! ## Residual risk
+//!
+//! The chain detects modification and truncation of the tail, because every
+//! event commits with the singleton `head` row. It cannot detect deletion of
+//! the entire ledger: an empty `events` table with no `head` row is
+//! indistinguishable from a fresh install. Nothing in the mediated sudoers
+//! policy can reach that state — it requires write access to the vault as root
+//! or the service user — but an external watcher wanting tamper-evidence
+//! against those principals must pin the tip hash reported by [`verify`]
+//! somewhere outside the vault.
 
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -336,10 +350,16 @@ fn open_connection(directory: &Path, expected_uid: Option<u32>) -> Result<Connec
     // 1. Validate protected directory metadata first (fail-closed).
     check_protected_dir(directory, expected_uid)?;
 
-    // 2. Check any existing ledger metadata before opening.
+    // 2. Check any existing ledger metadata before opening. Ownership is
+    //    deliberately not asserted yet: step 5 reassigns the ledger to the vault
+    //    owner, so a ledger left root-owned by an earlier install must be
+    //    repairable rather than permanently fatal. The post-open check enforces
+    //    the final ownership.
     let db_path = directory.join(DB_NAME);
-    let _existed = db_path.exists();
-    check_ledger_metadata(&db_path, expected_uid)?;
+    let identity_before = std::fs::symlink_metadata(&db_path)
+        .ok()
+        .map(|m| (m.dev(), m.ino()));
+    check_ledger_metadata(&db_path, None)?;
 
     // 3. Open with mask to ensure new file gets 0600.
     let old_mask = unsafe { libc::umask(0o077) };
@@ -379,8 +399,20 @@ fn open_connection(directory: &Path, expected_uid: Option<u32>) -> Result<Connec
         }
     }
 
-    // 6. Re-verify ledger metadata after open.
+    // 6. Re-verify ledger metadata after open, now including ownership.
     check_ledger_metadata(&db_path, expected_uid)?;
+
+    // 7. The path must still name the same file it did before the open. A
+    //    metadata re-check alone would pass happily if the ledger had been
+    //    swapped for a different file underneath us.
+    if let Some(before) = identity_before {
+        let after = std::fs::symlink_metadata(&db_path)?;
+        if (after.dev(), after.ino()) != before {
+            return Err(AuditError::Denied(
+                "ledger was replaced while opening".into(),
+            ));
+        }
+    }
 
     Ok(conn)
 }

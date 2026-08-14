@@ -7,7 +7,7 @@ Use this policy in `AGENTS.md`, skills, runbooks, and autonomous-agent prompts f
 - Use only the installed `/usr/local/bin/sudo-secretspec` client for credential CRUD and use.
 - Supply a short operational `--reason` for every `add`, `set`, `delete`, `get`, `check`, `export`, or `run` operation. The protected audit ledger stores only its SHA-256 digest.
 - Run a consumer as `sudo-secretspec run --reason "purpose" -- <command>` instead of extracting values into shell history or command arguments.
-- Treat an unavailable broker, failed audit append/verification, declaration mismatch, authorization failure, or drift finding as a hard stop.
+- Treat an unavailable broker, failed audit append/verification, declaration mismatch, authorization failure, or non-advisory drift finding as a hard stop. `doctor` marks advisory findings — `LEGACY_VAULT_CLUTTER` and `PENDING_ROLLBACK` — and still exits zero; report them to the operator and continue.
 - Report only the non-secret error and request operator action for boundary installation or repair.
 - Normal broker-mediated credential operations are autonomous when the installed sudoers policy allows them.
 
@@ -33,6 +33,8 @@ Tracked Git content contains declarations only. A new name must first be reviewe
 The public client may export the full declared environment to a requested child process; this is intentional for a deployment where every authorized local AI/user may use every managed credential. The boundary provides integrity, singular control-plane enforcement, least-privilege backing-file access, and value-free audit—not per-secret confidentiality among callers sharing the authorized operator identity.
 
 Client-family labels are correlation metadata, not authenticated principals. Deployments requiring per-agent or per-secret authorization need a stronger principal model and policy layer rather than trusting environment markers.
+
+The audit ledger is hash-chained, so modifying or truncating its tail is detectable. Deleting it outright is not: an empty ledger is indistinguishable from a fresh install. Reaching that state requires write access to the vault as root or the service user, which the mediated sudoers policy does not grant. A deployment that wants tamper-evidence against those principals must record the tip hash reported by `audit-verify` outside the vault.
 
 ## Verification
 

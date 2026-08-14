@@ -78,12 +78,23 @@ impl Layout {
     }
 }
 
+/// Findings that require operator review but do not invalidate the boundary.
+///
+/// Both describe state the operator must clean up by hand — non-secret tool
+/// state left under the vault, and a mutation backup a crash left behind — and
+/// neither means a credential operation would be unsafe. They must not fail
+/// `doctor`: agents are instructed to treat a drift failure as a hard stop, so
+/// a permanent advisory would wedge every automated caller indefinitely.
+const ADVISORY_CODES: &[&str] = &["LEGACY_VAULT_CLUTTER", "PENDING_ROLLBACK"];
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Finding {
     pub code: String,
     pub detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Advisory findings are reported but do not clear `Report.ok`.
+    pub advisory: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -95,7 +106,7 @@ pub struct Report {
 impl Report {
     fn from_findings(findings: Vec<Finding>) -> Self {
         Self {
-            ok: findings.is_empty(),
+            ok: findings.iter().all(|f| f.advisory),
             findings,
         }
     }
@@ -106,6 +117,7 @@ fn finding(code: &str, path: Option<&Path>, detail: impl Into<String>) -> Findin
         code: code.into(),
         detail: detail.into(),
         path: path.map(|p| p.display().to_string()),
+        advisory: ADVISORY_CODES.contains(&code),
     }
 }
 
@@ -455,6 +467,33 @@ service_group = "_sudo_secretspec"
             PathBuf::from("/usr/local/bin/sudo-secretspec")
         );
         assert_eq!(layout.vault, PathBuf::from("/var/db/sudo-secretspec"));
+    }
+
+    #[test]
+    fn advisory_findings_do_not_fail_the_report() {
+        // Agents are instructed to treat a drift failure as a hard stop, so
+        // vault clutter and a leftover mutation backup must be reported without
+        // clearing `ok` — otherwise every automated caller stalls permanently.
+        let report = Report::from_findings(vec![
+            finding("LEGACY_VAULT_CLUTTER", None, "tool state"),
+            finding("PENDING_ROLLBACK", None, "leftover backup"),
+        ]);
+        assert!(report.ok, "{:?}", report.findings);
+        assert!(report.findings.iter().all(|f| f.advisory));
+    }
+
+    #[test]
+    fn non_advisory_findings_still_fail_the_report() {
+        let report = Report::from_findings(vec![
+            finding("LEGACY_VAULT_CLUTTER", None, "tool state"),
+            finding("METADATA_MISMATCH", None, "wrong owner"),
+        ]);
+        assert!(!report.ok);
+    }
+
+    #[test]
+    fn an_empty_report_is_ok() {
+        assert!(Report::from_findings(vec![]).ok);
     }
 
     #[test]

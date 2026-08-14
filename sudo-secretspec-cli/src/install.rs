@@ -58,6 +58,92 @@ impl InstallRequest {
     }
 }
 
+/// Every absolute path the installer owns, with the mode it must be installed
+/// at.
+///
+/// This is the single source of truth shared by three callers: the installer
+/// writes these modes, `capture_snapshot` preserves exactly these paths, and
+/// `rollback` refuses to write anywhere outside this set. Rollback restoring a
+/// mode from anywhere else would be a way to smuggle in a different one — the
+/// sudoers policy at `0440` and the client binary at `0755` both matter.
+pub fn installed_artifacts() -> Vec<(PathBuf, u32)> {
+    let prefix = PathBuf::from(PREFIX);
+    let share = prefix.join("share/sudo-secretspec");
+    vec![
+        (prefix.join("bin/sudo-secretspec"), 0o755),
+        (prefix.join("libexec/sudo-secretspec"), 0o755),
+        (share.join("secretspec.toml"), 0o444),
+        (share.join("sudo-secretspec-retired.toml"), 0o444),
+        (share.join("AI-GUIDANCE.md"), 0o444),
+        (share.join("MANIFEST.sha256"), 0o444),
+        (PathBuf::from(CONFIG_PATH), 0o444),
+        (PathBuf::from(SUDOERS_PATH), 0o440),
+    ]
+}
+
+/// Installed mode for `path`, or `None` when it is not an owned artifact.
+pub fn artifact_mode(path: &Path) -> Option<u32> {
+    installed_artifacts()
+        .into_iter()
+        .find(|(p, _)| p == path)
+        .map(|(_, mode)| mode)
+}
+
+fn require_mode(path: &Path) -> Result<u32, InstallError> {
+    artifact_mode(path).ok_or_else(|| {
+        InstallError::Denied(format!("not an owned install artifact: {}", path.display()))
+    })
+}
+
+/// Copy the current bytes of every installed artifact into `snapshot` so a
+/// later `rollback` can restore exactly this state.
+///
+/// Each prior file is recorded as `<index>.prior` alongside `<index>.path`
+/// holding its absolute destination, plus a `MANIFEST.sha256` binding every
+/// destination to the hash of its captured bytes. Rollback verifies that
+/// manifest, so a snapshot cannot be edited into a delivery vehicle for other
+/// content. On a first install there is nothing to capture and the manifest is
+/// written empty.
+fn capture_snapshot(snapshot: &Path) -> Result<usize, InstallError> {
+    fs::create_dir_all(snapshot)?;
+    let mut perms = fs::metadata(snapshot)?.permissions();
+    perms.set_mode(0o700);
+    fs::set_permissions(snapshot, perms)?;
+
+    let mut manifest = String::new();
+    let mut captured = 0usize;
+    for (index, (dest, _mode)) in installed_artifacts().iter().enumerate() {
+        let meta = match fs::symlink_metadata(dest) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_file() {
+            return Err(InstallError::Denied(format!(
+                "refusing to snapshot a non-regular installed path: {}",
+                dest.display()
+            )));
+        }
+        let prior = snapshot.join(format!("{index}.prior"));
+        fs::copy(dest, &prior)?;
+        let mut p = fs::metadata(&prior)?.permissions();
+        p.set_mode(0o600);
+        fs::set_permissions(&prior, p)?;
+        write_bytes(
+            &snapshot.join(format!("{index}.path")),
+            dest.display().to_string().as_bytes(),
+            0o600,
+        )?;
+        manifest.push_str(&format!("{}  {}\n", sha256_file(&prior)?, dest.display()));
+        captured += 1;
+    }
+    write_bytes(
+        &snapshot.join("MANIFEST.sha256"),
+        manifest.as_bytes(),
+        0o600,
+    )?;
+    Ok(captured)
+}
+
 fn require_root() -> Result<(), InstallError> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(InstallError::Denied(
@@ -261,11 +347,22 @@ fn config_toml(req: &InstallRequest, vault_real: &Path) -> String {
     )
 }
 
+/// Sudoers policy for the operator.
+///
+/// The grant is deliberately per-subcommand. A blanket `sudo-secretspec *`
+/// would also cover `install` and `rollback` — the same binary serves as both
+/// client and broker — which would let any caller running as the operator
+/// reconfigure or restore the boundary with no interactive authentication.
+/// Boundary lifecycle must stay behind Touch ID via the public client, so only
+/// the mediated broker operations and the read-only doctor are NOPASSWD here.
+/// `main` enforces the same restriction inside the binary, because sudoers
+/// argument matching alone is easy to get subtly wrong.
 fn sudoers_text(operator: &str) -> String {
     format!(
         "Defaults!{prefix}/libexec/sudo-secretspec env_reset,secure_path=/usr/bin:/bin:/usr/sbin:/sbin,umask=0077\n\
-         {operator} ALL=(root) NOPASSWD: {prefix}/libexec/sudo-secretspec\n\
-         {operator} ALL=(root) NOPASSWD: {prefix}/libexec/sudo-secretspec *\n",
+         {operator} ALL=(root) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker *\n\
+         {operator} ALL=(root) NOPASSWD: {prefix}/libexec/sudo-secretspec doctor\n\
+         {operator} ALL=(root) NOPASSWD: {prefix}/libexec/sudo-secretspec doctor *\n",
         prefix = PREFIX,
         operator = operator,
     )
@@ -425,17 +522,41 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     fs::create_dir_all(PathBuf::from(PREFIX).join("etc"))?;
     fs::create_dir_all(&share)?;
 
-    install_file(&self_exe, &client_dst, 0o755)?;
-    install_file(&self_exe, &broker_dst, 0o755)?;
-    install_file(&req.declarations, &declarations_dst, 0o444)?;
-    write_bytes(&retired_dst, retired_toml().as_bytes(), 0o444)?;
-    write_bytes(&guidance_dst, guidance_text().as_bytes(), 0o444)?;
+    // Preserve the outgoing artifacts before anything is overwritten, so the
+    // snapshot this install reports is actually restorable.
+    let stamp = chrono_like_stamp();
+    let rollback = PathBuf::from(PREFIX)
+        .join("libexec")
+        .join(format!("sudo-secretspec-rollback-{stamp}"));
+    let captured = capture_snapshot(&rollback)?;
+
+    install_file(&self_exe, &client_dst, require_mode(&client_dst)?)?;
+    install_file(&self_exe, &broker_dst, require_mode(&broker_dst)?)?;
+    install_file(
+        &req.declarations,
+        &declarations_dst,
+        require_mode(&declarations_dst)?,
+    )?;
+    write_bytes(
+        &retired_dst,
+        retired_toml().as_bytes(),
+        require_mode(&retired_dst)?,
+    )?;
+    write_bytes(
+        &guidance_dst,
+        guidance_text().as_bytes(),
+        require_mode(&guidance_dst)?,
+    )?;
     write_bytes(
         &config_dst,
         config_toml(&req, &vault_real).as_bytes(),
-        0o444,
+        require_mode(&config_dst)?,
     )?;
-    write_bytes(&sudoers_dst, sudoers_text(&req.operator).as_bytes(), 0o440)?;
+    write_bytes(
+        &sudoers_dst,
+        sudoers_text(&req.operator).as_bytes(),
+        require_mode(&sudoers_dst)?,
+    )?;
 
     // Release manifest of installed artifacts.
     let mut manifest = String::new();
@@ -450,7 +571,11 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     ] {
         manifest.push_str(&format!("{}  {}\n", sha256_file(path)?, path.display()));
     }
-    write_bytes(&manifest_dst, manifest.as_bytes(), 0o444)?;
+    write_bytes(
+        &manifest_dst,
+        manifest.as_bytes(),
+        require_mode(&manifest_dst)?,
+    )?;
 
     // Validate sudoers.
     let visudo = Command::new("/usr/sbin/visudo")
@@ -488,20 +613,11 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
         }
     }
 
-    // Snapshot directory for future rollback of artifacts (not vault values).
-    let stamp = chrono_like_stamp();
-    let rollback = PathBuf::from(PREFIX)
-        .join("libexec")
-        .join(format!("sudo-secretspec-rollback-{stamp}"));
-    fs::create_dir_all(&rollback)?;
-    let mut rp = fs::metadata(&rollback)?.permissions();
-    rp.set_mode(0o700);
-    fs::set_permissions(&rollback, rp)?;
-
     println!("installed sudo-secretspec");
     println!("config={}", config_dst.display());
     println!("vault={}", req.vault.display());
     println!("rollback_snapshot={}", rollback.display());
+    println!("rollback_artifacts={captured}");
     if created_vault {
         println!("created_vault=1");
     }

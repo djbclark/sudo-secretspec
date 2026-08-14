@@ -53,6 +53,7 @@ sudo-secretspec check --reason "validate required credentials"
 - Reasons are hashed in the protected broker ledger but may reach SecretSpec’s native reason interface; never put values in them.
 - Client labels are correlation hints, not authenticated AI identities.
 - An alert-only watchdog must never repair state.
+- `install` and `rollback` are not available through the NOPASSWD broker path; they require interactive operator authentication through `/usr/local/bin/sudo-secretspec`.
 - `run` intentionally exposes the declared environment to its child; this deployment model authorizes every local caller for every declared credential.
 
 ## Verification
@@ -63,6 +64,6 @@ Run through `terminal`:
 sudo-secretspec doctor
 ```
 
-Success requires a zero exit status and no drift findings. Do not run `install` or `rollback` merely to verify a normal credential operation.
+Success requires a zero exit status. Findings marked `[advisory]` — vault clutter and a leftover mutation backup — do not fail the check; report them and continue. Any `[error]` finding is a hard stop. Do not run `install` or `rollback` merely to verify a normal credential operation.
 
 See `sudo-secretspec/AI-GUIDANCE.md` in the distribution for the complete policy contract.

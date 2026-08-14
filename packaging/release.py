@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Release sudo-secretspec downstream v0.19.1-djbclark.1 and its tap.
 
-The release keeps upstream crate versions at 0.19.1. Use ``--dry-run`` to print
+The release descends from upstream 0.19.1 and stamps the whole workspace with
+the downstream version 0.19.1-djbclark.1. Use ``--dry-run`` to print
 all mutating commands. The live path validates fork lineage, creates an
 annotated tag and GitHub Release, rewrites the formula checksum, synchronizes
 the tap, and performs a live Homebrew readback test.

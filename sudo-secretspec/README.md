@@ -45,33 +45,28 @@ sudo-secretspec install \
 | `/usr/local/share/sudo-secretspec/` | declarations pin, guidance, manifest |
 | vault (e.g. `/var/db/stayturgid-secrets`) | `_secretspec`-owned runtime store |
 
-Homebrew packaging installs files only. Privileged boundary creation always
-requires an explicit `sudo-secretspec install` (Touch ID/sudo).
+Privileged boundary creation always requires an explicit `sudo-secretspec
+install` (Touch ID/sudo); see [`../packaging/README.md`](../packaging/README.md)
+for the Homebrew safety boundary.
 
 ## Security model
 
 - Singular mediated path for credential CRUD/use
 - Fail-closed value-free SQLite audit (`broker-audit.sqlite3`)
 - No caller-selected manifests/providers/profiles
-- Doctor/drift is metadata-only and never repairs
-- Rollback snapshots restore installed artifacts, not vault secret values
+- Ownership, mode, and the resolved vault path are enforced before every
+  operation, not only by `doctor`
+- Doctor/drift is metadata-only and never repairs; advisory findings are
+  reported without failing the check
+- The NOPASSWD policy covers only mediated broker operations and `doctor`;
+  `install` and `rollback` always require interactive authentication
+- Rollback snapshots restore installed artifacts, not vault secret values, and
+  are verified against the snapshot manifest before anything is written
 
 See `AI-GUIDANCE.md` for AI/automation rules.
 
 ## Develop
 
-Workspace member: `sudo-secretspec-cli`.
-
-```bash
-export PKG_CONFIG_PATH="/opt/homebrew/opt/sqlite/lib/pkgconfig:$PKG_CONFIG_PATH"
-cargo test -p sudo-secretspec-cli
-cargo build -p sudo-secretspec-cli --release
-```
-
-Branch policy for this fork:
-
-- `main` mirrors upstream
-- `sudo-main` is the downstream release line
-- feature work PRs into `sudo-main`
-
-Current downstream version: `0.19.1-djbclark.1`.
+Workspace member: `sudo-secretspec-cli`. Build/test commands and macOS build
+caveats are in [`../FORK-AI.md`](../FORK-AI.md); branch policy and the
+downstream version scheme are in [`../CLAUDE.md`](../CLAUDE.md).

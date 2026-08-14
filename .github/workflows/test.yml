@@ -68,8 +68,11 @@ jobs:
     - name: Check documentation links
       if: runner.os == 'Linux'
       run: devenv shell -- npm --prefix docs run check:links
+    # sudo-secretspec-cli is macOS-only (it depends on libc, dscl, and the
+    # /private/var layout) and would not compile on the Linux leg of this
+    # matrix. Its suite runs in sudo-release.yml on macOS instead.
     - name: Run tests
-      run: devenv shell -- cargo test --all
+      run: devenv shell -- cargo test --all --exclude sudo-secretspec-cli
 
   # Each optional provider must compile on its own, not just in the default
   # feature set. `cargo test` above cannot catch a missing feature gate: it
@@ -146,4 +149,6 @@ jobs:
       # PHP dev toolchain (php-config/headers) this bare runner does not have, and
       # ext-php-rs rejects the runner's PHP version anyway. The PHP SDK is built
       # and tested by sdks.yml / php-ext.yml instead.
-      run: cargo test --workspace --exclude secretspec-php-native
+      # sudo-secretspec-cli is excluded for the same reason as the Linux leg
+      # above: it is a macOS-only companion and does not build on Windows.
+      run: cargo test --workspace --exclude secretspec-php-native --exclude sudo-secretspec-cli

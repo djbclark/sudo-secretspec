@@ -6,6 +6,16 @@ use std::process::Command;
 
 use clap::{Parser, Subcommand};
 
+/// Absolute path to sudo. Never resolve this through `PATH`: the caller
+/// controls the environment, and a planted `sudo` earlier in `PATH` would
+/// silently satisfy every broker call with forged values and no audit event.
+const SUDO: &str = "/usr/bin/sudo";
+
+/// Installed path of the privileged broker. The sudoers policy grants
+/// NOPASSWD execution of this path, so when the running binary *is* this
+/// path it may only serve the operations that policy is meant to expose.
+const BROKER_PATH: &str = "/usr/local/libexec/sudo-secretspec";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "sudo-secretspec",
@@ -95,8 +105,34 @@ enum Cmd {
     },
 }
 
+/// True when this process is the installed privileged broker, i.e. it was
+/// reached through the NOPASSWD sudoers rule rather than the public client.
+fn invoked_as_privileged_broker() -> bool {
+    let broker = std::fs::canonicalize(BROKER_PATH);
+    match (std::env::current_exe(), broker) {
+        (Ok(me), Ok(broker)) => std::fs::canonicalize(me)
+            .map(|me| me == broker)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
+
+    // The libexec path is NOPASSWD for the operator. Boundary lifecycle must
+    // stay behind an interactive authentication, so refuse anything other than
+    // the mediated operations when we were invoked through that path.
+    if invoked_as_privileged_broker() && !matches!(cli.cmd, Cmd::Broker { .. } | Cmd::Doctor { .. })
+    {
+        eprintln!(
+            "sudo-secretspec: the privileged broker path serves only __broker and doctor;\n\
+             run install/rollback through /usr/local/bin/sudo-secretspec so they require\n\
+             interactive authentication"
+        );
+        std::process::exit(2);
+    }
+
     match cli.cmd {
         Cmd::Add { name, reason } => lifecycle("add", &name, &reason),
         Cmd::Set { name, reason } => lifecycle("set", &name, &reason),
@@ -127,7 +163,7 @@ fn main() {
         Cmd::Doctor { json, config } => doctor(json, config),
         Cmd::Rollback { snapshot } => {
             if unsafe { libc::geteuid() } != 0 {
-                let status = Command::new("sudo")
+                let status = Command::new(SUDO)
                     .arg(self_exe())
                     .arg("rollback")
                     .arg(&snapshot)
@@ -159,7 +195,7 @@ fn self_exe() -> PathBuf {
 }
 
 fn privileged_broker() -> PathBuf {
-    let candidate = PathBuf::from("/usr/local/libexec/sudo-secretspec");
+    let candidate = PathBuf::from(BROKER_PATH);
     if candidate.is_file() {
         candidate
     } else {
@@ -356,7 +392,7 @@ fn run_install(
 
     // Install itself needs interactive sudo/Touch ID, not NOPASSWD -n.
     if unsafe { libc::geteuid() } != 0 {
-        let status = Command::new("sudo")
+        let status = Command::new(SUDO)
             .arg(self_exe())
             .arg("install")
             .arg("--declarations")
@@ -397,7 +433,7 @@ fn run_install(
 }
 
 fn lifecycle(op: &str, name: &str, reason: &str) {
-    let mut cmd = Command::new("sudo");
+    let mut cmd = Command::new(SUDO);
     cmd.arg("-n")
         .arg(privileged_broker())
         .arg("__broker")
@@ -435,18 +471,16 @@ fn detect_client() -> &'static str {
 }
 
 fn run_target(reason: &str, command: &[OsString]) {
-    let sep = command
-        .iter()
-        .position(|a| a == "--")
-        .unwrap_or(command.len());
-    let (pre, target) = command.split_at(sep);
-    let target = if target.is_empty() { pre } else { &target[1..] };
+    // `command` is already exactly the target argv: clap consumed the `--`
+    // delimiter via `last = true`. Any further `--` belongs to the target
+    // (`cargo test -- --nocapture`) and must be passed through untouched.
+    let target = command;
     if target.is_empty() {
         eprintln!("run requires a command after --");
         std::process::exit(2);
     }
 
-    let output = Command::new("sudo")
+    let output = Command::new(SUDO)
         .arg("-n")
         .arg(privileged_broker())
         .arg("__broker")
@@ -475,8 +509,9 @@ fn run_target(reason: &str, command: &[OsString]) {
 
     let mut cmd = Command::new(&target[0]);
     cmd.args(&target[1..]);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SECRETSPEC_") {
+    // `vars_os`, not `vars`: the latter panics on a non-UTF-8 environment.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("SECRETSPEC_") {
             cmd.env_remove(&key);
         }
     }
@@ -497,7 +532,7 @@ fn doctor(json: bool, config: Option<PathBuf>) {
     // Privileged checks (sudoers/vault) need root. Prefer NOPASSWD libexec.
     if unsafe { libc::geteuid() } != 0 {
         let broker = privileged_broker();
-        let mut cmd = Command::new("sudo");
+        let mut cmd = Command::new(SUDO);
         cmd.arg("-n").arg(&broker).arg("doctor");
         if json {
             cmd.arg("--json");
@@ -536,14 +571,33 @@ fn doctor(json: bool, config: Option<PathBuf>) {
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
     } else if report.ok {
         println!("doctor: OK");
+        // Advisories never fail the check, but the operator still needs to see
+        // them; they are the only findings that can appear alongside OK.
+        for finding in report.findings.iter().filter(|f| f.advisory) {
+            print_finding("advisory", finding);
+        }
     } else {
         eprintln!("doctor: FAILED");
         for finding in &report.findings {
-            match &finding.path {
-                Some(path) => eprintln!("- {} ({}): {}", finding.code, path, finding.detail),
-                None => eprintln!("- {}: {}", finding.code, finding.detail),
-            }
+            print_finding(
+                if finding.advisory {
+                    "advisory"
+                } else {
+                    "error"
+                },
+                finding,
+            );
         }
         std::process::exit(1);
+    }
+}
+
+fn print_finding(label: &str, finding: &sudo_secretspec_cli::Finding) {
+    match &finding.path {
+        Some(path) => eprintln!(
+            "- [{label}] {} ({}): {}",
+            finding.code, path, finding.detail
+        ),
+        None => eprintln!("- [{label}] {}: {}", finding.code, finding.detail),
     }
 }

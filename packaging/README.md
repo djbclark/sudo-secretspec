@@ -1,7 +1,10 @@
 # sudo-secretspec downstream packaging
 
-This downstream release preserves the upstream SecretSpec crate/workspace version
-`0.19.1` and uses a packaging-only downstream tag:
+This downstream release is built from upstream SecretSpec `0.19.1` and stamps the
+whole workspace — including the `secretspec` crate — with the downstream version
+`0.19.1-djbclark.1`. `release.py` verifies both halves: that the upstream tag it
+descends from carries `version = "0.19.1"`, and that this tree's root
+`Cargo.toml` carries the downstream version.
 
 - Tag: `v0.19.1-djbclark.1`
 - Release title: `SecretSpec 0.19.1 — sudo-secretspec downstream 1`
@@ -35,10 +38,9 @@ never deletes a pushed tag.
 
 ## Homebrew safety boundary
 
-The formula builds the upstream `secretspec` engine and installs companion
-files from `sudo-secretspec/bin`, `sudo-secretspec/libexec`, and
-`sudo-secretspec/share` when those paths exist in the tagged source. Missing
-companion paths are tolerated so upstream-only snapshots remain buildable.
+The formula runs `cargo install` twice — once for the upstream `secretspec`
+engine, once for the `sudo-secretspec-cli` companion — and copies the AI
+guidance and skill documents into `share/sudo-secretspec`.
 
 Installation has no privileged side effects: it never invokes `sudo`, edits
 sudoers, creates users, or mutates `/var/db`. The caveat tells the operator to

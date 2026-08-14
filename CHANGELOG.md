@@ -17,6 +17,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with declaration auto-detection and TTY prompts; long flags are overrides.
 - Fork docs: `sudo-secretspec/README.md`, `README.downstream.md`, `FORK-AI.md`.
 
+### Fixed
+
+- `sudo-secretspec` now invokes `/usr/bin/sudo` by absolute path. It previously
+  resolved `sudo` through `PATH`, so a `sudo` planted earlier in `PATH` could
+  satisfy any credential operation with forged values and no audit record.
+- The generated sudoers policy grants NOPASSWD execution per subcommand
+  (`__broker`, `doctor`) instead of for any arguments. The client and broker are
+  the same binary, so the previous blanket grant exposed `install` and
+  `rollback` — full boundary reconfiguration — without interactive
+  authentication. The binary enforces the same restriction internally. **Run
+  `sudo-secretspec install --adopt-existing` to replace an existing policy.**
+- `rollback` verifies snapshots before restoring: destinations must be install
+  artifacts, contents must match the snapshot manifest, and modes are taken from
+  the installer rather than the snapshot. It no longer executes a `restore`
+  program found in the snapshot directory.
+- `install` now captures the outgoing artifacts into its rollback snapshot.
+  Snapshots were previously created empty, so every `rollback` failed with
+  "snapshot contains no restorable prior artifacts".
+- `doctor` no longer fails on advisory findings. `LEGACY_VAULT_CLUTTER` and
+  `PENDING_ROLLBACK` are reported under a passing check instead of permanently
+  blocking automated callers, which are instructed to stop on drift.
+- The broker validates vault and runtime-file ownership, mode, and the resolved
+  vault path before every operation, and records the expected owner uid with each
+  audit event.
+- `run` passes `--` through to the target command, so `run -- cargo test --
+  --nocapture` no longer tries to execute `--nocapture`.
+- `run` no longer panics when the environment contains non-UTF-8 variables.
+- A failed terminal audit append now exits 126 and reports the operation's real
+  result code instead of masking it as a generic policy error.
+
 ## [0.19.1] - 2026-08-11
 
 Republishes 0.19.0's command-line artifacts. The library and CLI behave exactly
