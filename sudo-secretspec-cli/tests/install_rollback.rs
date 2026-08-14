@@ -115,6 +115,63 @@ fn plan_restore_accepts_an_owned_verified_pair_with_its_installed_mode() {
     assert_eq!(*mode, 0o440);
 }
 
+// --- sudoers is validated before it can take effect ---------------------
+//
+// An unparseable file under sudoers.d makes sudo refuse to run at all, which
+// would strand the operator with no way to elevate and no way to re-run the
+// installer to repair it. The policy must never reach its live name unchecked.
+
+#[test]
+fn a_valid_policy_stages_without_touching_the_live_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let dst = dir.path().join("sudo-secretspec");
+    let policy = "operator ALL=(root) NOPASSWD: /usr/local/libexec/sudo-secretspec doctor\n";
+
+    let staged = sudo_secretspec_cli::install::stage_sudoers(&dst, policy, 0o440)
+        .expect("visudo should accept this policy");
+
+    assert!(staged.is_file(), "staged policy should exist");
+    assert!(
+        !dst.exists(),
+        "staging must not create the live policy; only a later rename may"
+    );
+    // sudo ignores sudoers.d entries whose names contain a dot, so a crash
+    // between staging and renaming cannot activate the staged file.
+    assert!(
+        staged.file_name().unwrap().to_string_lossy().contains('.'),
+        "staged name must contain a dot so sudo ignores it"
+    );
+}
+
+#[test]
+fn an_invalid_policy_never_reaches_the_live_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let dst = dir.path().join("sudo-secretspec");
+    std::fs::write(&dst, "operator ALL=(root) NOPASSWD: /bin/true\n").unwrap();
+    let before = std::fs::read(&dst).unwrap();
+
+    let err =
+        sudo_secretspec_cli::install::stage_sudoers(&dst, "this is not sudoers syntax\n", 0o440)
+            .expect_err("visudo must reject this policy");
+    assert!(err.to_string().contains("visudo"), "{err}");
+
+    assert_eq!(
+        std::fs::read(&dst).unwrap(),
+        before,
+        "an existing policy must be left byte-for-byte untouched"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "sudo-secretspec")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "rejected policy must be cleaned up, found {leftovers:?}"
+    );
+}
+
 #[test]
 fn installed_artifact_table_pins_the_sensitive_modes() {
     use sudo_secretspec_cli::install::artifact_mode;

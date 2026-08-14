@@ -12,6 +12,8 @@ use std::process::Command;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::install::SUDOERS_DIR;
+
 fn sha256_file(path: &Path) -> Result<String, RollbackError> {
     let bytes = fs::read(path)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
@@ -78,6 +80,18 @@ pub fn run(snapshot: &Path) -> Result<(), RollbackError> {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
+        // A sudoers policy is validated before it is allowed to take effect.
+        // Restoring an unparseable one would leave the operator unable to
+        // elevate — including unable to run this command again to undo it.
+        if dest.starts_with(SUDOERS_DIR) {
+            let text = fs::read_to_string(prior).map_err(|e| {
+                RollbackError::Denied(format!("snapshot sudoers policy is unreadable: {e}"))
+            })?;
+            let staged = crate::install::stage_sudoers(dest, &text, *mode)
+                .map_err(|e| RollbackError::Denied(e.to_string()))?;
+            fs::rename(&staged, dest)?;
+            continue;
+        }
         let tmp = dest.with_extension(format!("restore.{}", std::process::id()));
         fs::copy(prior, &tmp)?;
         let mut perms = fs::metadata(&tmp)?.permissions();
@@ -86,15 +100,18 @@ pub fn run(snapshot: &Path) -> Result<(), RollbackError> {
         fs::rename(&tmp, dest)?;
     }
 
-    if Path::new("/private/etc/sudoers.d/sudo-secretspec").exists() {
-        let status = Command::new("/usr/sbin/visudo")
-            .args(["-c", "-f", "/private/etc/sudoers.d/sudo-secretspec"])
-            .status()?;
-        if !status.success() {
-            return Err(RollbackError::Denied(
-                "restored sudoers failed visudo validation".into(),
-            ));
-        }
+    // Isolated validity is not combined validity; check the whole config.
+    let combined_ok = Command::new("/usr/sbin/visudo")
+        .arg("-c")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !combined_ok {
+        return Err(RollbackError::Denied(
+            "sudoers configuration is invalid after restore; inspect \
+             /etc/sudoers.d/sudo-secretspec before elevating again"
+                .into(),
+        ));
     }
 
     println!("sudo-secretspec artifacts restored; runtime vault preserved");

@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rollback` — full boundary reconfiguration — without interactive
   authentication. The binary enforces the same restriction internally. **Run
   `sudo-secretspec install --adopt-existing` to replace an existing policy.**
+- `install` and `rollback` validate a sudoers policy before it can take effect,
+  instead of writing it live and checking afterwards. The policy is staged under
+  a name sudo ignores, accepted by `visudo`, and only then renamed into place;
+  the whole configuration is re-checked afterwards and the previous policy is
+  restored if that fails. An unparseable `sudoers.d` file makes sudo refuse to
+  run at all, which would have left no way to elevate and repair it.
 - `rollback` verifies snapshots before restoring: destinations must be install
   artifacts, contents must match the snapshot manifest, and modes are taken from
   the installer rather than the snapshot. It no longer executes a `restore`

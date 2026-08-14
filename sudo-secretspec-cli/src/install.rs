@@ -16,6 +16,9 @@ use thiserror::Error;
 const PREFIX: &str = "/usr/local";
 const CONFIG_PATH: &str = "/usr/local/etc/sudo-secretspec.toml";
 const SUDOERS_PATH: &str = "/private/etc/sudoers.d/sudo-secretspec";
+/// Any file installed under here is a sudo policy and must be validated before
+/// it is allowed to take effect.
+pub(crate) const SUDOERS_DIR: &str = "/private/etc/sudoers.d";
 const DEFAULT_VAULT: &str = "/var/db/sudo-secretspec";
 const DEFAULT_USER: &str = "_sudo_secretspec";
 const DEFAULT_GROUP: &str = "_sudo_secretspec";
@@ -198,6 +201,101 @@ fn write_bytes(dst: &Path, bytes: &[u8], mode: u32) -> Result<(), InstallError> 
         .status();
     fs::rename(&tmp, dst)?;
     Ok(())
+}
+
+/// Write a candidate sudoers policy beside `dst` and validate it, returning the
+/// staged path only if `visudo` accepts it.
+///
+/// A syntactically invalid file under `sudoers.d` makes sudo refuse to run at
+/// all, which would strand the operator with no way to elevate — including no
+/// way to re-run this installer and repair it. So the policy is never written
+/// to its live name until it has parsed cleanly.
+///
+/// The staging name deliberately contains dots. sudo ignores files in
+/// `sudoers.d` whose names contain a `.` or end in `~`, so even if this process
+/// dies between writing and renaming, the staged file is inert.
+pub fn stage_sudoers(
+    dst: &Path,
+    text: &str,
+    mode: u32,
+) -> Result<std::path::PathBuf, InstallError> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let staged = dst.with_extension(format!("staged.{}", std::process::id()));
+    {
+        let mut f = fs::File::create(&staged)?;
+        f.write_all(text.as_bytes())?;
+    }
+    let mut perms = fs::metadata(&staged)?.permissions();
+    perms.set_mode(mode);
+    fs::set_permissions(&staged, perms)?;
+    let _ = Command::new("/usr/sbin/chown")
+        .args(["root:wheel"])
+        .arg(&staged)
+        .status();
+
+    let accepted = Command::new("/usr/sbin/visudo")
+        .args(["-c", "-f"])
+        .arg(&staged)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !accepted {
+        let _ = fs::remove_file(&staged);
+        return Err(InstallError::Denied(
+            "generated sudoers policy failed visudo validation; the existing policy was left \
+             untouched"
+                .into(),
+        ));
+    }
+    Ok(staged)
+}
+
+/// Install the sudoers policy so that a bad policy can never take effect.
+///
+/// Staged and validated in isolation first, then renamed into place, then the
+/// combined configuration is re-checked with a bare `visudo -c`. If that final
+/// check fails the previous policy is put back — or the file removed when there
+/// was no previous policy — before returning an error.
+fn install_sudoers(dst: &Path, text: &str, mode: u32) -> Result<(), InstallError> {
+    let previous = fs::read(dst).ok();
+    let staged = stage_sudoers(dst, text, mode)?;
+    fs::rename(&staged, dst)?;
+
+    // Valid in isolation is not the same as valid in combination; re-check the
+    // whole configuration now that the file is live.
+    let combined_ok = Command::new("/usr/sbin/visudo")
+        .arg("-c")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if combined_ok {
+        return Ok(());
+    }
+
+    match &previous {
+        Some(bytes) => {
+            let restore = dst.with_extension(format!("restore.{}", std::process::id()));
+            fs::write(&restore, bytes)?;
+            let mut perms = fs::metadata(&restore)?.permissions();
+            perms.set_mode(mode);
+            fs::set_permissions(&restore, perms)?;
+            let _ = Command::new("/usr/sbin/chown")
+                .args(["root:wheel"])
+                .arg(&restore)
+                .status();
+            fs::rename(&restore, dst)?;
+        }
+        None => {
+            let _ = fs::remove_file(dst);
+        }
+    }
+    Err(InstallError::Denied(
+        "sudoers configuration failed validation with the new policy in place; the previous \
+         policy has been restored"
+            .into(),
+    ))
 }
 
 fn ensure_service_group(name: &str, create: bool) -> Result<u32, InstallError> {
@@ -552,9 +650,12 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
         config_toml(&req, &vault_real).as_bytes(),
         require_mode(&config_dst)?,
     )?;
-    write_bytes(
+    // Validated before it can take effect, and rolled back if the combined
+    // configuration is rejected — a broken sudoers.d file would leave the
+    // operator unable to elevate at all.
+    install_sudoers(
         &sudoers_dst,
-        sudoers_text(&req.operator).as_bytes(),
+        &sudoers_text(&req.operator),
         require_mode(&sudoers_dst)?,
     )?;
 
@@ -576,15 +677,6 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
         manifest.as_bytes(),
         require_mode(&manifest_dst)?,
     )?;
-
-    // Validate sudoers.
-    let visudo = Command::new("/usr/sbin/visudo")
-        .args(["-c", "-f"])
-        .arg(&sudoers_dst)
-        .status()?;
-    if !visudo.success() {
-        return Err(InstallError::Denied("visudo rejected sudoers".into()));
-    }
 
     // Runtime files for fresh install only.
     if !req.adopt_existing {
