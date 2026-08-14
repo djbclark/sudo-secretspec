@@ -9,7 +9,7 @@ class SudoSecretspec < Formula
   # Homebrew parses the trailing ".1" of the tag as the whole version, which
   # breaks upgrade detection. State it explicitly.
   version "0.19.1-sudo.4"
-  sha256 "f0b379a37b58bc0f1a5a050af24ab9a06a5feec85596b4aa18fa9d68ae9888f7"
+  sha256 "f15c36bcae7b8bf784293b63b851bf313bbf113a20f3a8ba43b13e77fb6d9616"
   license "Apache-2.0"
   head "https://github.com/djbclark/sudo-secretspec.git", branch: "sudo-main"
 
