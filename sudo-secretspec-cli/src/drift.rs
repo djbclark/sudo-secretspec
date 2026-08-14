@@ -601,6 +601,24 @@ pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
                     Some(&path),
                     "pending rollback artifact requires operator review",
                 ));
+                // A transient mutation artifact is reported by its own code and
+                // deliberately not also judged by the steady-state metadata
+                // rule. `fs::copy` does not carry ownership, so a backup left
+                // behind by an older broker is root-owned; letting that raise a
+                // non-advisory METADATA_MISMATCH would turn any crashed
+                // mutation into a hard `doctor` failure, wedging every agent
+                // told to treat one as a stop.
+                //
+                // A symlink here is still refused. That is not drift — it is a
+                // redirection of a path `Mutation::restore` copies back over.
+                if path.is_symlink() {
+                    findings.push(finding(
+                        "SYMLINK_FORBIDDEN",
+                        Some(&path),
+                        "path must not be a symlink",
+                    ));
+                }
+                continue;
             } else if matches!(name.as_ref(), ".local" | ".ansible" | ".cache") {
                 findings.push(finding(
                     "LEGACY_VAULT_CLUTTER",
@@ -741,6 +759,97 @@ service_group = "_sudo_secretspec"
             "{:?}",
             report.findings
         );
+    }
+
+    /// A `Layout` whose vault is `vault` and whose every other path is absent.
+    /// Only the vault-scan findings are meaningful for callers of this.
+    fn layout_for_vault(tmp: &Path, vault: &Path) -> Layout {
+        Layout {
+            config: tmp.join("missing.toml"),
+            vault: vault.to_path_buf(),
+            vault_realpath: vault.to_path_buf(),
+            service_user: owner_name(unsafe { libc::getuid() }),
+            service_group: group_name(unsafe { libc::getgid() }),
+            declarations: tmp.join("decl.toml"),
+            engine: tmp.join("engine"),
+            audit: tmp.join("audit"),
+            broker: tmp.join("broker"),
+            client: tmp.join("client"),
+            checker: tmp.join("checker"),
+            retired: tmp.join("retired"),
+            guidance: tmp.join("guidance"),
+            sudoers: tmp.join("sudoers"),
+            source_manifest: tmp.join("MANIFEST.sha256"),
+        }
+    }
+
+    fn findings_for<'a>(report: &'a Report, path: &Path) -> Vec<&'a str> {
+        report
+            .findings
+            .iter()
+            .filter(|f| f.path.as_deref() == Some(path.to_string_lossy().as_ref()))
+            .map(|f| f.code.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_pending_rollback_backup_is_not_also_judged_by_the_steady_state_rule() {
+        // `fs::copy` preserves mode but not ownership, so a backup made by the
+        // root broker lands root-owned inside a service-user vault. The
+        // per-entry metadata rule then turned the deliberately-advisory
+        // PENDING_ROLLBACK into a non-advisory METADATA_MISMATCH, failing
+        // `doctor` — and every agent is told to treat that as a hard stop, so a
+        // single crashed mutation wedged the host until someone cleaned up by
+        // hand. Ownership cannot be forged in an unprivileged test; a differing
+        // mode trips the very same rule on the very same entry.
+        let tmp = tempdir().unwrap();
+        let vault = tmp.path().join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::set_permissions(&vault, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let backup = vault.join(".secretspec.toml.rollback.0f9c1e6a");
+        fs::write(&backup, "manifest backup").unwrap();
+        fs::set_permissions(&backup, fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Control: an entry with the same wrong mode that is *not* a rollback
+        // artifact must still be judged, or this test would pass vacuously.
+        let control = vault.join("secretspec.toml");
+        fs::write(&control, "x = 1").unwrap();
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let report = inspect(&layout_for_vault(tmp.path(), &vault), &Default::default());
+
+        assert_eq!(
+            findings_for(&report, &backup),
+            ["PENDING_ROLLBACK"],
+            "the backup must be reported by its own code and nothing else"
+        );
+        assert!(
+            findings_for(&report, &control).contains(&"METADATA_MISMATCH"),
+            "control entry must still be judged: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_symlinked_rollback_backup_is_still_refused() {
+        // Skipping the metadata rule must not also skip this: `restore` copies
+        // a backup back over the live manifest, so a symlink in that position
+        // redirects what a root process is about to read.
+        let tmp = tempdir().unwrap();
+        let vault = tmp.path().join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::set_permissions(&vault, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let target = tmp.path().join("elsewhere");
+        fs::write(&target, "attacker controlled").unwrap();
+        let backup = vault.join(".secretspec.env.rollback.0f9c1e6a");
+        std::os::unix::fs::symlink(&target, &backup).unwrap();
+
+        let report = inspect(&layout_for_vault(tmp.path(), &vault), &Default::default());
+        let codes = findings_for(&report, &backup);
+        assert!(codes.contains(&"SYMLINK_FORBIDDEN"), "{codes:?}");
+        assert!(!report.ok, "a symlinked backup must fail the report");
     }
 
     const INSTALLED: &str = "/usr/local/bin/sudo-secretspec";

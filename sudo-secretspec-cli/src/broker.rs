@@ -178,6 +178,22 @@ fn require_boundary(cfg: &Config) -> Result<u32, i32> {
     Ok(service_uid)
 }
 
+/// `chown(2)` on a path, without following a final symlink.
+///
+/// `lchown` rather than `chown`: the caller has just created this path and a
+/// symlink appearing at it would otherwise redirect a root-owned ownership
+/// change onto whatever it points at.
+fn chown(path: &std::path::Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("path contains an interior NUL"))?;
+    // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call.
+    if unsafe { libc::lchown(c_path.as_ptr(), uid, gid) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Mutation helpers — backup/restore/commit for manifest and dotenv
 // ---------------------------------------------------------------------------
@@ -190,7 +206,7 @@ struct Mutation {
 }
 
 impl Mutation {
-    fn begin(cfg: &Config, transaction: uuid::Uuid) -> Result<Self, i32> {
+    fn begin(cfg: &Config, transaction: uuid::Uuid, uid: u32, gid: u32) -> Result<Self, i32> {
         let vault = cfg.vault.clone();
         let manifest = vault.join("secretspec.toml");
         let dotenv = vault.join(".env");
@@ -211,6 +227,18 @@ impl Mutation {
             }
             std::fs::copy(src, &dst).map_err(|e| {
                 eprintln!("broker: cannot create rollback copy: {e}");
+                2
+            })?;
+            // `fs::copy` carries the mode across but *not* the owner, so a copy
+            // made by this root process lands root-owned inside a vault owned by
+            // the service user. `drift` checks the vault entry by entry, and a
+            // root-owned entry there turns the deliberately-advisory
+            // PENDING_ROLLBACK into a hard METADATA_MISMATCH — which fails
+            // `doctor`, which every agent is told to treat as a stop. A crashed
+            // mutation would then wedge the host.
+            chown(&dst, uid, gid).map_err(|e| {
+                eprintln!("broker: cannot set rollback copy ownership: {e}");
+                let _ = std::fs::remove_file(&dst);
                 2
             })?;
         }
@@ -332,6 +360,37 @@ fn purge_ambient_env() {
     }
 }
 
+/// Map what happened during a mediated operation onto the terminal audit event.
+///
+/// Split out of [`run`] because it is the part of the funnel that can actually
+/// be tested. The failures it classifies need a root process and a real vault
+/// to provoke — a rollback-path collision needs a colliding fresh UUID, and
+/// root ignores mode bits, so the copy cannot be made to fail by permissions —
+/// but the mapping from "what happened" to "what the ledger records" is pure.
+///
+/// `attempted` is the name list from the attempt event: on the error path
+/// `execute` never ran, so it never reported names of its own.
+fn classify_terminal(
+    outcome: Result<(u8, bool, Vec<String>), i32>,
+    attempted: &[String],
+) -> (Outcome, u8, Vec<String>) {
+    match outcome {
+        // The mutation could not be rolled back. The store's state is genuinely
+        // unknown, which is neither success nor a clean failure.
+        Ok((_, true, names)) => (Outcome::Unknown, 125, names),
+        Ok((0, false, names)) => (Outcome::Success, 0, names),
+        Ok((rc, false, names)) => (Outcome::Failure, rc, names),
+        // Failed before `execute` ran: nothing was attempted against the store
+        // and nothing was mutated. This arm is the whole point of the funnel —
+        // it used to return bare, leaving an attempt with no terminal event.
+        Err(code) => (
+            Outcome::Failure,
+            u8::try_from(code).unwrap_or(2),
+            attempted.to_vec(),
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Operations
 // ---------------------------------------------------------------------------
@@ -350,6 +409,16 @@ fn run(broker: &Broker) -> Result<(), i32> {
             require_root()?;
             let cfg = load_config()?;
             let service_uid = require_boundary(&cfg)?;
+            // The group the vault itself carries, not the one named in the
+            // config: `audit::open_connection` already reassigns the ledger to
+            // the vault's own gid, and rollback backups must land beside it
+            // under the same identity.
+            let service_gid = std::fs::metadata(&cfg.vault)
+                .map_err(|e| {
+                    eprintln!("broker: vault unreadable: {e}");
+                    2
+                })?
+                .gid();
 
             if broker.reason.trim().is_empty() {
                 eprintln!("broker: --reason is required");
@@ -387,38 +456,45 @@ fn run(broker: &Broker) -> Result<(), i32> {
                 2
             })?;
 
-            // Begin mutation for write operations
-            let mutation = if matches!(
-                broker.operation.as_str(),
-                "source-set" | "source-add" | "source-delete"
-            ) {
-                Some(Mutation::begin(&cfg, transaction)?)
-            } else {
-                None
-            };
+            // Everything between the attempt and the terminal event runs inside
+            // this closure so that *no* path can leave an attempt unterminated.
+            // `Mutation::begin` used to `?` straight out of `run`, which left
+            // exactly that: an attempt with no outcome, indistinguishable in the
+            // ledger from a broker killed mid-operation. Funnelling makes the
+            // guarantee structural instead of something each new `?` has to
+            // remember.
+            let outcome = (|| -> Result<(u8, bool, Vec<String>), i32> {
+                let mutation = if matches!(
+                    broker.operation.as_str(),
+                    "source-set" | "source-add" | "source-delete"
+                ) {
+                    Some(Mutation::begin(
+                        &cfg,
+                        transaction,
+                        service_uid,
+                        service_gid,
+                    )?)
+                } else {
+                    None
+                };
 
-            // Execute the operation
-            let (rc, names) = execute(broker, &cfg);
+                let (rc, names) = execute(broker, &cfg);
 
-            // Commit or restore mutation
-            let mut unknown = false;
-            if let Some(m) = &mutation {
-                if rc == 0 {
-                    m.commit();
-                } else if !m.restore() {
-                    unknown = true;
+                // Commit or restore mutation
+                let mut unknown = false;
+                if let Some(m) = &mutation {
+                    if rc == 0 {
+                        m.commit();
+                    } else if !m.restore() {
+                        unknown = true;
+                    }
                 }
-            }
+
+                Ok((rc, unknown, names))
+            })();
 
             // Terminal audit must also succeed.
-            let phase = if unknown {
-                Outcome::Unknown
-            } else if rc == 0 {
-                Outcome::Success
-            } else {
-                Outcome::Failure
-            };
-            let terminal_rc = if unknown { 125 } else { rc };
+            let (phase, terminal_rc, names) = classify_terminal(outcome, &names);
             audit::append_event(
                 &cfg.vault,
                 AppendEventRequest {
@@ -624,6 +700,41 @@ mod tests {
                 "{name} must be purged before the engine runs"
             );
         }
+    }
+
+    /// Every arm must produce a terminal event. An attempt with no terminal is
+    /// indistinguishable in the ledger from a broker killed mid-operation, so
+    /// "some code path returns early" is the failure this guards against.
+    #[test]
+    fn every_outcome_maps_to_exactly_one_terminal_phase() {
+        let attempted = vec!["DATABASE_URL".to_string()];
+        let done = vec!["API_KEY".to_string()];
+
+        let cases = [
+            (Ok((0, false, done.clone())), Outcome::Success, 0, &done),
+            (Ok((1, false, done.clone())), Outcome::Failure, 1, &done),
+            // Rollback failed: the store's state is unknown, not merely failed.
+            (Ok((1, true, done.clone())), Outcome::Unknown, 125, &done),
+            (Ok((0, true, done.clone())), Outcome::Unknown, 125, &done),
+            // The path that previously returned with no terminal event at all.
+            (Err(2), Outcome::Failure, 2, &attempted),
+        ];
+
+        for (outcome, want_phase, want_rc, want_names) in cases {
+            let (phase, rc, names) = classify_terminal(outcome, &attempted);
+            assert_eq!(phase, want_phase);
+            assert_eq!(rc, want_rc);
+            assert_eq!(&names, want_names);
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_error_code_still_terminates_the_attempt() {
+        // A terminal event is required to carry a result code, so the mapping
+        // must not be able to produce "no code" for a code it cannot represent.
+        let (phase, rc, _) = classify_terminal(Err(i32::MAX), &[]);
+        assert_eq!(phase, Outcome::Failure);
+        assert_eq!(rc, 2);
     }
 
     #[test]

@@ -86,6 +86,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A crashed credential mutation no longer wedges `doctor`. The broker's
+  rollback backups are created by root with `fs::copy`, which carries the mode
+  across but not the owner, so they landed root-owned inside a service-user
+  vault — and the per-entry metadata check then turned the deliberately
+  advisory `PENDING_ROLLBACK` into a hard `METADATA_MISMATCH`, failing
+  `doctor` for anything that reads it as a stop condition. Backups are now
+  assigned the vault's own owner, and `drift` reports a pending backup by its
+  own code instead of also judging it against the steady-state rule, so hosts
+  carrying a backup from an older build recover too. A symlink in that
+  position is still refused.
+- Every mediated operation now records a terminal audit event. A failure to
+  create the rollback backups returned after the attempt event was already
+  written, leaving an attempt with no outcome — indistinguishable in the
+  ledger from a broker killed mid-operation.
 - `sudo-secretspec doctor --json` now emits only the JSON report. `visudo`
   printed `<path>: parsed OK` to the same stream first, so anything parsing the
   output as JSON failed on the first character.
