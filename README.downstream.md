@@ -29,4 +29,6 @@ sudo-secretspec run --reason "start app" -- your-command
 | Distributable AI skill | [`skills/sudo-secretspec/SKILL.md`](skills/sudo-secretspec/SKILL.md) |
 | Fork development notes, build lessons | [`FORK-AI.md`](FORK-AI.md) |
 | Release process and Homebrew packaging | [`packaging/README.md`](packaging/README.md) |
-| Branch policy and downstream version scheme | [`CLAUDE.md`](CLAUDE.md) |
+| Downstream version scheme | [`CLAUDE.md`](CLAUDE.md) |
+
+All work lives on `sudo-main`, the fork's only branch.

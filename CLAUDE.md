@@ -23,7 +23,9 @@ This repository is a fork. In addition to upstream SecretSpec:
 - Downstream docs: `sudo-secretspec/README.md`, `README.downstream.md`
 - AI automation contract: `sudo-secretspec/AI-GUIDANCE.md`
 - Fork-only agent notes/tricks: `FORK-AI.md` (do not upstream)
-- Branches: `main` mirrors upstream; `sudo-main` is the downstream release line
+- Single trunk: `sudo-main`. Commit and push work directly to it — no feature
+  branches, no PRs. If asked to work on "main" or "master", that means
+  `sudo-main`; neither branch exists.
 - Version scheme: `0.19.1-djbclark.1`
 
 When changing the companion, update `CHANGELOG.md` Unreleased with a user-facing

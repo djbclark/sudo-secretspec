@@ -68,5 +68,6 @@ See `AI-GUIDANCE.md` for AI/automation rules.
 ## Develop
 
 Workspace member: `sudo-secretspec-cli`. Build/test commands and macOS build
-caveats are in [`../FORK-AI.md`](../FORK-AI.md); branch policy and the
-downstream version scheme are in [`../CLAUDE.md`](../CLAUDE.md).
+caveats are in [`../FORK-AI.md`](../FORK-AI.md); the downstream version scheme
+is in [`../CLAUDE.md`](../CLAUDE.md). All work commits directly to `sudo-main`,
+the fork's only branch.

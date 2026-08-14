@@ -11,8 +11,10 @@ This file is **downstream-only**. Do not port it upstream to `cachix/secretspec`
 | `packaging/` | Release script + Homebrew formula |
 | `skills/sudo-secretspec/` | Distributable AI skill |
 
-Branch policy and the downstream version scheme live in `CLAUDE.md`, which is
-loaded into agent context automatically.
+`sudo-main` is the only branch. Work commits directly to it; there are no
+feature branches and no PRs. "main" and "master" both mean `sudo-main`. The
+downstream version scheme lives in `CLAUDE.md`, which is loaded into agent
+context automatically.
 
 ## High-value lessons (save time)
 
@@ -77,7 +79,8 @@ sudo-secretspec check --reason "smoke"
 
 ## Delivery conventions
 
-- PRs target `sudo-main` on `djbclark/sudo-secretspec` (not upstream).
+- Commit directly to `sudo-main` on `djbclark/sudo-secretspec`. Do not create
+  branches or open PRs for downstream work.
 - Never open upstream issues/PRs without explicit permission.
 - Keep `CHANGELOG.md` Unreleased entries user-facing.
 - After privileged install, verify paths under `/usr/local` and vault ownership
