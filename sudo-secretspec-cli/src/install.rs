@@ -812,12 +812,10 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
         .and_then(|p| p.parent())
         .ok_or_else(|| InstallError::Denied("current exe is not nested in libexec".into()))?;
 
-    let client_src = source_root.join("bin/sudo-secretspec");
     let broker_src = source_root.join("libexec/sudo-secretspec");
     let share_src = source_root.join("share/sudo-secretspec");
     let guidance_src = share_src.join("AI-GUIDANCE.md");
     let retired_src = share_src.join("sudo-secretspec-retired.toml");
-    let manifest_src = share_src.join("MANIFEST.sha256");
 
     let client_dst = PathBuf::from(PREFIX).join("bin/sudo-secretspec");
     let broker_dst = PathBuf::from(PREFIX).join("libexec/sudo-secretspec");
@@ -851,7 +849,7 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     let rollback = libexec.join(format!("{SNAPSHOT_PREFIX}{stamp}"));
     let captured = capture_snapshot(&rollback)?;
 
-    install_file(&client_src, &client_dst, require_mode(&client_dst)?)?;
+    install_file(&broker_src, &client_dst, require_mode(&client_dst)?)?;
     install_file(&broker_src, &broker_dst, require_mode(&broker_dst)?)?;
     install_file(
         &req.declarations,
@@ -868,11 +866,6 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
         &guidance_dst,
         require_mode(&guidance_dst)?,
     )?;
-    install_file(
-        &manifest_src,
-        &manifest_dst,
-        require_mode(&manifest_dst)?,
-    )?;
     write_bytes(
         &config_dst,
         config_toml(&req, &vault_real).as_bytes(),
@@ -885,6 +878,25 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
         &sudoers_dst,
         &sudoers_text(&req.operator),
         require_mode(&sudoers_dst)?,
+    )?;
+
+    // Release manifest of installed artifacts.
+    let mut manifest = String::new();
+    for path in [
+        &client_dst,
+        &broker_dst,
+        &declarations_dst,
+        &retired_dst,
+        &guidance_dst,
+        &config_dst,
+        &sudoers_dst,
+    ] {
+        manifest.push_str(&format!("{}  {}\n", sha256_file(path)?, path.display()));
+    }
+    write_bytes(
+        &manifest_dst,
+        manifest.as_bytes(),
+        require_mode(&manifest_dst)?,
     )?;
 
     // Runtime files for fresh install only.

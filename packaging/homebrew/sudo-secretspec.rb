@@ -29,6 +29,7 @@ class SudoSecretspec < Formula
     libexec.install staging/"bin/sudo-secretspec"
 
     (share/"sudo-secretspec").install "sudo-secretspec/AI-GUIDANCE.md"
+    (share/"sudo-secretspec").install "sudo-secretspec/sudo-secretspec-retired.toml"
     (share/"sudo-secretspec/skills/sudo-secretspec").install "skills/sudo-secretspec/SKILL.md"
   end
 
