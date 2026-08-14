@@ -26,14 +26,24 @@
 //!
 //! ## Residual risk
 //!
-//! The chain detects modification and truncation of the tail, because every
-//! event commits with the singleton `head` row. It cannot detect deletion of
-//! the entire ledger: an empty `events` table with no `head` row is
-//! indistinguishable from a fresh install. Nothing in the mediated sudoers
-//! policy can reach that state — it requires write access to the vault as root
-//! or the service user — but an external watcher wanting tamper-evidence
-//! against those principals must pin the tip hash reported by [`verify`]
-//! somewhere outside the vault.
+//! The chain detects *modification*: altering or removing any event other than
+//! the last leaves a `previous_hash` that no longer matches, and the whole
+//! chain fails to verify.
+//!
+//! It does not detect truncation, and it does not detect deletion of the whole
+//! ledger. Both have the same shape, because `head` lives in the same database
+//! as the events it points at: delete the last N events, rewrite the singleton
+//! `head` to the new tip, and [`verify`] re-verifies cleanly — it only checks
+//! that `head` agrees with the rows that are still present. Deleting everything
+//! is the same move taken to its limit, and an empty `events` table with no
+//! `head` row is indistinguishable from a fresh install.
+//!
+//! Nothing in the mediated sudoers policy can reach that state; it requires
+//! write access to the vault as root or the service user. But tamper-evidence
+//! against a principal who can write the ledger cannot be established from
+//! inside the ledger — that is arithmetic, not a defect. An external watcher
+//! wanting it must pin the tip hash reported by [`verify`] somewhere outside
+//! the vault and compare on each run.
 
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -495,7 +505,13 @@ fn ensure_schema(conn: &Connection) -> Result<(), AuditError> {
 // Canonical serialisation
 // ---------------------------------------------------------------------------
 
-/// Canonical JSON for an event (without sequence, timestamp_ns, event_hash).
+/// Canonical JSON for an event: every field that identifies it, including
+/// `sequence` and `timestamp_ns`, and excluding only `event_hash` itself.
+///
+/// Binding the sequence and the timestamp into the hash is what stops an event
+/// being renumbered or back-dated in place. (An earlier version of this comment
+/// claimed both were excluded; the code was always the stronger of the two, and
+/// changing it to match would invalidate every existing chain.)
 fn canonical_event_json(event: &AuditEvent) -> String {
     // Build a BTreeMap for deterministic key ordering.
     let mut map = std::collections::BTreeMap::new();
@@ -1035,6 +1051,82 @@ mod tests {
             .filter(|n| n != DB_NAME)
             .collect();
         assert!(strays.is_empty(), "read-only verify left {strays:?}");
+    }
+
+    // --- what the chain does and does not prove ---------------------------
+
+    #[test]
+    fn removing_an_event_from_the_middle_breaks_the_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = protected_dir(tmp.path());
+        let uid = Some(unsafe { libc::getuid() });
+        for _ in 0..3 {
+            let tx = uuid::Uuid::new_v4();
+            attempt(&dir, tx).unwrap();
+            terminal(&dir, tx, Outcome::Success, 0).unwrap();
+        }
+        assert_eq!(verify(&dir, uid).unwrap().count, 6);
+
+        let conn = Connection::open(dir.join(DB_NAME)).unwrap();
+        conn.execute("DELETE FROM events WHERE sequence = 3", [])
+            .unwrap();
+        drop(conn);
+
+        assert!(
+            verify(&dir, uid).is_err(),
+            "a gap in the chain must fail verification"
+        );
+    }
+
+    /// Pins the limitation documented in this module's "Residual risk" section.
+    ///
+    /// This asserts something the ledger *cannot* do, deliberately. The note it
+    /// backs previously claimed tail truncation was detected "because every
+    /// event commits with the singleton `head` row" — but `head` lives in the
+    /// same database, so rewriting it is part of the same edit. If someone
+    /// later strengthens the chain so this test fails, the fix is to update the
+    /// note, not to delete the test.
+    #[test]
+    fn truncating_the_tail_and_rewriting_head_is_not_detectable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = protected_dir(tmp.path());
+        let uid = Some(unsafe { libc::getuid() });
+        for _ in 0..3 {
+            let tx = uuid::Uuid::new_v4();
+            attempt(&dir, tx).unwrap();
+            terminal(&dir, tx, Outcome::Success, 0).unwrap();
+        }
+        assert_eq!(verify(&dir, uid).unwrap().count, 6);
+
+        let conn = Connection::open(dir.join(DB_NAME)).unwrap();
+        conn.execute("DELETE FROM events WHERE sequence > 4", [])
+            .unwrap();
+        // Dropping the events alone *is* caught, which is what made the old
+        // claim look true.
+        drop(conn);
+        assert!(
+            verify(&dir, uid).is_err(),
+            "head must not match a short chain"
+        );
+
+        let conn = Connection::open(dir.join(DB_NAME)).unwrap();
+        let tip: String = conn
+            .query_row(
+                "SELECT event_hash FROM events WHERE sequence = 4",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE head SET sequence = 4, event_hash = ?1 WHERE singleton = 1",
+            [&tip],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result = verify(&dir, uid).expect("truncation with a rewritten head verifies cleanly");
+        assert_eq!(result.count, 4);
+        assert_eq!(result.hash, tip);
     }
 
     /// Simple sliding-window substring check.

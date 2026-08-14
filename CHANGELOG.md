@@ -96,6 +96,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Corrected the documented tamper-evidence of the audit ledger, in
+  `AI-GUIDANCE.md` and in the library's own notes. Both said truncating the
+  tail was detectable "because every event commits with the singleton `head`
+  row". It is not: `head` lives in the same database as the events, so
+  deleting the last N events and rewriting `head` to the new tip verifies
+  cleanly. Truncation and whole-ledger deletion have the same mitigation —
+  pinning the tip reported by `audit-verify` outside the vault. No code
+  changed; the guarantee was always this one, and the note overstated it.
+  `AI-GUIDANCE.md` also now records that secret values are not zeroized in
+  the client, as accepted residual risk rather than an omission.
 - The in-binary refusal of boundary lifecycle through the NOPASSWD path now
   fails closed. It treated "this process cannot identify itself" and "no broker
   is installed" as the same answer and allowed `install`/`rollback`/`uninstall`
