@@ -2,11 +2,11 @@
 
 Downstream releases are built from upstream SecretSpec `0.19.1` and stamp the
 whole workspace — including the `secretspec` crate — with a downstream version
-of the form `0.19.1-djbclark.N`. `release.py` verifies both halves: that the
+of the form `0.19.1-sudo.N`. `release.py` verifies both halves: that the
 upstream tag it descends from carries `version = "0.19.1"`, and that this tree's
 root `Cargo.toml` carries the downstream version being cut.
 
-- Tag: `v0.19.1-djbclark.N`
+- Tag: `v0.19.1-sudo.N`
 - Release title: `SecretSpec 0.19.1 — sudo-secretspec downstream N`
 - Fork: `frdminc/sudo-secretspec` (parent `cachix/secretspec`)
 
@@ -27,13 +27,13 @@ at anything else.
 
 ```bash
 # Safe preview; performs no writes.
-python3 packaging/release.py --version 0.19.1-djbclark.2 --dry-run
+python3 packaging/release.py --version 0.19.1-sudo.10 --dry-run
 
 # Live release after packaging and companion changes are committed on sudo-main.
-python3 packaging/release.py --version 0.19.1-djbclark.2
+python3 packaging/release.py --version 0.19.1-sudo.10
 
 # Alternate local tap clone.
-python3 packaging/release.py --version 0.19.1-djbclark.2 \
+python3 packaging/release.py --version 0.19.1-sudo.10 \
   --tap-path ~/src/homebrew-sudo-secretspec
 ```
 

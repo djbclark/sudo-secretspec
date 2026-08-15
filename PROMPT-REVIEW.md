@@ -9,7 +9,7 @@ upstream `cachix/secretspec` 0.19.1 baseline.
 **PR**: https://github.com/frdminc/sudo-secretspec/pull/1  
 **Base**: `sudo-main` (downstream release branch)  
 **Head**: `feature/sudo-privilege-boundary`  
-**Version**: `0.19.1-djbclark.1` (`v0.19.1-djbclark.1`)
+**Version**: `0.19.1-sudo.9` (`v0.19.1-sudo.9`)
 
 ---
 
@@ -35,7 +35,7 @@ upstream `cachix/secretspec` 0.19.1 baseline.
 | File | Review Focus |
 |---|---|
 | `sudo-secretspec-cli/Cargo.toml` | `rusqlite = { version = "0.31" }` (no `bundled` — uses system SQLite via Homebrew) |
-| `packaging/release.py` | Downstream release: tag `v0.19.1-djbclark.1`, GitHub Release, Homebrew formula rewrite |
+| `packaging/release.py` | Downstream release: tag `v0.19.1-sudo.9`, GitHub Release, Homebrew formula rewrite |
 | `packaging/homebrew/sudo-secretspec.rb` | Formula installs `secretspec` + `sudo-secretspec-cli` companion; **no sudo/users/sudoers** |
 | `sudo-secretspec.conf.example` | 9-key TOML: engine, audit, vault, vault_realpath, declarations, service_user/group |
 | `.github/workflows/sudo-release.yml` | CI: cargo test, ruff, shellcheck, formula style, tag check |
@@ -70,7 +70,7 @@ upstream `cachix/secretspec` 0.19.1 baseline.
 # Build
 export PKG_CONFIG_PATH="/opt/homebrew/opt/sqlite/lib/pkgconfig:$PKG_CONFIG_PATH"
 export LIBRARY_PATH="/opt/homebrew/opt/sqlite/lib:$LIBRARY_PATH"
-cargo test -p sudo-secretspec-cli   # 58 tests
+cargo test -p sudo-secretspec-cli   # 152 tests
 cargo build -p sudo-secretspec-cli --release
 
 # Live install (Touch ID)

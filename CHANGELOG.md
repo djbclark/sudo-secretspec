@@ -289,6 +289,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `packaging/` and `tests/sudo_packaging/` are now formatted the way CI checks
   them. `ruff format --check` runs there on every pull request and had never
   passed.
+- Documentation that gave wrong instructions is corrected. `packaging/README.md`
+  described the downstream version scheme as `0.19.1-djbclark.N` and its three
+  copy-pasteable `release.py` examples used it — every one of them fails now,
+  because the helper accepts only `-sudo.N`. The `PROMPT-REVIEW.md` and
+  `PROMPT-SECREV.md` review requests named a version four releases stale and
+  advertised test counts of 58 and 102 against an actual 152. Historical
+  records under `docs/handoffs/` and `docs/design/` are deliberately left
+  alone: they describe what was true when written.
+
+- Every crate manifest names the current workspace version again.
+  `sudo-secretspec-cli` still required `secretspec 0.19.1-djbclark.2` and
+  `secretspec-derive` still required `0.19.1-djbclark.1`. Both built, because a
+  caret requirement on an older pre-release still admits the newer one, but the
+  manifests advertised versions the workspace has not contained for four
+  releases.
+
 - `AI-GUIDANCE.md` now documents the companion's mediated surface. Six engine
   subcommands have no companion equivalent — `config`, `import`, `init`,
   `schema`, `cache`, `audit` — and nothing said so, or why, even though the same

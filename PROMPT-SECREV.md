@@ -100,7 +100,7 @@ The same binary dispatches via hidden `__broker` subcommand.
 ### `sudo-secretspec-cli/Cargo.toml`
 
 - [ ] `rusqlite = { version = "0.31" }` **no `bundled`** (system SQLite via Homebrew)
-- [ ] `secretspec = { path = "../secretspec", version = "0.19.1-djbclark.1", default-features = false }`
+- [ ] `secretspec = { path = "../secretspec", version = "0.19.1-sudo.9", default-features = false, features = ["manifest-edit"] }`
 
 ---
 
@@ -114,7 +114,7 @@ The same binary dispatches via hidden `__broker` subcommand.
 
 ### `packaging/release.py`
 
-- [ ] Tag validation: `v0.19.1-djbclark.1`
+- [ ] Tag validation: `v0.19.1-sudo.9`
 - [ ] SHA-256 of tarball → formula rewrite
 - [ ] Homebrew tap sync + `brew test` + version readback
 - [ ] Readback: repo/tag/release/fork lineage verified
@@ -135,7 +135,7 @@ The same binary dispatches via hidden `__broker` subcommand.
 
 ```bash
 cargo test -p sudo-secretspec-cli
-# 102 tests: lib(50), audit(19), install_rollback(16), drift(11), cli(3), config(3)
+# 152 tests: lib(94), audit(19), install_rollback(16), drift(11), cli(6), config(6)
 ```
 
 ---
