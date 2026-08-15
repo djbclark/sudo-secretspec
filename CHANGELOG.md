@@ -289,6 +289,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `packaging/` and `tests/sudo_packaging/` are now formatted the way CI checks
   them. `ruff format --check` runs there on every pull request and had never
   passed.
+- `import --delete-source` no longer promises a deletion the provider cannot
+  perform. `Provider::delete` defaults to an unsupported-operation error, but
+  `Provider::check_deletable` — the preflight that exists so an unsupported
+  address cannot be discovered after earlier source entries are already gone —
+  defaulted to merely resolving coordinates. Nineteen of the twenty-eight
+  provider modules override neither, so preflight passed and the deletion phase
+  then failed, after the copy phase had already written the destination. The
+  preflight now refuses a provider that cannot delete at all, reporting the same
+  reason `delete` would, and providers declare the capability explicitly through
+  a new `Provider::supports_delete`, which defaults to `false` in lockstep with
+  `delete`. Custom providers that implement `delete` must override it; the eight
+  built-in ones that delete (dotenv, file, gopass, keeper, keyring, openbao,
+  pass, vault) do. No secret was ever lost to this — copies precede deletions,
+  so the first refusal aborted the run.
+
 - `sudo-secretspec run` works again for a command named by an absolute path.
   The client forwarded the whole invocation as the audit ledger's command
   *basename*, and the privileged side validates that field as a basename — no

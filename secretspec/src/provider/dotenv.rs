@@ -360,6 +360,12 @@ impl Provider for DotEnvProvider {
         Ok(())
     }
 
+    /// This provider implements [`Provider::delete`], so preflight may treat
+    /// its addresses as candidates for deletion.
+    fn supports_delete(&self) -> bool {
+        true
+    }
+
     fn delete(&self, addr: Address<'_>) -> Result<bool> {
         let target = super::flat_item(self, addr)?;
         validate_env_key(&target, addr)?;

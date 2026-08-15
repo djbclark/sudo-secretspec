@@ -295,6 +295,12 @@ impl Provider for PassProvider {
         Ok(())
     }
 
+    /// This provider implements [`Provider::delete`], so preflight may treat
+    /// its addresses as candidates for deletion.
+    fn supports_delete(&self) -> bool {
+        true
+    }
+
     fn delete(&self, addr: Address<'_>) -> Result<bool> {
         let entry_name = super::flat_item(self, addr)?;
         let output = self
