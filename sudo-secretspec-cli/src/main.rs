@@ -153,6 +153,13 @@ enum Cmd {
         #[arg(long, hide = true)]
         caller_path: Option<OsString>,
     },
+    /// Verify the audit ledger's hash chain and report its tip.
+    ///
+    /// Reads no secret and takes no reason: its whole job is to prove the
+    /// ledger is intact. Record the reported tip hash outside the vault and
+    /// compare it on later runs -- that external pin is what gives
+    /// tamper-evidence against a principal who can write the ledger.
+    AuditVerify,
     Rollback {
         snapshot: PathBuf,
     },
@@ -257,6 +264,7 @@ fn main() {
             config,
             caller_path,
         } => doctor(json, config, caller_path),
+        Cmd::AuditVerify => audit_verify(),
         Cmd::Rollback { snapshot } => {
             if unsafe { libc::geteuid() } != 0 {
                 let status = Command::new(SUDO)
@@ -663,6 +671,22 @@ fn lifecycle_add(name: &str, description: &str, reason: &str) {
         .arg(name)
         .arg("--description")
         .arg(description)
+        .status()
+        .unwrap_or_else(|e| {
+            eprintln!("cannot invoke broker: {e}");
+            std::process::exit(2);
+        });
+    if !status.success() {
+        exit_from_broker(status.code().unwrap_or(1));
+    }
+}
+
+fn audit_verify() {
+    let status = Command::new(SUDO)
+        .arg("-n")
+        .arg(privileged_broker())
+        .arg("__broker")
+        .arg("audit-verify")
         .status()
         .unwrap_or_else(|e| {
             eprintln!("cannot invoke broker: {e}");

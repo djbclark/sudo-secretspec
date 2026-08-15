@@ -53,6 +53,7 @@ fn help_exposes_typed_boundary_commands() {
         "check",
         "export",
         "template-check",
+        "audit-verify",
         "run",
         "install",
         "uninstall",

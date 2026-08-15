@@ -259,6 +259,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `run` no longer panics when the environment contains non-UTF-8 variables.
 - A failed terminal audit append now exits 126 and reports the operation's real
   result code instead of masking it as a generic policy error.
+- `sudo-secretspec audit-verify` verifies the audit ledger's hash chain and
+  prints its event count and tip hash. The privileged side has always
+  implemented this and `AI-GUIDANCE.md` already told deployments to pin the
+  reported tip externally, but no public subcommand reached it — the same gap
+  `template-check` had. Serves from an existing boundary without reinstalling.
+
 - `sudo-secretspec add` now actually declares a secret. It was wired to the
   engine's `set`, which refuses a name that is not already declared, so `add`
   could never once perform the operation it is named for — every invocation
