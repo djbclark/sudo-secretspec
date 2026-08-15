@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::{Parser, Subcommand};
@@ -415,21 +415,9 @@ fn resolve_declarations(
 }
 
 fn detect_existing_vault() -> Option<(PathBuf, String, String)> {
-    // Prefer the already-deployed local vault if present.
-    let candidates = [
-        PathBuf::from("/var/db/stayturgid-secrets"),
-        PathBuf::from("/var/db/sudo-secretspec"),
-    ];
-    for vault in candidates {
-        if vault.is_dir() && !vault.is_symlink() {
-            // Ownership can only be fully trusted after elevation; use names we know.
-            if vault.ends_with("stayturgid-secrets") {
-                return Some((vault, "_secretspec".into(), "staff".into()));
-            }
-            return Some((vault, "_sudo_secretspec".into(), "_sudo_secretspec".into()));
-        }
-    }
-    None
+    sudo_secretspec_cli::install::detect_existing_vault(Path::new(CONFIG_PATH), |path| {
+        path.is_dir() && !path.is_symlink()
+    })
 }
 
 fn run_install(

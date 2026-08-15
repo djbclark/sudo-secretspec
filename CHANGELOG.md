@@ -289,6 +289,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `packaging/` and `tests/sudo_packaging/` are now formatted the way CI checks
   them. `ruff format --check` runs there on every pull request and had never
   passed.
+- `sudo-secretspec install --adopt-existing` now adopts the vault the installed
+  boundary actually serves from, by reading the protected config, instead of
+  guessing from a fixed list of directory names that put the retired
+  `/var/db/stayturgid-secrets` first. On a host that had migrated to
+  `/var/db/sudo-secretspec`, a routine reinstall silently repointed the boundary
+  back at the wrapper's retired vault and its `_secretspec` service identity —
+  migration leaves that directory in place on purpose, as the second copy of the
+  secrets and the pre-migration audit ledger, so its presence never meant it was
+  the live vault. `--vault` and `--service-user` still override, an installed
+  config naming a vault that no longer exists falls back to detection rather
+  than pinning the installer to it, and with no boundary installed the canonical
+  vault is now preferred over the retired one.
+
 - The workspace's own `secretspec` and `secretspec-derive` dependency
   requirements are stamped with the release version again. The `0.19.1-sudo.5`
   bump moved `workspace.package.version` but left both requirements naming

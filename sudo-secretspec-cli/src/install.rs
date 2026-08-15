@@ -13,6 +13,17 @@ use std::process::Command;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+/// Vault belonging to the retired `stayturgid` `_secretspec` wrapper.
+///
+/// Adoptable, because a host that has only ever run the wrapper still keeps its
+/// secrets here — but never in preference to [`DEFAULT_VAULT`]. Migration copies
+/// the secrets out and deliberately leaves this directory in place as the second
+/// copy and the pre-migration audit ledger, so its mere existence says nothing
+/// about which vault the host actually serves from.
+const LEGACY_VAULT: &str = "/var/db/stayturgid-secrets";
+const LEGACY_USER: &str = "_secretspec";
+const LEGACY_GROUP: &str = "staff";
+
 pub(crate) const PREFIX: &str = "/usr/local";
 const CONFIG_PATH: &str = "/usr/local/etc/sudo-secretspec.toml";
 const SUDOERS_PATH: &str = "/private/etc/sudoers.d/sudo-secretspec";
@@ -940,6 +951,58 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     Ok(())
 }
 
+/// Vault and service identity an unattended `install` should adopt.
+///
+/// `config_path` is the installed protected config; `dir_exists` reports whether
+/// a path is a real directory (injected so the precedence below is testable
+/// without root or a populated `/var/db`).
+///
+/// An installed boundary is authoritative. It records the vault this host
+/// actually serves from, which a directory scan cannot infer: migration leaves
+/// the retired [`LEGACY_VAULT`] on disk on purpose, so scanning still finds it
+/// long after it stopped being the answer. Preferring the scan is how a routine
+/// reinstall silently repoints a migrated boundary back at retired secrets and a
+/// retired service identity.
+///
+/// Unprivileged and read-only. The config is root-owned `0444`, and the
+/// privileged side re-validates every value before acting on it, so a config
+/// that is missing, unreadable, or invalid falls through to detection rather
+/// than failing the install.
+pub fn detect_existing_vault(
+    config_path: &Path,
+    dir_exists: impl Fn(&Path) -> bool,
+) -> Option<(PathBuf, String, String)> {
+    if let Some(existing) = installed_identity(config_path, &dir_exists) {
+        return Some(existing);
+    }
+
+    // Nothing installed yet: name a vault by its path. The canonical vault wins;
+    // the wrapper's vault is adoptable only when it is the sole candidate.
+    for (vault, user, group) in [
+        (DEFAULT_VAULT, DEFAULT_USER, DEFAULT_GROUP),
+        (LEGACY_VAULT, LEGACY_USER, LEGACY_GROUP),
+    ] {
+        let vault = PathBuf::from(vault);
+        if dir_exists(&vault) {
+            return Some((vault, user.into(), group.into()));
+        }
+    }
+    None
+}
+
+fn installed_identity(
+    config_path: &Path,
+    dir_exists: &impl Fn(&Path) -> bool,
+) -> Option<(PathBuf, String, String)> {
+    let content = fs::read_to_string(config_path).ok()?;
+    let config = crate::config::Config::parse(&content).ok()?;
+    let vault = config.vault().to_path_buf();
+    if !dir_exists(&vault) {
+        return None;
+    }
+    Some((vault, config.service_user, config.service_group))
+}
+
 fn chrono_like_stamp() -> String {
     // UTC-ish timestamp without extra deps.
     let secs = std::time::SystemTime::now()
@@ -986,6 +1049,127 @@ mod tests {
 
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "got {mode:o}");
+    }
+
+    /// A protected config naming `vault`, as `install` would have written it.
+    fn installed_config(vault: &str, user: &str, group: &str) -> String {
+        format!(
+            r#"
+engine = "/usr/local/libexec/sudo-secretspec"
+audit_helper = "/usr/local/libexec/sudo-secretspec"
+vault = "/var/db/{vault}"
+vault_realpath = "/private/var/db/{vault}"
+declarations = "/usr/local/share/sudo-secretspec/secretspec.toml"
+service_user = "{user}"
+service_group = "{group}"
+profile = "default"
+adopted_vault = true
+"#
+        )
+    }
+
+    fn write_config(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sudo-secretspec.toml");
+        fs::write(&path, contents).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn an_installed_boundary_outranks_a_retired_vault_still_on_disk() {
+        // The regression this function exists for. Migration copies secrets to
+        // the canonical vault and leaves the wrapper's vault in place as the
+        // second copy plus the pre-migration ledger, so BOTH directories exist.
+        // A reinstall must follow the installed config, not the older directory.
+        let (_tmp, config) = write_config(&installed_config(
+            "sudo-secretspec",
+            "_sudo_secretspec",
+            "_sudo_secretspec",
+        ));
+
+        let (vault, user, group) = detect_existing_vault(&config, |_| true).unwrap();
+
+        assert_eq!(vault, PathBuf::from(DEFAULT_VAULT));
+        assert_eq!(user, DEFAULT_USER);
+        assert_eq!(group, DEFAULT_GROUP);
+    }
+
+    #[test]
+    fn an_installed_boundary_on_the_legacy_vault_is_still_followed() {
+        // Control for the test above: the config is obeyed, not merely a route
+        // to the canonical answer. A host that adopted the wrapper's vault and
+        // has not migrated must keep resolving to it.
+        let (_tmp, config) = write_config(&installed_config(
+            "stayturgid-secrets",
+            LEGACY_USER,
+            LEGACY_GROUP,
+        ));
+
+        let (vault, user, group) = detect_existing_vault(&config, |_| true).unwrap();
+
+        assert_eq!(vault, PathBuf::from(LEGACY_VAULT));
+        assert_eq!(user, LEGACY_USER);
+        assert_eq!(group, LEGACY_GROUP);
+    }
+
+    #[test]
+    fn with_no_boundary_installed_the_canonical_vault_wins() {
+        let missing = PathBuf::from("/nonexistent/sudo-secretspec.toml");
+
+        let (vault, user, _) = detect_existing_vault(&missing, |_| true).unwrap();
+
+        assert_eq!(vault, PathBuf::from(DEFAULT_VAULT));
+        assert_eq!(user, DEFAULT_USER);
+    }
+
+    #[test]
+    fn with_no_boundary_installed_the_legacy_vault_is_adopted_when_alone() {
+        let missing = PathBuf::from("/nonexistent/sudo-secretspec.toml");
+
+        let (vault, user, group) =
+            detect_existing_vault(&missing, |p| p == Path::new(LEGACY_VAULT)).unwrap();
+
+        assert_eq!(vault, PathBuf::from(LEGACY_VAULT));
+        assert_eq!(user, LEGACY_USER);
+        assert_eq!(group, LEGACY_GROUP);
+    }
+
+    #[test]
+    fn a_config_naming_a_vault_that_is_gone_falls_back_to_detection() {
+        // A config left behind by an uninstall that purged the vault must not
+        // pin the installer to a directory that no longer exists.
+        let (_tmp, config) = write_config(&installed_config(
+            "sudo-secretspec",
+            "_sudo_secretspec",
+            "_sudo_secretspec",
+        ));
+
+        let found = detect_existing_vault(&config, |p| p == Path::new(LEGACY_VAULT));
+
+        assert_eq!(
+            found,
+            Some((
+                PathBuf::from(LEGACY_VAULT),
+                LEGACY_USER.into(),
+                LEGACY_GROUP.into()
+            ))
+        );
+    }
+
+    #[test]
+    fn an_unparseable_config_falls_back_instead_of_failing() {
+        let (_tmp, config) = write_config("this is not toml {{{");
+
+        let (vault, _, _) = detect_existing_vault(&config, |_| true).unwrap();
+
+        assert_eq!(vault, PathBuf::from(DEFAULT_VAULT));
+    }
+
+    #[test]
+    fn nothing_on_disk_detects_nothing() {
+        let missing = PathBuf::from("/nonexistent/sudo-secretspec.toml");
+
+        assert_eq!(detect_existing_vault(&missing, |_| false), None);
     }
 
     #[test]
