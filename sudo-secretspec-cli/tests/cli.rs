@@ -52,6 +52,7 @@ fn help_exposes_typed_boundary_commands() {
         "delete",
         "check",
         "export",
+        "template-check",
         "run",
         "install",
         "uninstall",
@@ -60,4 +61,19 @@ fn help_exposes_typed_boundary_commands() {
     ] {
         assert!(stdout.contains(command), "missing {command}");
     }
+}
+
+#[test]
+fn template_check_requires_a_reason() {
+    // Every brokered operation is audited, and the ledger entry is keyed by the
+    // reason digest. A `template-check` that could run without one would be an
+    // unaudited read of the boundary's configuration.
+    let output = binary()
+        .arg("template-check")
+        .output()
+        .expect("run sudo-secretspec");
+    assert!(
+        !output.status.success(),
+        "template-check ran without --reason"
+    );
 }

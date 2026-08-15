@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with declaration auto-detection and TTY prompts; long flags are overrides.
 - Fork docs: `sudo-secretspec/README.md`, `README.downstream.md`, `FORK-AI.md`.
 
+- `sudo-secretspec template-check --reason <why>` reports whether the runtime
+  manifest in the vault still matches the tracked declaration template recorded
+  in the protected config. It reads no secret values, and like every other
+  brokered operation it requires a `--reason` and is recorded in the audit
+  ledger. The privileged side already implemented this check; only the public
+  subcommand was missing, so an existing boundary serves it without reinstalling.
+
 - `sudo-secretspec uninstall` removes the privileged boundary this installer
   owns. Add `--dry-run` to see the plan first; like `install`, it requires
   interactive authentication. The sudo policy is removed before the binaries it

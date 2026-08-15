@@ -5,7 +5,7 @@ Use this policy in `AGENTS.md`, skills, runbooks, and autonomous-agent prompts f
 ## Required behavior
 
 - Use only the installed `/usr/local/bin/sudo-secretspec` client for credential CRUD and use.
-- Supply a short operational `--reason` for every `add`, `set`, `delete`, `get`, `check`, `export`, or `run` operation. The protected audit ledger stores only its SHA-256 digest.
+- Supply a short operational `--reason` for every `add`, `set`, `delete`, `get`, `check`, `export`, `template-check`, or `run` operation. The protected audit ledger stores only its SHA-256 digest.
 - Run a consumer as `sudo-secretspec run --reason "purpose" -- <command>` instead of extracting values into shell history or command arguments.
 - Treat an unavailable broker, failed audit append/verification, declaration mismatch, authorization failure, or non-advisory drift finding as a hard stop. `doctor` marks advisory findings — `LEGACY_VAULT_CLUTTER`, `PENDING_ROLLBACK`, and `CLIENT_DUPLICATE` — and still exits zero; report them to the operator and continue. Read the `advisory` field rather than matching code names, which grow over releases.
 - Treat `CLIENT_SHADOWED` as a hard stop and do not work around it: it means a different `sudo-secretspec` would run instead of the installed client, so no operation you perform can be trusted to have reached the boundary. Report the reported path to the operator.

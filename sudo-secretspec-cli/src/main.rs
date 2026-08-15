@@ -60,6 +60,15 @@ enum Cmd {
         #[arg(long)]
         reason: String,
     },
+    /// Compare the runtime manifest against the tracked declaration template.
+    ///
+    /// Reports drift between `<vault>/secretspec.toml` (what the broker
+    /// actually resolves from) and the `declarations` file recorded in the
+    /// root-owned config (what review sees in git). Reads no secret values.
+    TemplateCheck {
+        #[arg(long)]
+        reason: String,
+    },
     Run {
         #[arg(long)]
         reason: String,
@@ -195,6 +204,7 @@ fn main() {
         Cmd::Get { name, reason } => lifecycle("get", &name, &reason),
         Cmd::Check { reason } => lifecycle("check", "", &reason),
         Cmd::Export { reason } => lifecycle("export", "", &reason),
+        Cmd::TemplateCheck { reason } => lifecycle("template-check", "", &reason),
         Cmd::Run { reason, command } => run_target(&reason, &command),
         Cmd::Install {
             declarations,
