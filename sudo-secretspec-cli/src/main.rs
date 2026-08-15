@@ -89,6 +89,17 @@ enum Cmd {
         #[arg(long)]
         reason: String,
     },
+    /// Emit a JSON Schema of the runtime manifest's typed shape.
+    ///
+    /// Declared names and whether each is required — never values, and not
+    /// descriptions either: `codegen`'s emitter writes only the `type` key
+    /// per property. The profile is the one recorded in the root-owned
+    /// config, not a caller flag: an arbitrary profile would enumerate
+    /// shapes the boundary is not configured for.
+    Schema {
+        #[arg(long)]
+        reason: String,
+    },
     Run {
         #[arg(long)]
         reason: String,
@@ -237,6 +248,7 @@ fn main() {
         Cmd::Check { reason } => lifecycle("check", "", &reason),
         Cmd::Export { reason } => lifecycle("export", "", &reason),
         Cmd::TemplateCheck { reason } => lifecycle("template-check", "", &reason),
+        Cmd::Schema { reason } => lifecycle("schema", "", &reason),
         Cmd::Run { reason, command } => run_target(&reason, &command),
         Cmd::Install {
             declarations,

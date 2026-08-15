@@ -54,18 +54,19 @@ The companion is not a wrapper around the whole engine. It exposes exactly:
 | `export --reason R` | Print **all** name→value pairs as JSON to stdout. |
 | `run --reason R -- cmd args...` | Run a child with the declared environment. |
 | `template-check --reason R` | Compare runtime manifest against the tracked declaration template. |
+| `schema --reason R` | Emit a JSON Schema of the runtime manifest's typed shape. |
 | `audit-verify` | Verify the ledger's hash chain and report its tip. |
 | `doctor` | Drift and health check. |
 
 Plus the operator-only lifecycle commands `install`, `uninstall`, and
 `rollback`.
 
-Six engine subcommands have **no** companion equivalent: `config`, `import`,
-`init`, `schema`, `cache`, and `audit`. Their absence is deliberate and is not a
+Five engine subcommands have **no** companion equivalent: `config`, `import`,
+`init`, `cache`, and `audit`. Their absence is deliberate and is not a
 gap to route around — the correct response to needing one is to ask the
 operator. `config` and `import` are permanently excluded (they would let a
 caller repoint which store answers, or move every secret into a store the
-boundary does not own). The other four are open operator questions; do not
+boundary does not own). The other three are open operator questions; do not
 assume their absence is either permanent or arbitrary.
 
 ## How to Run
@@ -79,6 +80,7 @@ sudo-secretspec get NAME --reason "inspect managed credential"
 sudo-secretspec set NAME --reason "rotate managed credential"
 sudo-secretspec check --reason "validate required credentials"
 sudo-secretspec template-check --reason "confirm manifest matches declarations"
+sudo-secretspec schema --reason "generate typed accessors"
 sudo-secretspec audit-verify
 ```
 

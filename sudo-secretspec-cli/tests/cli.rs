@@ -53,6 +53,7 @@ fn help_exposes_typed_boundary_commands() {
         "check",
         "export",
         "template-check",
+        "schema",
         "audit-verify",
         "undeclare",
         "run",
@@ -77,6 +78,33 @@ fn template_check_requires_a_reason() {
     assert!(
         !output.status.success(),
         "template-check ran without --reason"
+    );
+}
+
+#[test]
+fn schema_requires_a_reason() {
+    // Every brokered operation is audited, and the ledger entry is keyed by the
+    // reason digest. A `schema` that could run without one would be an
+    // unaudited read of the boundary's typed shape.
+    let output = binary()
+        .arg("schema")
+        .output()
+        .expect("run sudo-secretspec");
+    assert!(!output.status.success(), "schema ran without --reason");
+}
+
+#[test]
+fn schema_rejects_a_caller_profile() {
+    // The profile is pinned to the root-owned config. Accepting one here would
+    // let a caller enumerate shapes of profiles the boundary is not configured
+    // for.
+    let output = binary()
+        .args(["schema", "--profile", "production", "--reason", "why"])
+        .output()
+        .expect("run sudo-secretspec");
+    assert!(
+        !output.status.success(),
+        "schema accepted a caller --profile"
     );
 }
 

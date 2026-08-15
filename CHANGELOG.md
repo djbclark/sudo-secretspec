@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `sudo-secretspec schema --reason <why>` emits a JSON Schema of the runtime
+  manifest's typed shape (declared names and whether each is required) to
+  stdout. It reads no secret values, and emits no descriptions — the schema
+  carries one `type` key per property. The profile is the one recorded in the
+  root-owned config, not a caller flag, so a caller cannot enumerate shapes of
+  profiles the boundary is not configured for. Like every other brokered
+  operation it requires a `--reason` and is recorded in the audit ledger.
+  NOTE: unlike `template-check`, this needs a boundary reinstall — the older
+  broker has no `source-schema` operation.
+
+
 - Downstream `sudo-secretspec` privilege-boundary companion: a single Rust
   binary with mediated credential operations, fail-closed SQLite audit,
   metadata-only doctor/drift checks, explicit install/adopt/rollback, and

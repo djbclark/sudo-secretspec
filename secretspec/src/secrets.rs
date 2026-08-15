@@ -1809,10 +1809,14 @@ impl Secrets {
         Ok(())
     }
 
-    /// Get a reference to the project configuration. Used by `secretspec
-    /// codegen` (which needs the manifest, not a provider) and by tests.
-    #[cfg(any(feature = "cli", test))]
-    pub(crate) fn config(&self) -> &Config {
+    /// Get a reference to the project configuration.
+    ///
+    /// Used by `secretspec schema` (which needs the manifest, not a provider)
+    /// and by the privilege-separated broker, which must not take the `cli`
+    /// feature. Hidden from the public SDK surface: callers that need a
+    /// manifest load it themselves.
+    #[doc(hidden)]
+    pub fn config(&self) -> &Config {
         &self.config
     }
 

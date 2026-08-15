@@ -449,7 +449,8 @@ fn run(broker: &Broker) -> Result<(), i32> {
         | "source-delete"
         | "source-check"
         | "source-export"
-        | "source-template-check" => {
+        | "source-template-check"
+        | "source-schema" => {
             require_root()?;
             let cfg = load_config()?;
             let service_uid = require_boundary(&cfg)?;
@@ -847,8 +848,31 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                 (1, vec![])
             }
         }
+        // Manifest only: `codegen` never resolves a provider value. The
+        // profile is the one in the root-owned config, not a caller flag —
+        // an arbitrary profile would enumerate shapes the boundary is not
+        // configured for.
+        "source-schema" => match emit_schema(secrets.config(), &cfg.profile) {
+            Ok(schema) => {
+                print!("{schema}");
+                (0, vec![])
+            }
+            Err(e) => {
+                eprintln!("broker: {e}");
+                (1, vec![])
+            }
+        },
         _ => (2, vec![]),
     }
+}
+
+/// JSON Schema of a manifest for one profile.
+///
+/// Value-free: `codegen` reads declarations only. The caller supplies the
+/// profile; the broker always passes the one from the root-owned config.
+fn emit_schema(config: &secretspec::Config, profile: &str) -> Result<String, String> {
+    let ir = secretspec::codegen::build_ir(config);
+    secretspec::codegen::schema::emit(&ir, Some(profile))
 }
 
 #[cfg(test)]
@@ -1000,5 +1024,51 @@ mod tests {
                 "{name} must survive the purge"
             );
         }
+    }
+
+    #[test]
+    fn schema_is_pinned_to_the_configured_profile_and_contains_no_values() {
+        // The public client does not take `--profile`. This helper is what the
+        // broker calls with the root-owned config's profile, so a production-
+        // only name must not appear when that profile is `default`.
+        let config: secretspec::Config = r#"
+[project]
+name = "schema-test"
+revision = "1.0"
+
+[profiles.default]
+DATABASE_URL = { description = "app database", required = true }
+API_KEY = { description = "optional api key", required = false }
+
+[profiles.production]
+DATABASE_URL = { description = "prod database", required = true }
+PROD_ONLY = { description = "production-only token", required = true }
+"#
+        .parse()
+        .unwrap();
+
+        let schema: serde_json::Value =
+            serde_json::from_str(&emit_schema(&config, "default").unwrap()).unwrap();
+        assert_eq!(schema["title"], "DefaultSecrets");
+        assert_eq!(schema["properties"]["DATABASE_URL"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["API_KEY"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+        assert!(schema["properties"].get("PROD_ONLY").is_none());
+        assert!(
+            schema["properties"]["DATABASE_URL"]
+                .get("default")
+                .is_none()
+        );
+        assert!(schema["properties"]["DATABASE_URL"].get("const").is_none());
+
+        let production: serde_json::Value =
+            serde_json::from_str(&emit_schema(&config, "production").unwrap()).unwrap();
+        assert!(production["properties"]["PROD_ONLY"].is_object());
+        // Effective profile fields include inheritance from `default`.
+        assert!(production["properties"]["API_KEY"].is_object());
+
+        assert!(emit_schema(&config, "staging").is_err());
     }
 }
