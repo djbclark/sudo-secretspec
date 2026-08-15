@@ -5,11 +5,11 @@
 class SudoSecretspec < Formula
   desc "SecretSpec engine with an opt-in macOS privilege-boundary companion"
   homepage "https://github.com/frdminc/sudo-secretspec"
-  url "https://github.com/frdminc/sudo-secretspec/archive/refs/tags/v0.19.1-sudo.7.tar.gz"
+  url "https://github.com/frdminc/sudo-secretspec/archive/refs/tags/v0.19.1-sudo.8.tar.gz"
   # Homebrew parses the trailing ".1" of the tag as the whole version, which
   # breaks upgrade detection. State it explicitly.
-  version "0.19.1-sudo.7"
-  sha256 "0d1dfa9c42ccafd5620fc1c0ddf4b27f2f55c1f9a18f5faac02dd5d516e6f4e0"
+  version "0.19.1-sudo.8"
+  sha256 "68b9e516169f18efa5b7699a9d6a5d502960cad5d507067678b499e92c4b5d06"
   license "Apache-2.0"
   head "https://github.com/frdminc/sudo-secretspec.git", branch: "sudo-main"
 
@@ -63,8 +63,8 @@ class SudoSecretspec < Formula
   end
 
   test do
-    assert_match "0.19.1-sudo.7", shell_output("#{bin}/secretspec --version")
-    assert_match "sudo-secretspec 0.19.1-sudo.7", shell_output("#{libexec}/sudo-secretspec --version")
+    assert_match "0.19.1-sudo.8", shell_output("#{bin}/secretspec --version")
+    assert_match "sudo-secretspec 0.19.1-sudo.8", shell_output("#{libexec}/sudo-secretspec --version")
     # The companion must never be linked onto PATH; see the install comment.
     refute_path_exists bin/"sudo-secretspec"
   end
