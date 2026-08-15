@@ -38,14 +38,18 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 UPSTREAM_VERSION = "0.19.1"
 UPSTREAM_TAG = f"v{UPSTREAM_VERSION}"
-FORK_REPO = "djbclark/sudo-secretspec"
+FORK_REPO = "frdminc/sudo-secretspec"
 UPSTREAM_REPO = "cachix/secretspec"
 ORIGIN_URL = f"https://github.com/{FORK_REPO}.git"
 UPSTREAM_URL = f"https://github.com/{UPSTREAM_REPO}.git"
 FORMULA_REL = Path("packaging/homebrew/sudo-secretspec.rb")
 FORMULA = ROOT / FORMULA_REL
 DEFAULT_TAP = Path.home() / "src" / "homebrew-sudo-secretspec"
-FORMULA_NAME = "djbclark/sudo-secretspec/sudo-secretspec"
+# The Homebrew tap is named after the fork's owner and repo, so both derive from
+# FORK_REPO. Moving the fork to another org then means editing one constant --
+# the 2026-08-15 djbclark -> frdminc move had to touch three.
+TAP_NAME = FORK_REPO
+FORMULA_NAME = f"{TAP_NAME}/sudo-secretspec"
 # The downstream serial's prefix. Releases through 0.19.1-djbclark.3 used
 # "djbclark"; everything from 0.19.1-sudo.4 on uses "sudo".
 DOWNSTREAM_SUFFIX = "sudo"
@@ -395,9 +399,7 @@ def sync_tap(release: Release, tap_path: Path, *, dry_run: bool) -> None:
 
 def brew_refresh_and_test(release: Release, *, dry_run: bool) -> str:
     run(["brew", "update", "--force"], dry_run=dry_run, capture=False)
-    tap_repo = output(
-        ["brew", "--repository", "djbclark/sudo-secretspec"], dry_run=dry_run
-    )
+    tap_repo = output(["brew", "--repository", TAP_NAME], dry_run=dry_run)
     if not dry_run:
         tap = Path(tap_repo)
         _require(tap.is_dir(), "Homebrew did not return the tap checkout")

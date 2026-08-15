@@ -1,4 +1,4 @@
-# Fork-only notes for AI agents (`djbclark/sudo-secretspec`)
+# Fork-only notes for AI agents (`frdminc/sudo-secretspec`)
 
 This file is **downstream-only**. Do not port it upstream to `cachix/secretspec`.
 
@@ -81,7 +81,7 @@ sudo-secretspec check --reason "smoke"
 
 ## Delivery conventions
 
-- Commit directly to `sudo-main` on `djbclark/sudo-secretspec`. Do not create
+- Commit directly to `sudo-main` on `frdminc/sudo-secretspec`. Do not create
   branches or open PRs for downstream work.
 - Never open upstream issues/PRs without explicit permission.
 - Keep `CHANGELOG.md` Unreleased entries user-facing.

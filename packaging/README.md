@@ -8,7 +8,7 @@ root `Cargo.toml` carries the downstream version being cut.
 
 - Tag: `v0.19.1-djbclark.N`
 - Release title: `SecretSpec 0.19.1 — sudo-secretspec downstream N`
-- Fork: `djbclark/sudo-secretspec` (parent `cachix/secretspec`)
+- Fork: `frdminc/sudo-secretspec` (parent `cachix/secretspec`)
 
 The upstream base is a constant in `release.py`. Which downstream serial to cut
 is a `--version` argument; rebasing onto a newer upstream tag is a separate,

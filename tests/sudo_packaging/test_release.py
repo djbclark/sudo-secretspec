@@ -61,7 +61,7 @@ PREFLIGHT_GIT_OUTPUTS = {
         "remote",
         "get-url",
         "origin",
-    ): "https://github.com/djbclark/sudo-secretspec.git\n",
+    ): "https://github.com/frdminc/sudo-secretspec.git\n",
     (
         "git",
         "remote",
@@ -81,7 +81,7 @@ def test_release_identity_is_derived_from_the_serial(release, cut):
     assert cut.tag == "v0.19.1-sudo.5"
     assert cut.title == "SecretSpec 0.19.1 — sudo-secretspec downstream 5"
     assert cut.archive_url == (
-        "https://github.com/djbclark/sudo-secretspec/archive/refs/tags/"
+        "https://github.com/frdminc/sudo-secretspec/archive/refs/tags/"
         "v0.19.1-sudo.5.tar.gz"
     )
 
@@ -108,7 +108,7 @@ def test_only_downstream_versions_on_the_pinned_upstream_base_are_accepted(relea
 
 def test_https_release_url_guard(release):
     release.validate_release_url(
-        "https://github.com/djbclark/sudo-secretspec/archive/refs/tags/v0.19.1-sudo.1.tar.gz"
+        "https://github.com/frdminc/sudo-secretspec/archive/refs/tags/v0.19.1-sudo.1.tar.gz"
     )
     for url in ("http://github.com/x", "file:///tmp/x", "https://example.com/x"):
         with pytest.raises(release.ReleaseError):
@@ -121,7 +121,7 @@ def test_formula_rewrite_restamps_every_version_site(tmp_path: Path, release, cu
     # after the tag and the GitHub Release were already published.
     formula = tmp_path / "sudo-secretspec.rb"
     formula.write_text(
-        '  url "https://github.com/djbclark/sudo-secretspec/archive/refs/tags/'
+        '  url "https://github.com/frdminc/sudo-secretspec/archive/refs/tags/'
         'v0.19.1-djbclark.1.tar.gz"\n'
         '  version "0.19.1-djbclark.1"\n'
         f'  sha256 "{"0" * 64}"\n'
@@ -149,7 +149,7 @@ def test_formula_rewrite_refuses_an_unexpected_number_of_version_sites(
 ):
     formula = tmp_path / "sudo-secretspec.rb"
     formula.write_text(
-        '  url "https://github.com/djbclark/sudo-secretspec/archive/refs/tags/'
+        '  url "https://github.com/frdminc/sudo-secretspec/archive/refs/tags/'
         'v0.19.1-djbclark.1.tar.gz"\n'
         f'  sha256 "{"0" * 64}"\n',
         encoding="utf-8",
@@ -187,7 +187,7 @@ def test_preflight_validates_branch_remotes_lineage_and_fork(monkeypatch, releas
                 "remote",
                 "get-url",
                 "origin",
-            ): "https://github.com/djbclark/sudo-secretspec.git\n",
+            ): "https://github.com/frdminc/sudo-secretspec.git\n",
             (
                 "git",
                 "remote",
@@ -205,12 +205,12 @@ def test_preflight_validates_branch_remotes_lineage_and_fork(monkeypatch, releas
                 "gh",
                 "repo",
                 "view",
-                "djbclark/sudo-secretspec",
+                "frdminc/sudo-secretspec",
                 "--json",
                 "nameWithOwner,parent,defaultBranchRef",
             ): json.dumps(
                 {
-                    "nameWithOwner": "djbclark/sudo-secretspec",
+                    "nameWithOwner": "frdminc/sudo-secretspec",
                     "parent": {"nameWithOwner": "cachix/secretspec"},
                     "defaultBranchRef": {"name": "sudo-main"},
                 }
@@ -233,12 +233,12 @@ def test_preflight_refuses_a_serial_that_is_already_published(monkeypatch, relea
     def fake_run(argv, **kwargs):
         if argv[:2] == ["git", "ls-remote"]:
             return completed(argv, "9f4c…\trefs/tags/v0.19.1-sudo.9\n")
-        if argv[:4] == ["gh", "repo", "view", "djbclark/sudo-secretspec"]:
+        if argv[:4] == ["gh", "repo", "view", "frdminc/sudo-secretspec"]:
             return completed(
                 argv,
                 json.dumps(
                     {
-                        "nameWithOwner": "djbclark/sudo-secretspec",
+                        "nameWithOwner": "frdminc/sudo-secretspec",
                         "parent": {"nameWithOwner": "cachix/secretspec"},
                         "defaultBranchRef": {"name": "sudo-main"},
                     }
@@ -253,12 +253,12 @@ def test_preflight_refuses_a_serial_that_is_already_published(monkeypatch, relea
 
 def test_preflight_refuses_a_workspace_stamped_at_another_version(monkeypatch, release):
     def fake_run(argv, **kwargs):
-        if argv[:4] == ["gh", "repo", "view", "djbclark/sudo-secretspec"]:
+        if argv[:4] == ["gh", "repo", "view", "frdminc/sudo-secretspec"]:
             return completed(
                 argv,
                 json.dumps(
                     {
-                        "nameWithOwner": "djbclark/sudo-secretspec",
+                        "nameWithOwner": "frdminc/sudo-secretspec",
                         "parent": {"nameWithOwner": "cachix/secretspec"},
                         "defaultBranchRef": {"name": "sudo-main"},
                     }
@@ -289,12 +289,12 @@ def test_preflight_refuses_a_lockfile_that_disagrees_with_the_manifest(
             assert "--locked" in argv
             assert kwargs.get("check") is False, "must not raise past the guard"
             return completed(argv, returncode=101)
-        if argv[:4] == ["gh", "repo", "view", "djbclark/sudo-secretspec"]:
+        if argv[:4] == ["gh", "repo", "view", "frdminc/sudo-secretspec"]:
             return completed(
                 argv,
                 json.dumps(
                     {
-                        "nameWithOwner": "djbclark/sudo-secretspec",
+                        "nameWithOwner": "frdminc/sudo-secretspec",
                         "parent": {"nameWithOwner": "cachix/secretspec"},
                         "defaultBranchRef": {"name": "sudo-main"},
                     }
@@ -340,12 +340,12 @@ def test_parent_slug_accepts_every_gh_parent_shape(release):
 
 def test_preflight_accepts_gh_parent_without_name_with_owner(monkeypatch, release):
     def fake_run(argv, **kwargs):
-        if argv[:4] == ["gh", "repo", "view", "djbclark/sudo-secretspec"]:
+        if argv[:4] == ["gh", "repo", "view", "frdminc/sudo-secretspec"]:
             return completed(
                 argv,
                 json.dumps(
                     {
-                        "nameWithOwner": "djbclark/sudo-secretspec",
+                        "nameWithOwner": "frdminc/sudo-secretspec",
                         "parent": {
                             "id": "R_kgDOPHAtAA",
                             "name": "secretspec",
@@ -363,12 +363,12 @@ def test_preflight_accepts_gh_parent_without_name_with_owner(monkeypatch, releas
 
 def test_preflight_rejects_wrong_fork_parent(monkeypatch, release):
     def fake_run(argv, **kwargs):
-        if argv[:4] == ["gh", "repo", "view", "djbclark/sudo-secretspec"]:
+        if argv[:4] == ["gh", "repo", "view", "frdminc/sudo-secretspec"]:
             return completed(
                 argv,
                 json.dumps(
                     {
-                        "nameWithOwner": "djbclark/sudo-secretspec",
+                        "nameWithOwner": "frdminc/sudo-secretspec",
                         "parent": None,
                         "defaultBranchRef": {"name": "sudo-main"},
                     }
@@ -382,7 +382,7 @@ def test_preflight_rejects_wrong_fork_parent(monkeypatch, release):
                 "remote",
                 "get-url",
                 "origin",
-            ): "https://github.com/djbclark/sudo-secretspec.git\n",
+            ): "https://github.com/frdminc/sudo-secretspec.git\n",
             (
                 "git",
                 "remote",

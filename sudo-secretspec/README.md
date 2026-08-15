@@ -1,7 +1,7 @@
 # sudo-secretspec (downstream companion)
 
 Privilege-separated SecretSpec companion for this fork
-(`djbclark/sudo-secretspec`).
+(`frdminc/sudo-secretspec`).
 
 Upstream SecretSpec remains the declaration/provider engine. This companion adds
 a single mediated control plane for autonomous local AI/operator use on macOS.

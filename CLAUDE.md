@@ -15,7 +15,7 @@ For an upcoming provider or feature:
   pages, README files, and generated documentation summaries with the minimum
   version, for example `(0.15+)`.
 
-## Downstream fork notes (`djbclark/sudo-secretspec`)
+## Downstream fork notes (`frdminc/sudo-secretspec`)
 
 This repository is a fork. In addition to upstream SecretSpec:
 
@@ -31,7 +31,13 @@ This repository is a fork. In addition to upstream SecretSpec:
   upstream work intended for a future release.
 - Version scheme: `0.19.1-sudo.N`, where `N` is the downstream serial. Releases
   through `v0.19.1-djbclark.3` used the older `-djbclark.N` form; the tags
-  remain, but new work uses `-sudo.N`.
+  remain, but new work uses `-sudo.N`. The `djbclark` in those tag names is the
+  old *version* serial, unrelated to the org move below — do not rewrite them.
+- The fork moved from the `djbclark` user to the `frdminc` org on 2026-08-15.
+  GitHub redirects the old URLs, so stale references keep working and will not
+  announce themselves; prefer `frdminc/...` everywhere. Note that `djbclark`
+  also appears as the *operator's macOS username* (sudoers rules, audit test
+  fixtures, install paths) — those are not org references and must stay.
 
 When changing the companion, update `CHANGELOG.md` Unreleased with a user-facing
 entry and keep privileged install explicit (Homebrew must not silently edit

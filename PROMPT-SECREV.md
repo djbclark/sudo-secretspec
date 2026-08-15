@@ -161,7 +161,7 @@ cargo test -p sudo-secretspec-cli
 
 ## Review Output
 
-Post findings as PR comments on https://github.com/djbclark/sudo-secretspec/pull/1
+Post findings as PR comments on https://github.com/frdminc/sudo-secretspec/pull/1
 
 Tag:
 - `[SECURITY]` — exploitable / invariant violation

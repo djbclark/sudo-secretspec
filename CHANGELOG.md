@@ -17,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with declaration auto-detection and TTY prompts; long flags are overrides.
 - Fork docs: `sudo-secretspec/README.md`, `README.downstream.md`, `FORK-AI.md`.
 
+- The project moved from `djbclark/sudo-secretspec` to
+  `frdminc/sudo-secretspec`, and its Homebrew tap from
+  `djbclark/homebrew-sudo-secretspec` to `frdminc/homebrew-sudo-secretspec`.
+  Install with `brew install frdminc/sudo-secretspec/sudo-secretspec`. Existing
+  installations keep working — GitHub redirects the old URLs — but should be
+  moved over with `brew tap frdminc/sudo-secretspec`,
+  `brew reinstall frdminc/sudo-secretspec/sudo-secretspec`, then
+  `brew untap djbclark/sudo-secretspec`. Release artifacts are unchanged: the
+  `v0.19.1-sudo.5` tarball has the same SHA-256 under the new owner.
+
 - `sudo-secretspec template-check --reason <why>` reports whether the runtime
   manifest in the vault still matches the tracked declaration template recorded
   in the protected config. It reads no secret values, and like every other

@@ -1,4 +1,4 @@
-# PROMPT-REVIEW.md — Complete Code Review Request for `djbclark/sudo-secretspec`
+# PROMPT-REVIEW.md — Complete Code Review Request for `frdminc/sudo-secretspec`
 
 ## Scope
 
@@ -6,7 +6,7 @@ This is a **downstream fork** of `cachix/secretspec` adding a privilege-separate
 `sudo-secretspec` for macOS. Review all **new/changed** code in this fork against the
 upstream `cachix/secretspec` 0.19.1 baseline.
 
-**PR**: https://github.com/djbclark/sudo-secretspec/pull/1  
+**PR**: https://github.com/frdminc/sudo-secretspec/pull/1  
 **Base**: `sudo-main` (downstream release branch)  
 **Head**: `feature/sudo-privilege-boundary`  
 **Version**: `0.19.1-djbclark.1` (`v0.19.1-djbclark.1`)
@@ -122,7 +122,7 @@ See PR diff. Key new files:
 
 ## How to Deliver Review
 
-Post findings as PR comments on https://github.com/djbclark/sudo-secretspec/pull/1  
+Post findings as PR comments on https://github.com/frdminc/sudo-secretspec/pull/1  
 Tag security-critical items with `[SECURITY]`, advisory with `[ADVISORY]`.
 
 ---

@@ -1,4 +1,4 @@
-# djbclark/sudo-secretspec
+# frdminc/sudo-secretspec
 
 Downstream fork of [cachix/secretspec](https://github.com/cachix/secretspec)
 with an optional privilege-separated companion for autonomous local AI/operator

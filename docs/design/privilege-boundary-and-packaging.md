@@ -4,7 +4,7 @@
 complete.** Remaining open work is the separate workstream (items 9–10, F5) and
 item 12, cross-platform `sudo`.
 **Date:** 2026-08-13
-**Scope:** fork-only (`djbclark/sudo-secretspec`). Not upstream material.
+**Scope:** fork-only (`frdminc/sudo-secretspec`). Not upstream material.
 **Prompted by:** resolving the Homebrew link conflict after the
 `v0.19.1-djbclark.1` release turned out to be far more hazardous than it
 looked.
@@ -381,7 +381,7 @@ identity.
    the version as `1`, breaking upgrade detection.
 2. `keg_only` the companion so only `secretspec` links (F4).
 3. Rebuild: `brew uninstall secretspec && brew uninstall sudo-secretspec &&
-   brew install djbclark/sudo-secretspec/sudo-secretspec && brew test …`.
+   brew install frdminc/sudo-secretspec/sudo-secretspec && brew test …`.
    Nothing depends on the upstream formula (`brew uses --installed secretspec`
    is empty).
 4. Verify `secretspec --version`, `doctor`, and that

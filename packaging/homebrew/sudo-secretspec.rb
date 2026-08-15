@@ -4,14 +4,14 @@
 # Homebrew package for the upstream engine and downstream opt-in companion.
 class SudoSecretspec < Formula
   desc "SecretSpec engine with an opt-in macOS privilege-boundary companion"
-  homepage "https://github.com/djbclark/sudo-secretspec"
-  url "https://github.com/djbclark/sudo-secretspec/archive/refs/tags/v0.19.1-sudo.5.tar.gz"
+  homepage "https://github.com/frdminc/sudo-secretspec"
+  url "https://github.com/frdminc/sudo-secretspec/archive/refs/tags/v0.19.1-sudo.5.tar.gz"
   # Homebrew parses the trailing ".1" of the tag as the whole version, which
   # breaks upgrade detection. State it explicitly.
   version "0.19.1-sudo.5"
   sha256 "b177191d0a3496250532a40c0a384cbcd9483dde1b228e1ee8dd2f374c2c3823"
   license "Apache-2.0"
-  head "https://github.com/djbclark/sudo-secretspec.git", branch: "sudo-main"
+  head "https://github.com/frdminc/sudo-secretspec.git", branch: "sudo-main"
 
   depends_on "pkg-config" => :build
   depends_on "rust" => :build

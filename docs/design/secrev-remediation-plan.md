@@ -1,7 +1,7 @@
 # PLAN-SECREV-FIXES.md — remediation plan for the privilege-boundary review
 
 Companion to `PROMPT-SECREV.md` and the review posted at
-<https://github.com/djbclark/sudo-secretspec/pull/1#issuecomment-5289608095>.
+<https://github.com/frdminc/sudo-secretspec/pull/1#issuecomment-5289608095>.
 
 Ordered in the sequence I would actually do the work. Each item states the fix,
 the test that proves it, and — where there is one — the decision or trade-off
