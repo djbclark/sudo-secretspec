@@ -29,7 +29,9 @@ This repository is a fork. In addition to upstream SecretSpec:
 - `main` exists only as the upstream mirror. Do not develop on it, and do not
   merge it into `sudo-main` without being asked: it carries post-0.19.1
   upstream work intended for a future release.
-- Version scheme: `0.19.1-djbclark.1`
+- Version scheme: `0.19.1-sudo.N`, where `N` is the downstream serial. Releases
+  through `v0.19.1-djbclark.3` used the older `-djbclark.N` form; the tags
+  remain, but new work uses `-sudo.N`.
 
 When changing the companion, update `CHANGELOG.md` Unreleased with a user-facing
 entry and keep privileged install explicit (Homebrew must not silently edit

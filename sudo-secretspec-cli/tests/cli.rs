@@ -21,7 +21,7 @@ fn version_identifies_downstream_distribution() {
         format!("sudo-secretspec {}", env!("CARGO_PKG_VERSION"))
     );
     assert!(
-        reported.contains("-djbclark."),
+        reported.contains("-sudo."),
         "version must identify the fork: {reported}"
     );
 }

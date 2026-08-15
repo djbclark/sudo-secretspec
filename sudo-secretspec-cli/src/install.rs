@@ -856,16 +856,8 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
         &declarations_dst,
         require_mode(&declarations_dst)?,
     )?;
-    install_file(
-        &retired_src,
-        &retired_dst,
-        require_mode(&retired_dst)?,
-    )?;
-    install_file(
-        &guidance_src,
-        &guidance_dst,
-        require_mode(&guidance_dst)?,
-    )?;
+    install_file(&retired_src, &retired_dst, require_mode(&retired_dst)?)?;
+    install_file(&guidance_src, &guidance_dst, require_mode(&guidance_dst)?)?;
     write_bytes(
         &config_dst,
         config_toml(&req, &vault_real).as_bytes(),
