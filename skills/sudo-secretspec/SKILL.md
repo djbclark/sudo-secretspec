@@ -1,7 +1,7 @@
 ---
 name: sudo-secretspec
-description: Use managed credentials without backing-store access.
-version: 0.1.0
+description: Use managed credentials through the privilege-separated sudo-secretspec client instead of touching a secret store directly. Use when a task needs an API key, token, or password; when a credential must be declared, set, rotated, read, deleted, or injected into a child process; or when the boundary, drift checker, or audit ledger reports an error. Also covers what is deliberately NOT exposed and must be asked of the operator.
+version: 0.2.0
 author: Dan Clark (djbclark), Hermes Agent
 license: Apache-2.0
 platforms: [macos]
@@ -13,57 +13,173 @@ metadata:
 
 # sudo-secretspec Skill
 
-Use the installed privilege-separated client for autonomous credential CRUD and consumer execution. Do not access SecretSpec’s provider or protected backing files directly.
+Use the installed privilege-separated client for autonomous credential CRUD and
+consumer execution. Do not access SecretSpec's provider, manifest, or protected
+backing files directly, and never invoke `secretspec` itself for a managed
+deployment.
+
+Verified against client **0.19.1-sudo.10**. `sudo-secretspec --version` is the
+authority; if it reports something newer, re-read
+`sudo-secretspec/AI-GUIDANCE.md` rather than trusting this file's specifics.
 
 ## When to Use
 
 - A task needs an API key, token, password, or other declared credential.
-- A credential must be initialized, rotated, read, deleted, checked, exported, or injected into a child process.
+- A credential must be declared, initialized, rotated, read, deleted, checked,
+  exported, or injected into a child process.
 - The managed boundary or drift checker reports an error.
 
-Do not use for boundary installation, adoption, rollback, or repair without explicit operator authorization.
+Do not use for boundary installation, adoption, uninstall, rollback, or repair
+without explicit operator authorization.
 
 ## Prerequisites
 
-- `/usr/local/bin/sudo-secretspec` is installed.
-- The credential name is present in the released declarations before `add`.
-- The consumer can read its credentials from environment variables when using `run`.
+- `/usr/local/bin/sudo-secretspec` is installed and is the binary that actually
+  runs (see `CLIENT_SHADOWED` under Verification).
+- The consumer can read its credentials from environment variables when using
+  `run`.
+
+## Mediated surface
+
+The companion is not a wrapper around the whole engine. It exposes exactly:
+
+| Command | Purpose |
+| --- | --- |
+| `add NAME --description D --reason R` | Declare a name in the runtime manifest. Sets **no** value. |
+| `undeclare NAME --reason R` | Inverse of `add`. Guarded — see Declaration lifecycle. |
+| `set NAME --reason R` | Supply or rotate a value. |
+| `delete NAME --reason R` | Drop a value, keeping the declaration. |
+| `get NAME --reason R` | Print one value **to stdout**. |
+| `check --reason R` | Validate that required credentials are present. |
+| `export --reason R` | Print **all** name→value pairs as JSON to stdout. |
+| `run --reason R -- cmd args...` | Run a child with the declared environment. |
+| `template-check --reason R` | Compare runtime manifest against the tracked declaration template. |
+| `audit-verify` | Verify the ledger's hash chain and report its tip. |
+| `doctor` | Drift and health check. |
+
+Plus the operator-only lifecycle commands `install`, `uninstall`, and
+`rollback`.
+
+Six engine subcommands have **no** companion equivalent: `config`, `import`,
+`init`, `schema`, `cache`, and `audit`. Their absence is deliberate and is not a
+gap to route around — the correct response to needing one is to ask the
+operator. `config` and `import` are permanently excluded (they would let a
+caller repoint which store answers, or move every secret into a store the
+boundary does not own). The other four are open operator questions; do not
+assume their absence is either permanent or arbitrary.
 
 ## How to Run
 
-Invoke through `terminal` with a short non-secret reason:
+Every operation except `audit-verify`, `doctor`, and the lifecycle commands
+takes a short, non-secret `--reason`.
 
 ```bash
 sudo-secretspec run --reason "query provider API" -- command args...
 sudo-secretspec get NAME --reason "inspect managed credential"
 sudo-secretspec set NAME --reason "rotate managed credential"
 sudo-secretspec check --reason "validate required credentials"
+sudo-secretspec template-check --reason "confirm manifest matches declarations"
+sudo-secretspec audit-verify
 ```
+
+## Declaration lifecycle
+
+Tracked Git content contains declarations only. Two routes exist, and the right
+one depends on whether the name is meant to persist:
+
+- **Persistent name:** mirror the declaration into the tracked declarations file
+  through review and release. This is the durable path.
+- **Runtime declaration:** `add` writes the runtime manifest immediately, so the
+  manifest goes ahead of the tracked declarations and `template-check` reports
+  drift until you either mirror it through release or undo it.
+
+```bash
+sudo-secretspec add NAME --description "what it is" --reason "purpose"
+sudo-secretspec set NAME --reason "purpose"
+# undo, in this order:
+sudo-secretspec delete NAME --reason "purpose"
+sudo-secretspec undeclare NAME --reason "purpose"
+```
+
+`--description` is required by `add` and may not be empty. `undeclare` refuses a
+name present in the tracked declarations file (removing one of those is a
+review-and-release decision) and refuses a name that still holds a value, so
+`delete` must come first. Those two guards mean `undeclare` can only ever move
+the runtime manifest back toward the template. Removing a *tracked* declaration
+is never a runtime action.
+
+The broker rolls manifest and value mutations back on failure, and records an
+explicit `unknown` terminal state if restoration cannot be proven.
 
 ## Procedure
 
-1. Confirm the name already exists in released declarations. If absent, stop and request the declaration PR/release/deploy lifecycle; do not create an alternate manifest.
-2. Prefer `run` for consumers so values do not enter command arguments, source files, or shell history. Completion: the child receives its environment without value output in the agent transcript.
-3. Use `add`, `set`, `delete`, or `get` only through `sudo-secretspec`, with a non-secret reason. Completion: the command returns success and the audit ledger records a terminal outcome.
-4. On any broker, audit, authorization, or drift failure, stop and report only the non-secret error. Completion: no fallback store, manifest, provider, symlink, copy, permission change, or repair was attempted.
+1. Prefer `run` for consumers so values never enter command arguments, source
+   files, or shell history. Completion: the child receives its environment with
+   no value in the agent transcript.
+2. If the name is not yet declared, decide between the release path and a
+   runtime `add` per Declaration lifecycle above. A runtime `add` obliges you to
+   either mirror it or `undeclare` it — do not leave unexplained drift behind.
+3. Use `add`, `undeclare`, `set`, `delete`, or `get` only through
+   `sudo-secretspec`, always with a non-secret reason. Completion: the command
+   returns success and the audit ledger records a terminal outcome.
+4. On any broker, audit, authorization, or drift failure, stop and report only
+   the non-secret error. Completion: no fallback store, manifest, provider,
+   symlink, copy, permission change, or repair was attempted.
 
 ## Pitfalls
 
-- Permission denied while inspecting a `0700` store is expected and does not mean files are missing.
-- Reasons are hashed in the protected broker ledger but may reach SecretSpec’s native reason interface; never put values in them.
-- Client labels are correlation hints, not authenticated AI identities.
+- **`get` and `export` stream values straight to your stdout.** `export` writes
+  a JSON object of every declared name→value pair. Never print either into a
+  transcript, log, or tool output — parse and assert on keys. The client
+  deliberately does not capture this stream, so redaction is entirely on the
+  caller.
+- **`check` reports to stderr, not stdout.** An empty stdout is not a pass; read
+  the exit status.
+- **Lifecycle commands authenticate even under `--dry-run`.** `install`,
+  `uninstall`, and `rollback` re-exec through interactive `sudo` before the
+  dry-run flag is ever considered, under `timestamp_timeout=0`. Every
+  invocation costs a fresh Touch ID prompt. Never put one in a loop or an
+  unattended script.
+- **`template-check` is a raw byte comparison**, not a semantic one. Formatting
+  changes register as drift.
+- **`install --declarations` does not prune.** It is not a cleanup route for a
+  runtime declaration; `undeclare` is.
+- Permission denied while inspecting a `0700` store is expected and does not
+  mean files are missing.
+- Reasons are hashed in the protected broker ledger but may reach SecretSpec's
+  native reason interface; never put values in them.
+- Client labels are correlation hints, not authenticated AI identities. Every
+  authorized local caller may use every managed credential — the boundary gives
+  integrity, single-control-plane enforcement, least-privilege file access, and
+  value-free audit, not per-secret confidentiality between callers.
 - An alert-only watchdog must never repair state.
-- `install` and `rollback` are not available through the NOPASSWD broker path; they require interactive operator authentication through `/usr/local/bin/sudo-secretspec`.
-- `run` intentionally exposes the declared environment to its child; this deployment model authorizes every local caller for every declared credential.
+- `install`, `uninstall`, and `rollback` are not available through the NOPASSWD
+  broker path. Never run `uninstall` to work around a failed check, and never
+  pass `--purge-vault` or `--remove-service-user`.
 
 ## Verification
-
-Run through `terminal`:
 
 ```bash
 sudo-secretspec doctor
 ```
 
-Success requires a zero exit status. Findings marked `[advisory]` — vault clutter and a leftover mutation backup — do not fail the check; report them and continue. Any `[error]` finding is a hard stop. Do not run `install` or `rollback` merely to verify a normal credential operation.
+Success requires a zero exit status. Some findings are advisory and still exit
+zero — report them to the operator and continue.
 
-See `sudo-secretspec/AI-GUIDANCE.md` in the distribution for the complete policy contract.
+**Read the `advisory` field on each finding rather than matching code names.**
+That list has grown twice already; at 0.19.1-sudo.10 it is
+`LEGACY_VAULT_CLUTTER`, `PENDING_ROLLBACK`, `CLIENT_DUPLICATE`, and the three
+`SUDOERS_NEIGHBOUR_*` codes, but treating those names as the definition is how
+this instruction goes stale. Any non-advisory finding is a hard stop.
+
+`CLIENT_SHADOWED` is always a hard stop and must not be worked around: it means
+a different `sudo-secretspec` would run instead of the installed client, so no
+operation you performed can be trusted to have reached the boundary. Report the
+reported path to the operator.
+
+Do not run `install` or `rollback` merely to verify a normal credential
+operation.
+
+See `sudo-secretspec/AI-GUIDANCE.md` in the distribution for the complete policy
+contract, including the audit ledger's tamper-evidence limits and the client's
+non-zeroization of values in memory.

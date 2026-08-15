@@ -136,6 +136,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It was previously allowed to fall through to the caller's user-global
   SecretSpec config. Existing configuration files without the key keep
   working.
+- The bundled agent skill (`skills/sudo-secretspec/SKILL.md`) now documents the
+  full mediated surface — `add`, `undeclare`, `export`, `template-check`, and
+  `audit-verify` were missing — along with the six engine subcommands that are
+  deliberately not exposed, the runtime declaration lifecycle and its `delete`
+  then `undeclare` inverse, and the hazards worth knowing before the first
+  command: `get`/`export` stream values to stdout, `check` reports to stderr,
+  and every lifecycle command authenticates even under `--dry-run`. It also now
+  tells readers to check each `doctor` finding's `advisory` field instead of
+  matching a hardcoded list of codes, and flags `CLIENT_SHADOWED` as a hard
+  stop.
 
 ### Fixed
 
