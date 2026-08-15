@@ -289,6 +289,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `packaging/` and `tests/sudo_packaging/` are now formatted the way CI checks
   them. `ruff format --check` runs there on every pull request and had never
   passed.
+- `v0.19.1-sudo.6` is superseded by `v0.19.1-sudo.7` and should not be used to
+  install or adopt a boundary; its installer carries the vault-detection bug
+  below. Nothing else in `.6` is affected, and an already-installed boundary is
+  unharmed — the bug only fires while `install` is choosing what to adopt.
+
 - `sudo-secretspec install --adopt-existing` now adopts the vault the installed
   boundary actually serves from, by reading the protected config, instead of
   guessing from a fixed list of directory names that put the retired
