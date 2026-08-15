@@ -289,6 +289,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `packaging/` and `tests/sudo_packaging/` are now formatted the way CI checks
   them. `ruff format --check` runs there on every pull request and had never
   passed.
+- The workspace's own `secretspec` and `secretspec-derive` dependency
+  requirements are stamped with the release version again. The `0.19.1-sudo.5`
+  bump moved `workspace.package.version` but left both requirements naming
+  `0.19.1-sudo.4`; every earlier downstream release had moved them together.
+  The build was unaffected, since the stale requirement still admitted the
+  newer version, but the manifest advertised a version the workspace no longer
+  contained.
 
 ## [0.19.1] - 2026-08-11
 
