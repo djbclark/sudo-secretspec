@@ -168,9 +168,9 @@ def test_the_real_formula_has_exactly_the_expected_version_sites(release):
     after the rewriter was written, and nothing tied the two together.
     """
     text = release.FORMULA.read_text(encoding="utf-8")
-    assert (
-        len(release.ANY_VERSION_RE.findall(text)) == release.FORMULA_VERSION_SITES
-    ), text
+    assert len(release.ANY_VERSION_RE.findall(text)) == release.FORMULA_VERSION_SITES, (
+        text
+    )
 
 
 def test_preflight_validates_branch_remotes_lineage_and_fork(monkeypatch, release):
@@ -404,7 +404,9 @@ def test_preflight_rejects_wrong_fork_parent(monkeypatch, release):
         release.preflight(workspace_release(release), allow_dirty=False)
 
 
-def test_dry_run_lists_remote_actions_without_running(monkeypatch, release, capsys, cut):
+def test_dry_run_lists_remote_actions_without_running(
+    monkeypatch, release, capsys, cut
+):
     monkeypatch.setattr(release, "preflight", lambda _release, **kwargs: None)
     monkeypatch.setattr(release, "run_tests", lambda **kwargs: None)
     assert release.main(["--version", cut.version, "--dry-run", "--skip-tests"]) == 0
@@ -543,6 +545,7 @@ def test_interruption_cleanup_never_deletes_pushed_tag(monkeypatch, release):
         release, "run", lambda argv, **kwargs: calls.append(argv) or completed(argv)
     )
     release.cleanup_interrupted(
-        cut, release.CleanupState(tag_created=True, tag_pushed=True, formula_changed=False)
+        cut,
+        release.CleanupState(tag_created=True, tag_pushed=True, formula_changed=False),
     )
     assert calls == []

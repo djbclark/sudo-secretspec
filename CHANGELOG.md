@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with declaration auto-detection and TTY prompts; long flags are overrides.
 - Fork docs: `sudo-secretspec/README.md`, `README.downstream.md`, `FORK-AI.md`.
 
+
 - The project moved from `djbclark/sudo-secretspec` to
   `frdminc/sudo-secretspec`, and its Homebrew tap from
   `djbclark/homebrew-sudo-secretspec` to `frdminc/homebrew-sudo-secretspec`.
@@ -258,6 +259,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `run` no longer panics when the environment contains non-UTF-8 variables.
 - A failed terminal audit append now exits 126 and reports the operation's real
   result code instead of masking it as a generic policy error.
+- The downstream release workflow's tag trigger was pinned to the single
+  literal `v0.19.1-djbclark.1`, so it fired exactly once in its entire history:
+  `.2`, `.3`, `-sudo.4` and `-sudo.5` all published with the tag leg silently
+  skipped. It now matches every downstream release tag, and its identity check
+  asserts the tag names the version the workspace is actually stamped with —
+  the same invariant `packaging/release.py` enforces in preflight, and the one
+  that would have caught `v0.19.1-sudo.4` shipping uninstallable.
+- `packaging/` and `tests/sudo_packaging/` are now formatted the way CI checks
+  them. `ruff format --check` runs there on every pull request and had never
+  passed.
 
 ## [0.19.1] - 2026-08-11
 

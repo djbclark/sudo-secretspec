@@ -95,7 +95,9 @@ class Release:
 
     @property
     def title(self) -> str:
-        return f"SecretSpec {UPSTREAM_VERSION} — sudo-secretspec downstream {self.serial}"
+        return (
+            f"SecretSpec {UPSTREAM_VERSION} — sudo-secretspec downstream {self.serial}"
+        )
 
     @property
     def archive_url(self) -> str:
@@ -281,7 +283,9 @@ def rewrite_formula(path: Path, release: Release, sha256: str) -> None:
             f"expected {FORMULA_VERSION_SITES} downstream version references in {path}, "
             f"rewrote {versions}"
         )
-    text, hashes = re.subn(r'sha256 "[0-9a-f]{64}"', f'sha256 "{sha256}"', text, count=1)
+    text, hashes = re.subn(
+        r'sha256 "[0-9a-f]{64}"', f'sha256 "{sha256}"', text, count=1
+    )
     if hashes != 1:
         raise ReleaseError(f"failed to rewrite exactly one checksum in {path}")
     # The version substitution above is textual; confirm it actually produced
@@ -447,8 +451,7 @@ def verify_readback(release: Release, prefix: str) -> None:
         )
     )
     _require(
-        published
-        == {"tagName": release.tag, "name": release.title, "isDraft": False},
+        published == {"tagName": release.tag, "name": release.title, "isDraft": False},
         "release readback mismatch",
     )
     version = output([str(Path(prefix) / "bin" / "secretspec"), "--version"])

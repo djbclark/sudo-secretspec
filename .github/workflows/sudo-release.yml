@@ -14,7 +14,13 @@ on:
       - "CHANGELOG.md"
   push:
     tags:
-      - "v0.19.1-djbclark.1"
+      # Every downstream release tag, not one literal. This was pinned to
+      # "v0.19.1-djbclark.1" and so fired exactly once, in the entire history
+      # of the workflow -- .2, .3, sudo.4 and sudo.5 all published with the tag
+      # leg silently skipped. The djbclark spelling stays because those tags
+      # exist; it is the old version serial, not the org.
+      - "v0.19.1-sudo.*"
+      - "v0.19.1-djbclark.*"
   workflow_dispatch:
 
 permissions:
@@ -53,8 +59,14 @@ jobs:
         run: |
           ruby -c packaging/homebrew/sudo-secretspec.rb
           brew style packaging/homebrew/sudo-secretspec.rb
-      - name: Verify pinned tag identity
+      # A tag must name the version the workspace is actually stamped with.
+      # This is the same invariant `packaging/release.py` enforces in preflight;
+      # asserting it here catches a tag pushed by hand, which is exactly how
+      # v0.19.1-sudo.4 shipped uninstallable.
+      - name: Verify tag matches the stamped workspace version
         if: github.ref_type == 'tag'
-        env:
-          EXPECTED_TAG: v0.19.1-djbclark.1
-        run: test "$GITHUB_REF_NAME" = "$EXPECTED_TAG"
+        run: |
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml)"
+          test -n "$version" || { echo "could not read workspace version"; exit 1; }
+          echo "tag=$GITHUB_REF_NAME workspace=$version"
+          test "$GITHUB_REF_NAME" = "v$version"
