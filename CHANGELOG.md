@@ -121,6 +121,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The Homebrew formula now declares `sqlite` and `pkg-config` as build
+  dependencies. The companion builds `rusqlite` against the system SQLite
+  rather than the bundled copy, so both are genuine build inputs; without them
+  a `brew install` from the tap failed at build time on a host that happened
+  not to have them. The formula also declares `depends_on :macos`, since the
+  privileged boundary it installs targets macOS paths and there is nothing for
+  it to do on Linux.
+- `Cargo.lock` now matches the workspace version. The `0.19.1-sudo.4` bump
+  updated `Cargo.toml` but not the lockfile, and because the formula builds
+  with `cargo install --locked`, an install from that tag aborted before
+  compiling anything.
+
 - Corrected the documented tamper-evidence of the audit ledger, in
   `AI-GUIDANCE.md` and in the library's own notes. Both said truncating the
   tail was detectable "because every event commits with the singleton `head`

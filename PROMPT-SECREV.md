@@ -164,9 +164,9 @@ cargo test -p sudo-secretspec-cli
 Post findings as PR comments on https://github.com/djbclark/sudo-secretspec/pull/1
 
 Tag:
-- `���� SECURITY` — exploitable / invariant violation
-- `���� ADVISORY` — hardening / defense-in-depth
-- `���� OK` — invariant holds
+- `[SECURITY]` — exploitable / invariant violation
+- `[ADVISORY]` — hardening / defense-in-depth
+- `[OK]` — invariant holds
 
 ---
 

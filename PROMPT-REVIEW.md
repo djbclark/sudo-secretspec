@@ -123,7 +123,7 @@ See PR diff. Key new files:
 ## How to Deliver Review
 
 Post findings as PR comments on https://github.com/djbclark/sudo-secretspec/pull/1  
-Tag security-critical items with `���� SECURITY`, advisory with `���� ADVISORY`.
+Tag security-critical items with `[SECURITY]`, advisory with `[ADVISORY]`.
 
 ---
 

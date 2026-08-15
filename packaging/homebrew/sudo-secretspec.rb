@@ -13,7 +13,16 @@ class SudoSecretspec < Formula
   license "Apache-2.0"
   head "https://github.com/djbclark/sudo-secretspec.git", branch: "sudo-main"
 
+  depends_on "pkg-config" => :build
   depends_on "rust" => :build
+  # The companion builds rusqlite against the system SQLite rather than the
+  # bundled copy, which hangs in libsqlite3-sys on macOS. That makes sqlite and
+  # pkg-config real build inputs: CI installs them by hand, and a tap install
+  # would otherwise fail at link time on a host without them.
+  depends_on "sqlite" => :build
+  # install.rs targets /private/etc and the sudoers boundary it manages is
+  # macOS-only, so there is nothing for this formula to do on Linux.
+  depends_on :macos
 
   def install
     system "cargo", "install", "--locked", "--root", prefix, "--path", "secretspec"
