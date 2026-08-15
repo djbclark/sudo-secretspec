@@ -47,7 +47,7 @@ def workspace_release(release):
     tests that are not about the version.
     """
     text = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
-    match = re.search(r'version = "(\d+\.\d+\.\d+-djbclark\.\d+)"', text)
+    match = re.search(r'version = "(\d+\.\d+\.\d+-sudo\.\d+)"', text)
     assert match, "workspace Cargo.toml is not stamped with a downstream version"
     return release.parse_release(match.group(1))
 
@@ -75,14 +75,14 @@ PREFLIGHT_GIT_OUTPUTS = {
 
 
 def test_release_identity_is_derived_from_the_serial(release, cut):
-    cut = release.parse_release("0.19.1-djbclark.2")
-    assert cut.serial == 2
-    assert cut.version == "0.19.1-djbclark.2"
-    assert cut.tag == "v0.19.1-djbclark.2"
-    assert cut.title == "SecretSpec 0.19.1 — sudo-secretspec downstream 2"
+    cut = release.parse_release("0.19.1-sudo.5")
+    assert cut.serial == 5
+    assert cut.version == "0.19.1-sudo.5"
+    assert cut.tag == "v0.19.1-sudo.5"
+    assert cut.title == "SecretSpec 0.19.1 — sudo-secretspec downstream 5"
     assert cut.archive_url == (
         "https://github.com/djbclark/sudo-secretspec/archive/refs/tags/"
-        "v0.19.1-djbclark.2.tar.gz"
+        "v0.19.1-sudo.5.tar.gz"
     )
 
 
@@ -90,12 +90,16 @@ def test_only_downstream_versions_on_the_pinned_upstream_base_are_accepted(relea
     # The upstream base stays a constant: rebasing onto a new upstream tag is a
     # separate decision, not something a --version argument may do implicitly.
     for bad in (
-        "0.20.0-djbclark.1",
+        "0.20.0-sudo.1",
         "0.19.1",
-        "v0.19.1-djbclark.1",
-        "0.19.1-djbclark.0",
-        "0.19.1-djbclark.01",
+        "v0.19.1-sudo.1",
+        "0.19.1-sudo.0",
+        "0.19.1-sudo.01",
         "0.19.1-other.1",
+        # The pre-rename spelling is no longer a version this script may cut.
+        # It still has to be *recognized* when restamping a formula, which is
+        # ANY_VERSION_RE's job, not parse_release's.
+        "0.19.1-djbclark.4",
         "",
     ):
         with pytest.raises(release.ReleaseError):
@@ -104,7 +108,7 @@ def test_only_downstream_versions_on_the_pinned_upstream_base_are_accepted(relea
 
 def test_https_release_url_guard(release):
     release.validate_release_url(
-        "https://github.com/djbclark/sudo-secretspec/archive/refs/tags/v0.19.1-djbclark.1.tar.gz"
+        "https://github.com/djbclark/sudo-secretspec/archive/refs/tags/v0.19.1-sudo.1.tar.gz"
     )
     for url in ("http://github.com/x", "file:///tmp/x", "https://example.com/x"):
         with pytest.raises(release.ReleaseError):
@@ -127,13 +131,15 @@ def test_formula_rewrite_restamps_every_version_site(tmp_path: Path, release, cu
         "  end\n",
         encoding="utf-8",
     )
-    cut = release.parse_release("0.19.1-djbclark.2")
+    cut = release.parse_release("0.19.1-sudo.5")
 
     release.rewrite_formula(formula, cut, "a" * 64)
 
     text = formula.read_text(encoding="utf-8")
+    # The fixture is deliberately on the pre-rename spelling: a formula carried
+    # across the djbclark -> sudo rename must be restamped, not left behind.
     assert "0.19.1-djbclark.1" not in text, text
-    assert text.count("0.19.1-djbclark.2") == release.FORMULA_VERSION_SITES
+    assert text.count("0.19.1-sudo.5") == release.FORMULA_VERSION_SITES
     assert f'url "{cut.archive_url}"' in text
     assert f'sha256 "{"a" * 64}"' in text
 
@@ -150,7 +156,7 @@ def test_formula_rewrite_refuses_an_unexpected_number_of_version_sites(
     )
     with pytest.raises(release.ReleaseError, match="version references"):
         release.rewrite_formula(
-            formula, release.parse_release("0.19.1-djbclark.2"), "a" * 64
+            formula, release.parse_release("0.19.1-sudo.5"), "a" * 64
         )
 
 
@@ -226,7 +232,7 @@ def test_preflight_refuses_a_serial_that_is_already_published(monkeypatch, relea
 
     def fake_run(argv, **kwargs):
         if argv[:2] == ["git", "ls-remote"]:
-            return completed(argv, "9f4c…\trefs/tags/v0.19.1-djbclark.9\n")
+            return completed(argv, "9f4c…\trefs/tags/v0.19.1-sudo.9\n")
         if argv[:4] == ["gh", "repo", "view", "djbclark/sudo-secretspec"]:
             return completed(
                 argv,
@@ -263,7 +269,50 @@ def test_preflight_refuses_a_workspace_stamped_at_another_version(monkeypatch, r
     monkeypatch.setattr(release, "run", fake_run)
     # A serial nobody will ever cut, so it cannot match the real Cargo.toml.
     with pytest.raises(release.ReleaseError, match="bump Cargo.toml"):
-        release.preflight(release.parse_release("0.19.1-djbclark.999"), allow_dirty=False)
+        release.preflight(release.parse_release("0.19.1-sudo.999"), allow_dirty=False)
+
+
+def test_preflight_refuses_a_lockfile_that_disagrees_with_the_manifest(
+    monkeypatch, release
+):
+    """The guard that v0.19.1-sudo.4 shipped without.
+
+    That release bumped Cargo.toml and left Cargo.lock naming the previous
+    version. The formula builds with `cargo install --locked`, so the published
+    tag aborted before compiling anything. `cargo metadata --locked` is the
+    cheapest way to ask, and asking in preflight means the failure lands before
+    a tag exists rather than after it is public.
+    """
+
+    def fake_run(argv, **kwargs):
+        if argv[:2] == ["cargo", "metadata"]:
+            assert "--locked" in argv
+            assert kwargs.get("check") is False, "must not raise past the guard"
+            return completed(argv, returncode=101)
+        if argv[:4] == ["gh", "repo", "view", "djbclark/sudo-secretspec"]:
+            return completed(
+                argv,
+                json.dumps(
+                    {
+                        "nameWithOwner": "djbclark/sudo-secretspec",
+                        "parent": {"nameWithOwner": "cachix/secretspec"},
+                        "defaultBranchRef": {"name": "sudo-main"},
+                    }
+                ),
+            )
+        return completed(argv, PREFLIGHT_GIT_OUTPUTS.get(tuple(argv), ""))
+
+    monkeypatch.setattr(release, "run", fake_run)
+    with pytest.raises(release.ReleaseError, match="Cargo.lock is out of date"):
+        release.preflight(workspace_release(release), allow_dirty=False)
+
+
+def test_any_version_re_matches_both_downstream_spellings(release):
+    """Restamping must recognize the pre-rename spelling as well as the current
+    one, or a formula carried across the rename keeps its stale version."""
+    assert release.ANY_VERSION_RE.findall(
+        'url ".../v0.19.1-djbclark.3.tar.gz"\nversion "0.19.1-sudo.4"\n'
+    ) == ["0.19.1-djbclark.3", "0.19.1-sudo.4"]
 
 
 def test_parent_slug_accepts_every_gh_parent_shape(release):

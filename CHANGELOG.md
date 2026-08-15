@@ -131,7 +131,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Cargo.lock` now matches the workspace version. The `0.19.1-sudo.4` bump
   updated `Cargo.toml` but not the lockfile, and because the formula builds
   with `cargo install --locked`, an install from that tag aborted before
-  compiling anything.
+  compiling anything. `v0.19.1-sudo.4` is superseded and should not be
+  installed; use `v0.19.1-sudo.5` or later. The release helper now refuses to
+  cut a version whose lockfile disagrees with the manifest, and it understands
+  the `-sudo.N` serial that `0.19.1-sudo.4` renamed to.
 
 - Corrected the documented tamper-evidence of the audit ledger, in
   `AI-GUIDANCE.md` and in the library's own notes. Both said truncating the

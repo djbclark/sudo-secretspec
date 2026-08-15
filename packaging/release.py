@@ -46,9 +46,18 @@ FORMULA_REL = Path("packaging/homebrew/sudo-secretspec.rb")
 FORMULA = ROOT / FORMULA_REL
 DEFAULT_TAP = Path.home() / "src" / "homebrew-sudo-secretspec"
 FORMULA_NAME = "djbclark/sudo-secretspec/sudo-secretspec"
-VERSION_RE = re.compile(rf"^{re.escape(UPSTREAM_VERSION)}-djbclark\.([1-9][0-9]*)$")
+# The downstream serial's prefix. Releases through 0.19.1-djbclark.3 used
+# "djbclark"; everything from 0.19.1-sudo.4 on uses "sudo".
+DOWNSTREAM_SUFFIX = "sudo"
+VERSION_RE = re.compile(
+    rf"^{re.escape(UPSTREAM_VERSION)}-{DOWNSTREAM_SUFFIX}\.([1-9][0-9]*)$"
+)
 # Any downstream version, anywhere in a file. Used to restamp the formula.
-ANY_VERSION_RE = re.compile(rf"{re.escape(UPSTREAM_VERSION)}-djbclark\.[0-9]+")
+# Both spellings, because a formula carried over from before the rename still
+# names the old one and has to be restamped rather than silently left behind.
+ANY_VERSION_RE = re.compile(
+    rf"{re.escape(UPSTREAM_VERSION)}-(?:{DOWNSTREAM_SUFFIX}|djbclark)\.[0-9]+"
+)
 # Places the formula names its own version: the source `url`, the explicit
 # `version` stanza, and both `brew test` assertions. Pinned as a count so that
 # adding a fifth site fails this script loudly instead of shipping a formula
@@ -74,7 +83,7 @@ class Release:
 
     @property
     def version(self) -> str:
-        return f"{UPSTREAM_VERSION}-djbclark.{self.serial}"
+        return f"{UPSTREAM_VERSION}-{DOWNSTREAM_SUFFIX}.{self.serial}"
 
     @property
     def tag(self) -> str:
@@ -122,8 +131,8 @@ def parse_release(version: str) -> Release:
     match = VERSION_RE.fullmatch(version)
     if not match:
         raise ReleaseError(
-            f"downstream version must be {UPSTREAM_VERSION}-djbclark.N with N >= 1, "
-            f"got {version!r}"
+            f"downstream version must be {UPSTREAM_VERSION}-{DOWNSTREAM_SUFFIX}.N "
+            f"with N >= 1, got {version!r}"
         )
     return Release(serial=int(match.group(1)))
 
@@ -187,6 +196,21 @@ def preflight(release: Release, *, allow_dirty: bool) -> None:
         f'version = "{release.version}"'
         in (ROOT / "Cargo.toml").read_text(encoding="utf-8"),
         f"workspace is not stamped {release.version}; bump Cargo.toml first",
+    )
+    # Cargo.lock records every workspace member's version, so bumping Cargo.toml
+    # without regenerating the lock leaves the two disagreeing. The formula
+    # builds with `cargo install --locked`, which refuses that tree outright, so
+    # the tag installs nowhere. This is exactly how v0.19.1-sudo.4 shipped
+    # broken; catch it here, before a tag exists to be un-published.
+    _require(
+        run(
+            ["cargo", "metadata", "--locked", "--format-version", "1"],
+            check=False,
+        ).returncode
+        == 0,
+        f"Cargo.lock is out of date for {release.version}; run `cargo check` to "
+        "regenerate it and commit the result, or the published tag will fail "
+        "`cargo install --locked`",
     )
     # Catch a re-used serial here rather than after the test suite has run and
     # a local tag already exists. The remote is the authority: a serial can be
@@ -477,7 +501,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--version",
         required=True,
-        help=f"downstream version to cut, e.g. {UPSTREAM_VERSION}-djbclark.2",
+        help=f"downstream version to cut, e.g. {UPSTREAM_VERSION}-{DOWNSTREAM_SUFFIX}.5",
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--allow-dirty", action="store_true")
