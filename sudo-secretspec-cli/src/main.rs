@@ -35,8 +35,10 @@ enum Cmd {
     /// Declare a new secret in the runtime manifest.
     ///
     /// Creates the declaration only; it assigns no value. Follow with `set`.
-    /// Mirror the declaration into the tracked declarations file and release
-    /// it, or `template-check` will report the drift.
+    ///
+    /// This edits the runtime manifest immediately, so `template-check` will
+    /// report drift until you either mirror the declaration into the tracked
+    /// declarations file and release it, or undo it with `undeclare`.
     Add {
         name: String,
         /// Human description recorded in the declaration.
@@ -51,6 +53,16 @@ enum Cmd {
         reason: String,
     },
     Delete {
+        name: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Remove a declaration this client added at runtime.
+    ///
+    /// The inverse of `add`. Refuses a name that is in the tracked declaration
+    /// template — removing one of those is a review-and-release decision — and
+    /// refuses a name that still holds a value, so `delete` comes first.
+    Undeclare {
         name: String,
         #[arg(long)]
         reason: String,
@@ -220,6 +232,7 @@ fn main() {
         } => lifecycle_add(&name, &description, &reason),
         Cmd::Set { name, reason } => lifecycle("set", &name, &reason),
         Cmd::Delete { name, reason } => lifecycle("delete", &name, &reason),
+        Cmd::Undeclare { name, reason } => lifecycle("undeclare", &name, &reason),
         Cmd::Get { name, reason } => lifecycle("get", &name, &reason),
         Cmd::Check { reason } => lifecycle("check", "", &reason),
         Cmd::Export { reason } => lifecycle("export", "", &reason),

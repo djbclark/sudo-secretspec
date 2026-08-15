@@ -54,6 +54,7 @@ fn help_exposes_typed_boundary_commands() {
         "export",
         "template-check",
         "audit-verify",
+        "undeclare",
         "run",
         "install",
         "uninstall",
@@ -112,4 +113,30 @@ fn add_rejects_an_empty_description() {
         .output()
         .expect("run sudo-secretspec");
     assert!(!output.status.success(), "add accepted a blank description");
+}
+
+#[test]
+fn undeclare_requires_a_reason() {
+    let output = binary()
+        .args(["undeclare", "SOME_SECRET"])
+        .output()
+        .expect("run sudo-secretspec");
+    assert!(!output.status.success(), "undeclare ran without --reason");
+}
+
+#[test]
+fn add_and_undeclare_are_a_matched_pair() {
+    // The asymmetry this subcommand exists to fix: `add` mutates the runtime
+    // manifest on the cheap NOPASSWD path, and until `undeclare` there was no
+    // way back on that same path -- `delete` removes a value and leaves the
+    // declaration standing. An agent could dirty the manifest with an
+    // unprivileged call and then need an operator at a Touch ID prompt to undo
+    // it. Both must stay reachable from the same surface.
+    let output = binary()
+        .arg("--help")
+        .output()
+        .expect("run sudo-secretspec");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("add"), "add missing");
+    assert!(stdout.contains("undeclare"), "undeclare missing");
 }

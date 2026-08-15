@@ -289,6 +289,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `packaging/` and `tests/sudo_packaging/` are now formatted the way CI checks
   them. `ruff format --check` runs there on every pull request and had never
   passed.
+- `sudo-secretspec undeclare NAME --reason <why>` removes a declaration this
+  client added at runtime — the inverse `add` never had. `add` edits the runtime
+  manifest immediately over the unprivileged NOPASSWD broker path, but `delete`
+  only removes a *value*, so a declaration added at runtime could previously be
+  undone only by an operator at an interactive authentication prompt. The cheap
+  operation was one-way, and the drift it left fails `template-check`, which
+  deployments call before publishing.
+
+  Two guards keep it from becoming a way to edit policy. A name present in the
+  tracked declaration template is refused, because removing one of those stays a
+  review-and-release decision; and a name that still holds a value is refused,
+  because undeclaring it would strand the value in the store with nothing
+  declaring it. So teardown mirrors setup: `add` then `set`, `delete` then
+  `undeclare`, and the runtime manifest can only ever move back toward the
+  tracked template. The edit preserves surrounding formatting, so undoing an
+  `add` restores the manifest byte for byte — which is what `template-check`
+  compares.
+
 - Documentation that gave wrong instructions is corrected. `packaging/README.md`
   described the downstream version scheme as `0.19.1-djbclark.N` and its three
   copy-pasteable `release.py` examples used it — every one of them fails now,

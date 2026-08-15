@@ -5,7 +5,7 @@ Use this policy in `AGENTS.md`, skills, runbooks, and autonomous-agent prompts f
 ## Required behavior
 
 - Use only the installed `/usr/local/bin/sudo-secretspec` client for credential CRUD and use.
-- Supply a short operational `--reason` for every `add`, `set`, `delete`, `get`, `check`, `export`, `template-check`, or `run` operation. `add` additionally requires `--description`: it declares a secret, it does not set a value. The protected audit ledger stores only its SHA-256 digest.
+- Supply a short operational `--reason` for every `add`, `undeclare`, `set`, `delete`, `get`, `check`, `export`, `template-check`, or `run` operation. `add` additionally requires `--description`: it declares a secret, it does not set a value. The protected audit ledger stores only its SHA-256 digest.
 - Run a consumer as `sudo-secretspec run --reason "purpose" -- <command>` instead of extracting values into shell history or command arguments.
 - Treat an unavailable broker, failed audit append/verification, declaration mismatch, authorization failure, or non-advisory drift finding as a hard stop. `doctor` marks advisory findings — currently `LEGACY_VAULT_CLUTTER`, `PENDING_ROLLBACK`, `CLIENT_DUPLICATE`, and the three `SUDOERS_NEIGHBOUR_*` codes — and still exits zero; report them to the operator and continue. Read the `advisory` field rather than matching code names: that list has already grown twice, and this sentence is the wrong place to learn it has grown again.
 - Treat `CLIENT_SHADOWED` as a hard stop and do not work around it: it means a different `sudo-secretspec` would run instead of the installed client, so no operation you perform can be trusted to have reached the boundary. Report the reported path to the operator.
@@ -27,7 +27,7 @@ Never:
 
 ## Mediated surface
 
-The companion is not a wrapper around the whole engine. It exposes `add`, `set`,
+The companion is not a wrapper around the whole engine. It exposes `add`, `undeclare`, `set`,
 `delete`, `get`, `check`, `export`, `run`, `template-check`, `audit-verify`, and
 `doctor`, plus the operator-only lifecycle commands `install`, `uninstall`, and
 `rollback`. Six engine subcommands have **no** companion equivalent: `config`,
@@ -56,7 +56,7 @@ Do not assume their absence is permanent, and do not assume it is arbitrary.
 
 ## Declaration lifecycle
 
-Tracked Git content contains declarations only. A new name must first be reviewed and released in the declaration file. `sudo-secretspec add NAME --description "what it is" --reason "purpose"` declares the name in the runtime manifest and creates **no** value; `sudo-secretspec set NAME --reason "purpose"` then supplies one. Adding at runtime puts the manifest ahead of the tracked declarations, so mirror the declaration through review/release — `template-check` reports the drift until you do. Remove a declaration through review/release before `delete` removes its value. The broker rolls manifest/value mutations back on failure and records an explicit `unknown` terminal state if restoration cannot be proven.
+Tracked Git content contains declarations only. A new name must first be reviewed and released in the declaration file. `sudo-secretspec add NAME --description "what it is" --reason "purpose"` declares the name in the runtime manifest and creates **no** value; `sudo-secretspec set NAME --reason "purpose"` then supplies one. Adding at runtime puts the manifest ahead of the tracked declarations, so mirror the declaration through review/release — `template-check` reports the drift until you do. Removing a declaration that is in the tracked file stays a review/release decision. A declaration **you** added at runtime has a runtime inverse: `sudo-secretspec delete NAME --reason "purpose"` drops the value, then `sudo-secretspec undeclare NAME --reason "purpose"` drops the declaration, restoring the manifest and clearing the `template-check` drift your `add` created. `undeclare` refuses a name present in the tracked declarations file, and refuses a name that still holds a value, so it can only ever move the runtime manifest back toward the template. The broker rolls manifest/value mutations back on failure and records an explicit `unknown` terminal state if restoration cannot be proven.
 
 ## Security scope
 

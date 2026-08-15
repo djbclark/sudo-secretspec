@@ -445,6 +445,7 @@ fn run(broker: &Broker) -> Result<(), i32> {
         "source-get"
         | "source-set"
         | "source-add"
+        | "source-undeclare"
         | "source-delete"
         | "source-check"
         | "source-export"
@@ -698,6 +699,92 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                         "declaration added to the runtime manifest; mirror {name} into the \
                          tracked declarations and release it, or `template-check` will report drift"
                     );
+                    (0, vec![name.into()])
+                }
+                Err(e) => {
+                    eprintln!("broker: cannot write manifest: {e}");
+                    (1, vec![name.into()])
+                }
+            }
+        }
+        // The inverse of `source-add`, and deliberately narrower than it.
+        //
+        // `add` can only ever move the runtime manifest *away* from the tracked
+        // template, and until this existed nothing could move it back on the
+        // mediated path: `delete` removes a value and leaves the declaration
+        // standing. An agent could therefore dirty the manifest with an
+        // unprivileged NOPASSWD call and then need an operator at a Touch ID
+        // prompt to undo it, which is the wrong way round for a cheap operation
+        // to fail.
+        //
+        // Two guards keep this from becoming a way to edit policy:
+        //
+        // 1. A name present in the tracked declaration template is refused.
+        //    Those are Git content; removing one stays a review-and-release
+        //    decision, exactly as AI-GUIDANCE says. So this can only ever move
+        //    the manifest *toward* the template, never further from it.
+        // 2. A name that still resolves to a value is refused. Undeclaring it
+        //    would strand the value in the dotenv with nothing declaring it —
+        //    a secret on disk that no longer appears in `check`. `delete`
+        //    first, then undeclare; that mirrors `add` then `set`.
+        "source-undeclare" => {
+            let template = match std::fs::read_to_string(&cfg.declarations) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("broker: cannot read declaration template: {e}");
+                    return (2, vec![name.into()]);
+                }
+            };
+            // Fail closed: an unparseable template is not evidence that the
+            // name is absent from it, and this guard exists to protect exactly
+            // the names it might have failed to read.
+            match secretspec::manifest_edit::declares_secret(&template, &cfg.profile, name) {
+                Ok(true) => {
+                    eprintln!(
+                        "broker: {name} is in the tracked declaration template; remove it \
+                         through review and release, not at runtime"
+                    );
+                    return (1, vec![name.into()]);
+                }
+                Err(e) => {
+                    eprintln!("broker: cannot parse declaration template: {e}");
+                    return (2, vec![name.into()]);
+                }
+                Ok(false) => {}
+            }
+
+            if let Ok(secretspec::NamedResolution::Resolved(secret)) = secrets.resolve_named(name)
+                && secret.value.is_some()
+            {
+                eprintln!(
+                    "broker: {name} still holds a value; `delete` it first, or undeclaring would \
+                     leave the value in the store with nothing declaring it"
+                );
+                return (1, vec![name.into()]);
+            }
+
+            let source = match std::fs::read_to_string(&manifest) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("broker: cannot read manifest: {e}");
+                    return (2, vec![name.into()]);
+                }
+            };
+            let updated = match secretspec::manifest_edit::remove_secret_from_manifest(
+                &source,
+                &cfg.profile,
+                name,
+            ) {
+                Ok(updated) => updated,
+                Err(e) => {
+                    eprintln!("broker: {e}");
+                    return (1, vec![name.into()]);
+                }
+            };
+            // In place, for the same ownership reason as `source-add`.
+            match std::fs::write(&manifest, updated) {
+                Ok(()) => {
+                    println!("declaration removed from the runtime manifest");
                     (0, vec![name.into()])
                 }
                 Err(e) => {
