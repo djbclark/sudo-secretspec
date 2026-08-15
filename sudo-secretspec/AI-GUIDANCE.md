@@ -7,7 +7,7 @@ Use this policy in `AGENTS.md`, skills, runbooks, and autonomous-agent prompts f
 - Use only the installed `/usr/local/bin/sudo-secretspec` client for credential CRUD and use.
 - Supply a short operational `--reason` for every `add`, `set`, `delete`, `get`, `check`, `export`, `template-check`, or `run` operation. `add` additionally requires `--description`: it declares a secret, it does not set a value. The protected audit ledger stores only its SHA-256 digest.
 - Run a consumer as `sudo-secretspec run --reason "purpose" -- <command>` instead of extracting values into shell history or command arguments.
-- Treat an unavailable broker, failed audit append/verification, declaration mismatch, authorization failure, or non-advisory drift finding as a hard stop. `doctor` marks advisory findings — `LEGACY_VAULT_CLUTTER`, `PENDING_ROLLBACK`, and `CLIENT_DUPLICATE` — and still exits zero; report them to the operator and continue. Read the `advisory` field rather than matching code names, which grow over releases.
+- Treat an unavailable broker, failed audit append/verification, declaration mismatch, authorization failure, or non-advisory drift finding as a hard stop. `doctor` marks advisory findings — currently `LEGACY_VAULT_CLUTTER`, `PENDING_ROLLBACK`, `CLIENT_DUPLICATE`, and the three `SUDOERS_NEIGHBOUR_*` codes — and still exits zero; report them to the operator and continue. Read the `advisory` field rather than matching code names: that list has already grown twice, and this sentence is the wrong place to learn it has grown again.
 - Treat `CLIENT_SHADOWED` as a hard stop and do not work around it: it means a different `sudo-secretspec` would run instead of the installed client, so no operation you perform can be trusted to have reached the boundary. Report the reported path to the operator.
 - Report only the non-secret error and request operator action for boundary installation or repair.
 - Normal broker-mediated credential operations are autonomous when the installed sudoers policy allows them.
@@ -24,6 +24,35 @@ Never:
 - place secret values in reasons, logs, audit metadata, command arguments, issue text, commits, tests, or documentation;
 - treat inability to stat a `0700` store as evidence that files are absent;
 - use a watchdog or drift check to mutate or repair state.
+
+## Mediated surface
+
+The companion is not a wrapper around the whole engine. It exposes `add`, `set`,
+`delete`, `get`, `check`, `export`, `run`, `template-check`, `audit-verify`, and
+`doctor`, plus the operator-only lifecycle commands `install`, `uninstall`, and
+`rollback`. Six engine subcommands have **no** companion equivalent: `config`,
+`import`, `init`, `schema`, `cache`, and `audit`.
+
+Their absence is deliberate, not an oversight, and it is not a gap to route
+around. Combined with the rule above against invoking `secretspec` directly, the
+correct response to needing one of these is to ask the operator — never to reach
+past the boundary.
+
+Two must stay excluded, because exposing them would defeat the boundary rather
+than extend it:
+
+- **`config`** rewrites which provider and profile resolve. A caller who can
+  repoint those chooses which store answers, which is the single decision the
+  protected root-owned config exists to take away from the caller.
+- **`import`** copies values between providers. A caller who can name the
+  destination can move every managed secret into a store the boundary does not
+  own, which is exfiltration wearing the clothes of a migration.
+
+The remaining four are open questions for the operator rather than settled
+policy. `schema` is read-only and would be safe to expose. `init`, `cache`, and
+`audit` are judgement calls: each touches state the boundary owns, but none
+hands the caller the provider/profile choice the way `config` and `import` do.
+Do not assume their absence is permanent, and do not assume it is arbitrary.
 
 ## Declaration lifecycle
 

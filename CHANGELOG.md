@@ -289,6 +289,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `packaging/` and `tests/sudo_packaging/` are now formatted the way CI checks
   them. `ruff format --check` runs there on every pull request and had never
   passed.
+- `AI-GUIDANCE.md` now documents the companion's mediated surface. Six engine
+  subcommands have no companion equivalent — `config`, `import`, `init`,
+  `schema`, `cache`, `audit` — and nothing said so, or why, even though the same
+  document forbids invoking `secretspec` directly. An agent that needed one had
+  no guidance and every incentive to route around the boundary. `config` and
+  `import` are documented as permanently excluded, with the reason: one
+  repoints which provider and profile resolve, the other copies values to a
+  store the boundary does not own. The other four are recorded as open operator
+  questions rather than settled policy. The advisory-code list in the same file
+  was two releases stale and now names all six.
+
 - `import --delete-source` no longer promises a deletion the provider cannot
   perform. `Provider::delete` defaults to an unsupported-operation error, but
   `Provider::check_deletable` — the preflight that exists so an unsupported
