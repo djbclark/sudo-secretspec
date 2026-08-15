@@ -16,10 +16,13 @@ class SudoSecretspec < Formula
   depends_on "pkg-config" => :build
   depends_on "rust" => :build
   # The companion builds rusqlite against the system SQLite rather than the
-  # bundled copy, which hangs in libsqlite3-sys on macOS. That makes sqlite and
-  # pkg-config real build inputs: CI installs them by hand, and a tap install
-  # would otherwise fail at link time on a host without them.
-  depends_on "sqlite" => :build
+  # bundled copy, which hangs in libsqlite3-sys on macOS. pkg-config finds it at
+  # build time, and it resolves to Homebrew's sqlite rather than the one in
+  # /usr/lib -- `otool -L` on the installed companion shows a link against
+  # /opt/homebrew/opt/sqlite/lib/libsqlite3.dylib. So this is a runtime
+  # dependency, not just a build one: declaring it `=> :build` would let
+  # Homebrew remove sqlite and leave an installed binary that cannot start.
+  depends_on "sqlite"
   # install.rs targets /private/etc and the sudoers boundary it manages is
   # macOS-only, so there is nothing for this formula to do on Linux.
   depends_on :macos

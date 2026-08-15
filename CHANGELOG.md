@@ -121,13 +121,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The Homebrew formula now declares `sqlite` and `pkg-config` as build
-  dependencies. The companion builds `rusqlite` against the system SQLite
-  rather than the bundled copy, so both are genuine build inputs; without them
-  a `brew install` from the tap failed at build time on a host that happened
-  not to have them. The formula also declares `depends_on :macos`, since the
-  privileged boundary it installs targets macOS paths and there is nothing for
-  it to do on Linux.
+- The Homebrew formula now declares its SQLite dependencies. The companion
+  builds `rusqlite` against the system SQLite rather than the bundled copy, so
+  `pkg-config` is a build input and `sqlite` is a full runtime one — the
+  installed companion links `/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib`,
+  not the copy in `/usr/lib`, so removing Homebrew's sqlite would leave a
+  binary that cannot start. Previously neither was declared and a tap install
+  failed at build time on a host that happened not to have them. The formula
+  also declares `depends_on :macos`, since the privileged boundary it installs
+  targets macOS paths and there is nothing for it to do on Linux.
 - `Cargo.lock` now matches the workspace version. The `0.19.1-sudo.4` bump
   updated `Cargo.toml` but not the lockfile, and because the formula builds
   with `cargo install --locked`, an install from that tag aborted before
