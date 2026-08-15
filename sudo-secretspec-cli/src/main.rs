@@ -745,7 +745,7 @@ fn run_target(reason: &str, command: &[OsString]) {
         .arg("--reason-sha256")
         .arg(reason_digest_or_exit(reason))
         .arg("--command-basename")
-        .arg(target[0].to_str().unwrap_or("unknown"))
+        .arg(sudo_secretspec_cli::audit::command_basename(&target[0]))
         .output()
         .unwrap_or_else(|e| {
             eprintln!("cannot invoke broker: {e}");

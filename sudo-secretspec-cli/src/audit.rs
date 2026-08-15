@@ -263,6 +263,28 @@ fn is_valid_sha256_hex(s: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
+/// Basename the ledger records for a `run` target.
+///
+/// The counterpart to [`is_valid_command_basename`], and the only supported way
+/// to produce a value that satisfies it. The validator forbids separators, so a
+/// caller that forwards the invocation verbatim has every absolute path denied
+/// -- `run -- /bin/echo hi` failed with `audit denied: invalid command
+/// basename`, which is most real invocations.
+///
+/// A target with no usable final component degrades to `unknown` rather than
+/// failing the run. The ledger recording that a command ran and could not be
+/// named is worth more than refusing to run it: this value is a label for
+/// after-the-fact reading, never an authorization input.
+#[must_use]
+pub fn command_basename(target: &std::ffi::OsStr) -> String {
+    Path::new(target)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| is_valid_command_basename(name))
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 /// Manual validation: alphanumeric plus `_.+-`, 1-128 chars.
 fn is_valid_command_basename(s: &str) -> bool {
     let bytes = s.as_bytes();
@@ -955,6 +977,61 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+
+    fn basename_of(target: &str) -> String {
+        command_basename(std::ffi::OsStr::new(target))
+    }
+
+    #[test]
+    fn an_absolute_path_is_reduced_to_its_final_component() {
+        // The regression: the whole invocation was forwarded verbatim, and the
+        // validator rejects separators, so every absolute path was denied.
+        assert_eq!(basename_of("/bin/echo"), "echo");
+        assert_eq!(basename_of("/usr/local/bin/my-tool"), "my-tool");
+    }
+
+    #[test]
+    fn a_bare_command_is_unchanged() {
+        assert_eq!(basename_of("sh"), "sh");
+        assert_eq!(basename_of("cargo"), "cargo");
+    }
+
+    #[test]
+    fn every_produced_basename_satisfies_the_validator() {
+        // The two must agree by construction; that agreement is the whole point.
+        for target in [
+            "/bin/echo",
+            "sh",
+            "./local-tool",
+            "../up/tool",
+            "/weird/name with spaces",
+            "/",
+            "..",
+            "",
+            "/usr/bin/tool.v2+build-1",
+        ] {
+            let produced = basename_of(target);
+            assert!(
+                is_valid_command_basename(&produced),
+                "{target:?} produced {produced:?}, which the broker would deny"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_the_validator_would_reject_degrades_to_unknown() {
+        // A separator-free component can still be invalid (spaces are not in the
+        // allowed set). Recording `unknown` beats failing an otherwise fine run.
+        assert_eq!(basename_of("/weird/name with spaces"), "unknown");
+        assert_eq!(basename_of("/"), "unknown");
+        assert_eq!(basename_of(""), "unknown");
+    }
+
+    #[test]
+    fn a_relative_path_keeps_only_its_final_component() {
+        assert_eq!(basename_of("./local-tool"), "local-tool");
+        assert_eq!(basename_of("../up/tool"), "tool");
+    }
 
     /// Create a protected directory (mode 0700) inside tmp.
     fn protected_dir(tmp: &Path) -> std::path::PathBuf {

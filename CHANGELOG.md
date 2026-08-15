@@ -289,6 +289,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `packaging/` and `tests/sudo_packaging/` are now formatted the way CI checks
   them. `ruff format --check` runs there on every pull request and had never
   passed.
+- `sudo-secretspec run` works again for a command named by an absolute path.
+  The client forwarded the whole invocation as the audit ledger's command
+  *basename*, and the privileged side validates that field as a basename — no
+  path separators — so `run -- /bin/echo hi` was refused with `audit denied:
+  invalid command basename`, which is most real invocations. Only a bare
+  `run -- sh -c ...` got through. The client now takes the final component, and
+  a target with no usable one is recorded as `unknown` rather than failing the
+  run. Client-side only: no boundary reinstall needed.
+
 - `v0.19.1-sudo.6` is superseded by `v0.19.1-sudo.7` and should not be used to
   install or adopt a boundary; its installer carries the vault-detection bug
   below. Nothing else in `.6` is affected, and an already-installed boundary is
