@@ -259,6 +259,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `run` no longer panics when the environment contains non-UTF-8 variables.
 - A failed terminal audit append now exits 126 and reports the operation's real
   result code instead of masking it as a generic policy error.
+- `sudo-secretspec add` now actually declares a secret. It was wired to the
+  engine's `set`, which refuses a name that is not already declared, so `add`
+  could never once perform the operation it is named for — every invocation
+  failed with a `SecretNotFound` listing every existing secret. It now takes a
+  required `--description` and edits the runtime manifest, and its output
+  reminds you to mirror the declaration into the tracked declarations file.
+  NOTE: unlike `template-check`, this needs a boundary reinstall — the older
+  broker rejects the new `--description` argument.
+- `sudo-secretspec check` no longer prompts. The broker ran the engine's check
+  with prompting enabled, inside a root process with no usable terminal: a
+  missing secret dropped it into interactive value entry, reading from whatever
+  stdin the caller passed and writing the answers into the vault. An operation
+  named `check` could therefore write, and with stdout redirected the prompt was
+  invisible and it simply hung. It is now read-only and reports missing secrets.
 - The downstream release workflow's tag trigger was pinned to the single
   literal `v0.19.1-djbclark.1`, so it fired exactly once in its entire history:
   `.2`, `.3`, `-sudo.4` and `-sudo.5` all published with the tag leg silently

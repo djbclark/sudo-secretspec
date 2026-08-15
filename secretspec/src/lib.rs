@@ -61,6 +61,11 @@ pub(crate) mod provider;
 #[cfg(feature = "cli")]
 pub mod cli;
 
+// Manifest declaration edits. Its own feature so the downstream privilege
+// boundary can take this without taking the whole interactive CLI.
+#[cfg(feature = "manifest-edit")]
+pub mod manifest_edit;
+
 // Re-export only the types needed by users and generated code
 pub use config::Resolved;
 

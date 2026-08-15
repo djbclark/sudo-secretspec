@@ -56,6 +56,14 @@ pub(crate) struct Broker {
 
     #[arg(long)]
     pub(crate) command_basename: Option<String>,
+
+    /// Declaration description, for `source-add` only.
+    ///
+    /// Declarations carry a human description, so `add` cannot be satisfied by
+    /// a name alone. This arrives as an ordinary argument rather than a prompt
+    /// because the broker never has a usable terminal.
+    #[arg(long)]
+    pub(crate) description: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -650,7 +658,55 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                 (1, vec![name.into()])
             }
         },
-        "source-set" | "source-add" => match secrets.set(name, None) {
+        // `add` declares; `set` assigns a value. These used to share this arm,
+        // which made `add` an alias for `set` — and `set` refuses a name that
+        // is not already declared, so `add` could never once perform the
+        // operation it is named for.
+        "source-add" => {
+            let Some(description) = broker.description.as_deref() else {
+                eprintln!("broker: source-add requires --description");
+                return (2, vec![name.into()]);
+            };
+            let source = match std::fs::read_to_string(&manifest) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("broker: cannot read manifest: {e}");
+                    return (2, vec![name.into()]);
+                }
+            };
+            let updated = match secretspec::manifest_edit::add_secret_to_manifest(
+                &source,
+                &cfg.profile,
+                name,
+                description,
+            ) {
+                Ok(updated) => updated,
+                Err(e) => {
+                    eprintln!("broker: {e}");
+                    return (1, vec![name.into()]);
+                }
+            };
+            // Write IN PLACE, never temp-file-and-rename. The vault manifest is
+            // owned by the service user; a rename would replace it with a file
+            // this root process created, leaving it root-owned inside a vault
+            // that `drift` checks entry by entry — which fails `doctor`. An
+            // in-place truncate keeps the inode, and with it the owner and mode.
+            // `Mutation::restore` relies on the same property.
+            match std::fs::write(&manifest, updated) {
+                Ok(()) => {
+                    println!(
+                        "declaration added to the runtime manifest; mirror {name} into the \
+                         tracked declarations and release it, or `template-check` will report drift"
+                    );
+                    (0, vec![name.into()])
+                }
+                Err(e) => {
+                    eprintln!("broker: cannot write manifest: {e}");
+                    (1, vec![name.into()])
+                }
+            }
+        }
+        "source-set" => match secrets.set(name, None) {
             Ok(()) => (0, vec![name.into()]),
             Err(e) => {
                 eprintln!("broker: {e}");
@@ -664,7 +720,14 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                 (1, vec![name.into()])
             }
         },
-        "source-check" => match secrets.check(false) {
+        // `no_prompt: true`. With prompting enabled this reports missing
+        // secrets by dropping into the engine's interactive value-entry flow --
+        // inside a root process that has no usable terminal, reading from
+        // whatever stdin the caller happened to pass, and writing the answers
+        // into the vault. That turns an operation named `check` into a write,
+        // and with stdout redirected the prompt is invisible and it simply
+        // hangs. The retired wrapper passed `--no-prompt` for this reason.
+        "source-check" => match secrets.check(true) {
             Ok(_) => (0, vec![]),
             Err(e) => {
                 eprintln!("broker: {e}");

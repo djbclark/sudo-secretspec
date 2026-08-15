@@ -57,7 +57,8 @@ age = { workspace = true, optional = true }
 
 [features]
 default = ["cli", "keyring", "kdbx", "keeper", "gcsm", "awssm", "awsps", "vault", "openbao", "bws", "akv", "infisical", "bw", "age", "scaleway", "sops"]
-cli = ["dep:toml_edit"]
+cli = ["manifest-edit"]
+manifest-edit = ["dep:toml_edit"]
 keyring = ["dep:keyring", "dep:whoami"]
 kdbx = ["dep:keepass"]
 keeper = ["dep:keeper-secrets-manager-core"]

@@ -32,8 +32,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
+    /// Declare a new secret in the runtime manifest.
+    ///
+    /// Creates the declaration only; it assigns no value. Follow with `set`.
+    /// Mirror the declaration into the tracked declarations file and release
+    /// it, or `template-check` will report the drift.
     Add {
         name: String,
+        /// Human description recorded in the declaration.
+        #[arg(long)]
+        description: String,
         #[arg(long)]
         reason: String,
     },
@@ -198,7 +206,11 @@ fn main() {
     }
 
     match cli.cmd {
-        Cmd::Add { name, reason } => lifecycle("add", &name, &reason),
+        Cmd::Add {
+            name,
+            description,
+            reason,
+        } => lifecycle_add(&name, &description, &reason),
         Cmd::Set { name, reason } => lifecycle("set", &name, &reason),
         Cmd::Delete { name, reason } => lifecycle("delete", &name, &reason),
         Cmd::Get { name, reason } => lifecycle("get", &name, &reason),
@@ -626,6 +638,39 @@ fn exit_from_broker(code: i32) -> ! {
         );
     }
     std::process::exit(code);
+}
+
+/// `add` is `lifecycle` plus the declaration's description.
+///
+/// Kept separate rather than widening `lifecycle` with an `Option`: `add` is
+/// the only operation that carries one, and threading a `None` through every
+/// other call site is how `add` came to be a silent alias for `set`.
+fn lifecycle_add(name: &str, description: &str, reason: &str) {
+    if description.trim().is_empty() {
+        eprintln!("sudo-secretspec: --description cannot be empty");
+        std::process::exit(2);
+    }
+    let status = Command::new(SUDO)
+        .arg("-n")
+        .arg(privileged_broker())
+        .arg("__broker")
+        .arg("source-add")
+        .arg("--client")
+        .arg(detect_client())
+        .arg("--reason-sha256")
+        .arg(reason_digest_or_exit(reason))
+        .arg("--name")
+        .arg(name)
+        .arg("--description")
+        .arg(description)
+        .status()
+        .unwrap_or_else(|e| {
+            eprintln!("cannot invoke broker: {e}");
+            std::process::exit(2);
+        });
+    if !status.success() {
+        exit_from_broker(status.code().unwrap_or(1));
+    }
 }
 
 fn lifecycle(op: &str, name: &str, reason: &str) {

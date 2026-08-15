@@ -77,3 +77,38 @@ fn template_check_requires_a_reason() {
         "template-check ran without --reason"
     );
 }
+
+#[test]
+fn add_requires_a_description() {
+    // `add` used to be a silent alias for `set`: the broker mapped source-add
+    // to the engine's `set`, which refuses a name that is not already
+    // declared, so `add` could never perform the operation it is named for.
+    // A declaration carries a description, so requiring one here is what keeps
+    // the two operations distinct.
+    let output = binary()
+        .args(["add", "SOME_SECRET", "--reason", "why"])
+        .output()
+        .expect("run sudo-secretspec");
+    assert!(!output.status.success(), "add ran without --description");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--description"),
+        "error should name the missing flag: {stderr}"
+    );
+}
+
+#[test]
+fn add_rejects_an_empty_description() {
+    let output = binary()
+        .args([
+            "add",
+            "SOME_SECRET",
+            "--description",
+            "   ",
+            "--reason",
+            "why",
+        ])
+        .output()
+        .expect("run sudo-secretspec");
+    assert!(!output.status.success(), "add accepted a blank description");
+}
