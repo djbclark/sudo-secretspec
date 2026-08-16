@@ -87,7 +87,7 @@ Upgrading is not `brew upgrade` alone: Homebrew only replaces files, and never t
 "$(brew --prefix)"/opt/sudo-secretspec/libexec/sudo-secretspec install --adopt-existing
 ```
 
-Plain `sudo-secretspec install` reaches the *installed* client instead, whose tree is the install destination, so it would copy every artifact onto itself. Since 0.19.1-sudo.13 that is refused with an error naming the correct command; on earlier versions it succeeded, wrote a rollback snapshot, and upgraded nothing. The install now reports the version transition it performed (`0.19.1-sudo.12 -> 0.19.1-sudo.13`, or `(reinstalled, unchanged)`), so its own output is the evidence — a bare success line no longer has to be taken on trust.
+Plain `sudo-secretspec install` reaches the *installed* client instead, whose tree is the install destination, so it would copy every artifact onto itself. Since 0.19.1-sudo.13 that is refused with an error naming the correct command; on earlier versions it succeeded, wrote a rollback snapshot, and upgraded nothing. Since 0.19.1-sudo.14 the refusal happens before elevating, so a wrong invocation exits 2 immediately and costs no authentication prompt — which also means the behaviour is reachable unattended rather than only by an operator at the machine. The install reports the version transition it performed (`0.19.1-sudo.13 -> 0.19.1-sudo.14`, or `(reinstalled, unchanged)`), so its own output is the evidence — a bare success line no longer has to be taken on trust.
 
 `doctor` reports a staged-but-uninstalled build as the advisory `UPGRADE_AVAILABLE`, naming the path to run. Advisory findings do not clear `ok`, so this must not be treated as a stop condition.
 

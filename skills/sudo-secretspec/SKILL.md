@@ -1,7 +1,7 @@
 ---
 name: sudo-secretspec
 description: Use managed credentials through the privilege-separated sudo-secretspec client instead of touching a secret store directly. Use when a task needs an API key, token, or password; when a credential must be declared, set, rotated, read, deleted, or injected into a child process; or when the boundary, drift checker, or audit ledger reports an error. Also covers what is deliberately NOT exposed and must be asked of the operator.
-version: 0.4.0
+version: 0.5.0
 author: Dan Clark (djbclark), Hermes Agent
 license: Apache-2.0
 platforms: [macos]
@@ -18,7 +18,7 @@ consumer execution. Do not access SecretSpec's provider, manifest, or protected
 backing files directly, and never invoke `secretspec` itself for a managed
 deployment.
 
-Verified against client **0.19.1-sudo.13**. `sudo-secretspec --version` is the
+Verified against client **0.19.1-sudo.14**. `sudo-secretspec --version` is the
 authority; if it reports something newer, re-read
 `sudo-secretspec/AI-GUIDANCE.md` rather than trusting this file's specifics.
 If it reports something *older*, the flags marked with a minimum version below
@@ -194,10 +194,12 @@ explicit `unknown` terminal state if restoration cannot be proven.
   client, whose tree is the destination — so it would copy every artifact onto
   itself. Since 0.19.1-sudo.13 that is refused outright, with the correct
   command in the error; before .13 it silently succeeded and upgraded nothing.
-  The install now also prints the version transition
-  (`0.19.1-sudo.12 -> 0.19.1-sudo.13`), so the output itself is the evidence
-  the upgrade happened. This is an operator action — it authenticates
-  interactively.
+  Since 0.19.1-sudo.14 the refusal happens *before* elevating, so a wrong
+  invocation costs no authentication prompt at all and exits 2 immediately.
+  The install also prints the version transition
+  (`0.19.1-sudo.13 -> 0.19.1-sudo.14`), so the output itself is the evidence
+  the upgrade happened. A *correct* install is still an operator action — it
+  authenticates interactively.
 - **`doctor` reports a staged upgrade** as the `UPGRADE_AVAILABLE` advisory
   (0.19.1-sudo.13+), naming the path to run. Advisory means `doctor` still
   exits 0; it is not a stop condition.
