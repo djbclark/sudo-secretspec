@@ -24,6 +24,16 @@ sudo-secretspec doctor
 `install` auto-detects common declaration paths and existing vaults, and
 prompts on a TTY when needed. Use flags only to override defaults:
 
+> **Which binary runs `install` matters.** `install` copies from the tree its
+> own executable lives in, so it must be run from the copy your package manager
+> ships — `"$(brew --prefix)"/opt/sudo-secretspec/libexec/sudo-secretspec`,
+> which is kept off `PATH` so it cannot shadow the installed client. The short
+> forms above are what you type for a *first* install, when nothing is installed
+> yet and that keg copy is the only one present. Once a boundary is installed,
+> `sudo-secretspec install` would reach the installed client, whose tree is the
+> destination; since `0.19.1-sudo.13` that is refused with the correct command
+> in the error, and on earlier versions it silently upgraded nothing.
+
 ```bash
 sudo-secretspec install \
   --declarations /path/to/secretspec.toml.example \
