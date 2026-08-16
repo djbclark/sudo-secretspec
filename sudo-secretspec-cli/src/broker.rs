@@ -852,7 +852,7 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
         // profile is the one in the root-owned config, not a caller flag —
         // an arbitrary profile would enumerate shapes the boundary is not
         // configured for.
-        "source-schema" => match emit_schema(secrets.config(), &cfg.profile) {
+        "source-schema" => match emit_schema(&manifest, &cfg.profile) {
             Ok(schema) => {
                 print!("{schema}");
                 (0, vec![])
@@ -870,8 +870,9 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
 ///
 /// Value-free: `codegen` reads declarations only. The caller supplies the
 /// profile; the broker always passes the one from the root-owned config.
-fn emit_schema(config: &secretspec::Config, profile: &str) -> Result<String, String> {
-    let ir = secretspec::codegen::build_ir(config);
+fn emit_schema(manifest: &std::path::Path, profile: &str) -> Result<String, String> {
+    let spec = secretspec::Spec::load_from(manifest).map_err(|e| e.to_string())?;
+    let ir = secretspec::codegen::build_ir(&spec);
     secretspec::codegen::schema::emit(&ir, Some(profile))
 }
 
@@ -1031,7 +1032,11 @@ mod tests {
         // The public client does not take `--profile`. This helper is what the
         // broker calls with the root-owned config's profile, so a production-
         // only name must not appear when that profile is `default`.
-        let config: secretspec::Config = r#"
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("secretspec.toml");
+        std::fs::write(
+            &manifest,
+            r#"
 [project]
 name = "schema-test"
 revision = "1.0"
@@ -1043,12 +1048,12 @@ API_KEY = { description = "optional api key", required = false }
 [profiles.production]
 DATABASE_URL = { description = "prod database", required = true }
 PROD_ONLY = { description = "production-only token", required = true }
-"#
-        .parse()
+"#,
+        )
         .unwrap();
 
         let schema: serde_json::Value =
-            serde_json::from_str(&emit_schema(&config, "default").unwrap()).unwrap();
+            serde_json::from_str(&emit_schema(&manifest, "default").unwrap()).unwrap();
         assert_eq!(schema["title"], "DefaultSecrets");
         assert_eq!(schema["properties"]["DATABASE_URL"]["type"], "string");
         assert_eq!(
@@ -1064,11 +1069,11 @@ PROD_ONLY = { description = "production-only token", required = true }
         assert!(schema["properties"]["DATABASE_URL"].get("const").is_none());
 
         let production: serde_json::Value =
-            serde_json::from_str(&emit_schema(&config, "production").unwrap()).unwrap();
+            serde_json::from_str(&emit_schema(&manifest, "production").unwrap()).unwrap();
         assert!(production["properties"]["PROD_ONLY"].is_object());
         // Effective profile fields include inheritance from `default`.
         assert!(production["properties"]["API_KEY"].is_object());
 
-        assert!(emit_schema(&config, "staging").is_err());
+        assert!(emit_schema(&manifest, "staging").is_err());
     }
 }

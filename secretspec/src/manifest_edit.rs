@@ -84,10 +84,81 @@ pub fn add_secret_to_manifest(
     Ok(doc.to_string())
 }
 
+/// Whether `source` declares `name` in `profile`.
+///
+/// Parsed, not searched. A substring test would match the name inside a comment
+/// or another secret's description, and the inverse mistake is worse because it
+/// is silent — a caller relying on this to protect tracked declarations would
+/// get a wrong answer with no indication.
+///
+/// A malformed manifest is an `Err`, never a `false`. Callers using this as a
+/// guard must fail closed, and that decision belongs to them rather than being
+/// smuggled in here as a default: "I could not parse it" is not "the name is
+/// absent from it".
+pub fn declares_secret(source: &str, profile: &str, name: &str) -> Result<bool> {
+    use toml_edit::{DocumentMut, Item};
+
+    let doc = source
+        .parse::<DocumentMut>()
+        .into_diagnostic()
+        .wrap_err("Failed to parse secretspec.toml")?;
+    Ok(doc
+        .get("profiles")
+        .and_then(Item::as_table_like)
+        .and_then(|profiles| profiles.get(profile))
+        .and_then(Item::as_table_like)
+        .is_some_and(|table| table.contains_key(name)))
+}
+
+/// Remove a secret declaration from a `secretspec.toml` source string.
+///
+/// The inverse of [`add_secret_to_manifest`], and pure for the same reason.
+///
+/// `toml_edit` preserves the formatting of everything it does not touch, so
+/// removing a declaration that `add_secret_to_manifest` inserted restores the
+/// original text byte for byte. That matters more than it looks: the downstream
+/// boundary's `template-check` compares the runtime manifest against the tracked
+/// template as raw bytes, so "undo" has to mean *byte-identical*, not merely
+/// semantically equivalent.
+///
+/// Removing a name that is not declared is an error rather than a silent no-op.
+/// A caller undeclaring something already absent has a wrong model of the
+/// manifest, and saying so is cheaper than letting them believe they cleaned up
+/// state that was never there.
+pub fn remove_secret_from_manifest(source: &str, profile: &str, name: &str) -> Result<String> {
+    use toml_edit::{DocumentMut, Item};
+
+    validate_add_secret_name(name)?;
+
+    let mut doc = source
+        .parse::<DocumentMut>()
+        .into_diagnostic()
+        .wrap_err("Failed to parse secretspec.toml for editing")?;
+    let profiles = doc
+        .get_mut("profiles")
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| miette!("secretspec.toml does not contain a [profiles] table"))?;
+
+    let profile_table = profiles
+        .get_mut(profile)
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| miette!("Profile '{}' is not declared in this manifest", profile))?;
+
+    if profile_table.remove(name).is_none() {
+        return Err(miette!(
+            "Secret '{}' is not declared in profile '{}'",
+            name,
+            profile
+        ));
+    }
+
+    Ok(doc.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Config;
+    use crate::__private::Config;
 
     #[test]
     fn add_secret_to_manifest_preserves_comments_and_other_tables() {

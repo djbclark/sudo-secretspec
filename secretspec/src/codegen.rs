@@ -570,7 +570,7 @@ mod tests {
         // quicktype turns a JSON Schema "description" into a native docstring
         // in every target language, so a declared description should reach the
         // generated schema even though it plays no role in the type itself.
-        let ir = build_ir(&config_with(vec![(
+        let ir = build_ir_from_config(&config_with(vec![(
             "default",
             vec![
                 (
