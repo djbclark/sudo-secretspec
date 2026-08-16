@@ -6,6 +6,7 @@ members = [
   "secretspec-node",
   "secretspec-php",
   "secretspec-py",
+  "sudo-secretspec-cli",
 ]
 resolver = "2"
 
@@ -64,6 +65,7 @@ uuid = { version = "1", features = ["serde", "v4"] }
 data-encoding = "2"
 detect-coding-agent = "0.1"
 age = { version = "0.12", features = ["armor", "plugin", "ssh"] }
+sha2 = "0.10"
 
 # The profile that 'dist' will build with
 [profile.dist]

@@ -1,0 +1,128 @@
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("invalid TOML config: {0}")]
+    Parse(#[from] toml::de::Error),
+    #[error("invalid sudo-secretspec config: {0}")]
+    Invalid(&'static str),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    pub engine: PathBuf,
+    pub audit_helper: PathBuf,
+    pub vault: PathBuf,
+    pub vault_realpath: PathBuf,
+    pub declarations: PathBuf,
+    pub service_user: String,
+    pub service_group: String,
+    /// Manifest profile the broker resolves secrets from.
+    ///
+    /// Part of the protected control plane rather than an ambient fallback.
+    /// The engine's `resolve_profile_name` falls through to its *user-global*
+    /// config when nothing else selects a profile, and inside the root broker
+    /// that file belongs to the unprivileged caller — so which secrets resolve
+    /// would be the caller's choice. Naming it here puts it in a root-owned,
+    /// `0444`, boundary-validated file instead.
+    ///
+    /// `serde(default)` because `deny_unknown_fields` tolerates a *new* field
+    /// but not a *missing* one: a config written by an older installer must
+    /// still parse. The inverse — a new config met by an older broker — is
+    /// rejected, but the two are installed as a pair and `rollback` restores
+    /// them together, so that combination is not reachable.
+    #[serde(default = "default_profile")]
+    pub profile: String,
+    #[serde(default)]
+    pub adopted_vault: bool,
+}
+
+fn default_profile() -> String {
+    "default".into()
+}
+
+impl Config {
+    pub fn parse(input: &str) -> Result<Self, ConfigError> {
+        let config: Self = toml::from_str(input)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        for path in [&self.engine, &self.audit_helper, &self.declarations] {
+            if !path.is_absolute() {
+                return Err(ConfigError::Invalid("managed paths must be absolute"));
+            }
+            if path.to_string_lossy().contains("..") {
+                return Err(ConfigError::Invalid("managed paths must not contain '..'"));
+            }
+        }
+        let vault_name = direct_child(&self.vault, Path::new("/var/db"))?;
+        let real_name = direct_child(&self.vault_realpath, Path::new("/private/var/db"))?;
+        if vault_name != real_name {
+            return Err(ConfigError::Invalid("vault and resolved vault must match"));
+        }
+        if !valid_service_identity(&self.service_user, true)
+            || !valid_service_identity(&self.service_group, false)
+        {
+            return Err(ConfigError::Invalid("invalid service identity"));
+        }
+        if !valid_profile_name(&self.profile) {
+            return Err(ConfigError::Invalid("invalid profile name"));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn vault(&self) -> &Path {
+        &self.vault
+    }
+
+    #[must_use]
+    pub fn service_user(&self) -> &str {
+        &self.service_user
+    }
+}
+
+fn direct_child<'a>(path: &'a Path, parent: &Path) -> Result<&'a std::ffi::OsStr, ConfigError> {
+    let relative = path
+        .strip_prefix(parent)
+        .map_err(|_| ConfigError::Invalid("vault is outside protected database root"))?;
+    let mut components = relative.components();
+    let name = components
+        .next()
+        .ok_or(ConfigError::Invalid("vault name is missing"))?;
+    if components.next().is_some() {
+        return Err(ConfigError::Invalid("vault must be one direct child"));
+    }
+    Ok(name.as_os_str())
+}
+
+/// A profile name is a manifest table key, not a path. Constrain it here so a
+/// hand-edited config cannot smuggle a traversal or a separator into the value
+/// the broker hands the engine.
+fn valid_profile_name(value: &str) -> bool {
+    if value.is_empty() || value.len() > 64 {
+        return false;
+    }
+    value.bytes().enumerate().all(|(index, byte)| match byte {
+        b'a'..=b'z' | b'A'..=b'Z' => true,
+        b'0'..=b'9' | b'_' | b'-' => index > 0,
+        _ => false,
+    })
+}
+
+fn valid_service_identity(value: &str, require_underscore: bool) -> bool {
+    if value.is_empty() || value.len() > 31 || (require_underscore && !value.starts_with('_')) {
+        return false;
+    }
+    value.bytes().enumerate().all(|(index, byte)| match byte {
+        b'a'..=b'z' | b'_' => true,
+        b'0'..=b'9' => index > 0,
+        _ => false,
+    })
+}
