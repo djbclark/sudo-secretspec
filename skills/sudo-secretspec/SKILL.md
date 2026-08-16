@@ -1,7 +1,7 @@
 ---
 name: sudo-secretspec
 description: Use managed credentials through the privilege-separated sudo-secretspec client instead of touching a secret store directly. Use when a task needs an API key, token, or password; when a credential must be declared, set, rotated, read, deleted, or injected into a child process; or when the boundary, drift checker, or audit ledger reports an error. Also covers what is deliberately NOT exposed and must be asked of the operator.
-version: 0.2.0
+version: 0.3.0
 author: Dan Clark (djbclark), Hermes Agent
 license: Apache-2.0
 platforms: [macos]
@@ -18,9 +18,11 @@ consumer execution. Do not access SecretSpec's provider, manifest, or protected
 backing files directly, and never invoke `secretspec` itself for a managed
 deployment.
 
-Verified against client **0.19.1-sudo.10**. `sudo-secretspec --version` is the
+Verified against client **0.19.1-sudo.12**. `sudo-secretspec --version` is the
 authority; if it reports something newer, re-read
 `sudo-secretspec/AI-GUIDANCE.md` rather than trusting this file's specifics.
+If it reports something *older*, the flags marked with a minimum version below
+will be rejected by your client — check `--help` before assuming a flag exists.
 
 ## When to Use
 
@@ -45,7 +47,7 @@ The companion is not a wrapper around the whole engine. It exposes exactly:
 
 | Command | Purpose |
 | --- | --- |
-| `add NAME --description D --reason R` | Declare a name in the runtime manifest. Sets **no** value. |
+| `add NAME --description D --reason R [--optional\|--required]` | Declare a name in the runtime manifest. Sets **no** value. The requiredness flags are `0.19.1-sudo.12+`. |
 | `undeclare NAME --reason R` | Inverse of `add`. Guarded — see Declaration lifecycle. |
 | `set NAME --reason R` | Supply or rotate a value. |
 | `delete NAME --reason R` | Drop a value, keeping the declaration. |
@@ -103,17 +105,39 @@ sudo-secretspec delete NAME --reason "purpose"
 sudo-secretspec undeclare NAME --reason "purpose"
 ```
 
-`--description` is required by `add` and may not be empty. `add` writes no
-`required` key by default, so the declaration inherits the profile's
-`[defaults] required` — usually required. Pass `--optional` for a secret only
-some hosts need, so `check` stays green on the hosts that don't set it, or
-`--required` to force it required in a profile whose defaults are optional.
-The two flags cannot be combined. `undeclare` refuses a
-name present in the tracked declarations file (removing one of those is a
-review-and-release decision) and refuses a name that still holds a value, so
-`delete` must come first. Those two guards mean `undeclare` can only ever move
-the runtime manifest back toward the template. Removing a *tracked* declaration
-is never a runtime action.
+`--description` is required by `add` and may not be empty.
+
+### Requiredness (`0.19.1-sudo.12+`)
+
+`add` writes no `required` key by default, so the declaration inherits the
+profile's `[defaults] required`. That inherited value is **usually** required,
+but not always — which is why there are two flags rather than one:
+
+```bash
+# only some hosts need it -- `check` stays green on the hosts that don't set it
+sudo-secretspec add NAME --description "what it is" --optional --reason "purpose"
+
+# force required where the profile's [defaults] set required = false
+sudo-secretspec add NAME --description "what it is" --required --reason "purpose"
+```
+
+The two cannot be combined; passing both is refused. Omitting both writes
+exactly what `add` wrote before `0.19.1-sudo.12`.
+
+This matters because it decides whether `check` passes: a required-but-unset
+secret fails `check` (and anything gating on it), while an optional-but-unset
+one does not. Neither flag can *change* an existing declaration — `add` refuses
+a name that is already declared. To flip requiredness on a runtime declaration,
+`delete` then `undeclare` then `add` again; for a tracked one it is a
+review-and-release decision.
+
+### Undo guards
+
+`undeclare` refuses a name present in the tracked declarations file (removing
+one of those is a review-and-release decision) and refuses a name that still
+holds a value, so `delete` must come first. Those two guards mean `undeclare`
+can only ever move the runtime manifest back toward the template. Removing a
+*tracked* declaration is never a runtime action.
 
 The broker rolls manifest and value mutations back on failure, and records an
 explicit `unknown` terminal state if restoration cannot be proven.
@@ -148,7 +172,10 @@ explicit `unknown` terminal state if restoration cannot be proven.
   invocation costs a fresh Touch ID prompt. Never put one in a loop or an
   unattended script.
 - **`template-check` is a raw byte comparison**, not a semantic one. Formatting
-  changes register as drift.
+  changes register as drift. This is deliberate — it is what makes green mean
+  "the running file is the exact bytes that were reviewed", and what makes
+  `add` → `undeclare` a provable undo. Do not propose loosening it; see
+  `docs/design/template-check-resync.md`.
 - **`install --declarations` does not prune.** It is not a cleanup route for a
   runtime declaration; `undeclare` is.
 - Permission denied while inspecting a `0700` store is expected and does not
@@ -174,7 +201,7 @@ Success requires a zero exit status. Some findings are advisory and still exit
 zero — report them to the operator and continue.
 
 **Read the `advisory` field on each finding rather than matching code names.**
-That list has grown twice already; at 0.19.1-sudo.10 it is
+That list has grown twice already; at 0.19.1-sudo.12 it is
 `LEGACY_VAULT_CLUTTER`, `PENDING_ROLLBACK`, `CLIENT_DUPLICATE`, and the three
 `SUDOERS_NEIGHBOUR_*` codes, but treating those names as the definition is how
 this instruction goes stale. Any non-advisory finding is a hard stop.
