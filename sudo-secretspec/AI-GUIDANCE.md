@@ -79,7 +79,16 @@ sudo-secretspec doctor
 sudo-secretspec install --dry-run <install options>
 ```
 
-The dry-run still uses `sudo` because protected metadata cannot be validated honestly from the operator UID. It never reads secret contents. Rollback snapshots cover installed artifacts only and deliberately preserve the runtime vault:
+The dry-run still uses `sudo` because protected metadata cannot be validated honestly from the operator UID. It never reads secret contents.
+
+Upgrading is not `brew upgrade` alone, and not plain `sudo-secretspec install` either. Homebrew only replaces files; it never touches the privilege boundary, so `/usr/local/bin/sudo-secretspec` goes on running the old version. Invoking `sudo-secretspec install` then resolves through `PATH` to that *old* client, which reinstalls itself — the version silently does not move, and the command still reports success. Drive the upgrade from the freshly installed copy, which is kept off `PATH` precisely so it cannot shadow the installed client, then confirm the version actually changed:
+
+```bash
+/opt/homebrew/opt/sudo-secretspec/libexec/sudo-secretspec install --adopt-existing
+sudo-secretspec --version
+```
+
+Rollback snapshots cover installed artifacts only and deliberately preserve the runtime vault:
 
 ```bash
 sudo-secretspec rollback /usr/local/libexec/sudo-secretspec-rollback-<timestamp>

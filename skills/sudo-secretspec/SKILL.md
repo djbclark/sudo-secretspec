@@ -178,6 +178,21 @@ explicit `unknown` terminal state if restoration cannot be proven.
   `docs/design/template-check-resync.md`.
 - **`install --declarations` does not prune.** It is not a cleanup route for a
   runtime declaration; `undeclare` is.
+- **Upgrading requires the Homebrew `libexec` copy, not `install` on `PATH`.**
+  `brew upgrade` only replaces files; it never touches the privilege boundary,
+  so `/usr/local/bin/sudo-secretspec` keeps running the old version. Running
+  plain `sudo-secretspec install` then resolves through `PATH` to that *old*
+  client, which reinstalls itself — the version silently does not move. Drive
+  the upgrade from the new copy, which is deliberately off `PATH` so it cannot
+  shadow the installed client:
+
+  ```bash
+  /opt/homebrew/opt/sudo-secretspec/libexec/sudo-secretspec install --adopt-existing
+  ```
+
+  Confirm with `sudo-secretspec --version` afterwards; if it is unchanged, the
+  upgrade did not happen. This is an operator action — it authenticates
+  interactively.
 - Permission denied while inspecting a `0700` store is expected and does not
   mean files are missing.
 - Reasons are hashed in the protected broker ledger but may reach SecretSpec's
