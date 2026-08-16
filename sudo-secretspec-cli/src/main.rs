@@ -44,6 +44,10 @@ enum Cmd {
         /// Human description recorded in the declaration.
         #[arg(long)]
         description: String,
+        /// Declare the secret optional (`required = false`) instead of the
+        /// default required declaration.
+        #[arg(long)]
+        optional: bool,
         #[arg(long)]
         reason: String,
     },
@@ -239,8 +243,9 @@ fn main() {
         Cmd::Add {
             name,
             description,
+            optional,
             reason,
-        } => lifecycle_add(&name, &description, &reason),
+        } => lifecycle_add(&name, &description, optional, &reason),
         Cmd::Set { name, reason } => lifecycle("set", &name, &reason),
         Cmd::Delete { name, reason } => lifecycle("delete", &name, &reason),
         Cmd::Undeclare { name, reason } => lifecycle("undeclare", &name, &reason),
@@ -666,12 +671,13 @@ fn exit_from_broker(code: i32) -> ! {
 /// Kept separate rather than widening `lifecycle` with an `Option`: `add` is
 /// the only operation that carries one, and threading a `None` through every
 /// other call site is how `add` came to be a silent alias for `set`.
-fn lifecycle_add(name: &str, description: &str, reason: &str) {
+fn lifecycle_add(name: &str, description: &str, optional: bool, reason: &str) {
     if description.trim().is_empty() {
         eprintln!("sudo-secretspec: --description cannot be empty");
         std::process::exit(2);
     }
-    let status = Command::new(SUDO)
+    let mut command = Command::new(SUDO);
+    command
         .arg("-n")
         .arg(privileged_broker())
         .arg("__broker")
@@ -683,12 +689,14 @@ fn lifecycle_add(name: &str, description: &str, reason: &str) {
         .arg("--name")
         .arg(name)
         .arg("--description")
-        .arg(description)
-        .status()
-        .unwrap_or_else(|e| {
-            eprintln!("cannot invoke broker: {e}");
-            std::process::exit(2);
-        });
+        .arg(description);
+    if optional {
+        command.arg("--optional");
+    }
+    let status = command.status().unwrap_or_else(|e| {
+        eprintln!("cannot invoke broker: {e}");
+        std::process::exit(2);
+    });
     if !status.success() {
         exit_from_broker(status.code().unwrap_or(1));
     }

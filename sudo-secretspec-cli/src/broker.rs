@@ -64,6 +64,12 @@ pub(crate) struct Broker {
     /// because the broker never has a usable terminal.
     #[arg(long)]
     pub(crate) description: Option<String>,
+
+    /// Declare the secret optional (`required = false`), for `source-add`
+    /// only. Omitted means required, matching the engine's own default for a
+    /// declaration that carries no `required` key.
+    #[arg(long)]
+    pub(crate) optional: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -681,6 +687,7 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                 &cfg.profile,
                 name,
                 description,
+                broker.optional,
             ) {
                 Ok(updated) => updated,
                 Err(e) => {
