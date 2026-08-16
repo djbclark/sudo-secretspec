@@ -9,12 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `add` (both `secretspec add` and `sudo-secretspec add`) takes a new
-  `--optional` flag, writing `required = false` on the new declaration
-  instead of leaving `required` unset (which resolves to required). Every
-  declaration `add` wrote before this had no way to be anything but required,
-  so a secret only some hosts need had no CLI path to stay optional without
-  hand-editing the manifest.
+- `add` (both `secretspec add` and `sudo-secretspec add`) takes new
+  `--optional` and `--required` flags, writing `required = false` or
+  `required = true` on the new declaration. Omitting both writes no `required`
+  key, exactly as before, leaving the secret to inherit `[defaults] required`
+  from its profile. Previously there was no flag at all, so a secret only some
+  hosts need had no CLI path to being optional short of hand-editing the
+  manifest — and in a profile whose defaults set `required = false`, no path
+  to being required either.
 - `sudo-secretspec schema --reason <why>` emits a JSON Schema of the runtime
   manifest's typed shape (declared names and whether each is required) to
   stdout. It reads no secret values, and emits no descriptions — the schema

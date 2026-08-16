@@ -65,11 +65,18 @@ pub(crate) struct Broker {
     #[arg(long)]
     pub(crate) description: Option<String>,
 
-    /// Declare the secret optional (`required = false`), for `source-add`
-    /// only. Omitted means required, matching the engine's own default for a
-    /// declaration that carries no `required` key.
-    #[arg(long)]
+    /// Write `required = false` on the declaration, for `source-add` only.
+    #[arg(long, conflicts_with = "required")]
     pub(crate) optional: bool,
+
+    /// Write `required = true` on the declaration, for `source-add` only.
+    ///
+    /// Neither flag omits the key, leaving the secret to inherit `[defaults]
+    /// required` from its profile. That inherited value is not always
+    /// required, which is why this is a separate flag rather than the absence
+    /// of `--optional`.
+    #[arg(long)]
+    pub(crate) required: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -687,7 +694,11 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                 &cfg.profile,
                 name,
                 description,
-                broker.optional,
+                match (broker.optional, broker.required) {
+                    (true, _) => Some(false),
+                    (_, true) => Some(true),
+                    _ => None,
+                },
             ) {
                 Ok(updated) => updated,
                 Err(e) => {

@@ -103,10 +103,12 @@ sudo-secretspec delete NAME --reason "purpose"
 sudo-secretspec undeclare NAME --reason "purpose"
 ```
 
-`--description` is required by `add` and may not be empty. `add` always
-declares the name required unless you also pass `--optional`, which writes
-`required = false` instead — use it for a secret that only some hosts need,
-so `check` stays green on the hosts that don't set it. `undeclare` refuses a
+`--description` is required by `add` and may not be empty. `add` writes no
+`required` key by default, so the declaration inherits the profile's
+`[defaults] required` — usually required. Pass `--optional` for a secret only
+some hosts need, so `check` stays green on the hosts that don't set it, or
+`--required` to force it required in a profile whose defaults are optional.
+The two flags cannot be combined. `undeclare` refuses a
 name present in the tracked declarations file (removing one of those is a
 review-and-release decision) and refuses a name that still holds a value, so
 `delete` must come first. Those two guards mean `undeclare` can only ever move

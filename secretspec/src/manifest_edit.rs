@@ -37,21 +37,26 @@ pub(crate) fn validate_add_secret_name(name: &str) -> Result<()> {
 /// same edit without shelling out to this CLI — it must write the result
 /// itself, in place, to preserve the vault file's ownership.
 ///
-/// `optional` controls the declaration's `required` field: omitted (`false`)
-/// matches every declaration this function has ever written, which resolves
-/// to `required = true` by the engine's own default — see
-/// `unspecified_required_is_non_optional_matching_runtime` in
-/// `codegen.rs`. Passing `true` writes an explicit `required = false`, the
-/// same shape `secretspec init`'s generator already produces for an optional
-/// secret. There is no third state: a caller that needs a presence group
-/// (`at_least_one`/`exactly_one`) edits the manifest by hand, since that
-/// spans multiple secrets and doesn't fit a single-secret declare.
+/// `required` is tri-state, and the third state is the reason it is not a
+/// plain `bool`. `None` writes no `required` key, which is what this function
+/// has always done and which leaves the secret inheriting `[defaults]
+/// required` from its profile. `Some(v)` writes `required = v` explicitly,
+/// the same shape `secretspec init`'s generator emits.
+///
+/// Collapsing this to "omitted means required" would be wrong: a profile
+/// carrying `defaults = { required = false }` makes an omitted key resolve to
+/// *optional*, so without an explicit `Some(true)` there would be no way to
+/// declare a required secret in such a profile at all.
+///
+/// A presence group (`at_least_one`/`exactly_one`) is deliberately out of
+/// scope here — it spans several secrets at once and does not fit a
+/// single-secret declaration.
 pub fn add_secret_to_manifest(
     source: &str,
     profile: &str,
     name: &str,
     description: &str,
-    optional: bool,
+    required: Option<bool>,
 ) -> Result<String> {
     use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
 
@@ -87,8 +92,8 @@ pub fn add_secret_to_manifest(
 
     let mut secret = InlineTable::new();
     secret.insert("description", Value::from(description));
-    if optional {
-        secret.insert("required", Value::from(false));
+    if let Some(required) = required {
+        secret.insert("required", Value::from(required));
     }
     profile_table.insert(name, toml_edit::value(secret));
 
@@ -184,7 +189,7 @@ EXISTING = { description = "already here" }
         // runtime manifest against the tracked template as raw BYTES, so an
         // "undo" that is merely semantically equivalent still reports drift
         // forever. toml_edit preserves untouched formatting; this proves it.
-        let added = add_secret_to_manifest(MANIFEST, "default", "SCRATCH", "temp", false).unwrap();
+        let added = add_secret_to_manifest(MANIFEST, "default", "SCRATCH", "temp", None).unwrap();
         assert_ne!(added, MANIFEST, "add did not change anything");
 
         let removed = remove_secret_from_manifest(&added, "default", "SCRATCH").unwrap();
@@ -193,24 +198,99 @@ EXISTING = { description = "already here" }
     }
 
     #[test]
-    fn add_secret_to_manifest_omits_required_by_default() {
-        let added = add_secret_to_manifest(MANIFEST, "default", "SCRATCH", "temp", false).unwrap();
-        assert!(!added.contains("required"));
+    fn add_secret_to_manifest_omits_required_when_unspecified() {
+        // Asserted on the emitted declaration, not on the whole document: a
+        // whole-file `contains("required")` would also be satisfied (or
+        // broken) by any sibling or comment carrying that word.
+        let added = add_secret_to_manifest(MANIFEST, "default", "SCRATCH", "temp", None).unwrap();
+        assert!(added.contains("SCRATCH = { description = \"temp\" }"));
     }
 
     #[test]
-    fn add_secret_to_manifest_writes_required_false_when_optional() {
-        let added = add_secret_to_manifest(MANIFEST, "default", "SCRATCH", "temp", true).unwrap();
-        assert!(added.contains("SCRATCH = { description = \"temp\", required = false }"));
+    fn add_secret_to_manifest_writes_the_requiredness_it_is_given() {
+        let optional =
+            add_secret_to_manifest(MANIFEST, "default", "SCRATCH", "temp", Some(false)).unwrap();
+        assert!(optional.contains("SCRATCH = { description = \"temp\", required = false }"));
+
+        // The other half of the tri-state, and the reason it is not a bool:
+        // a profile carrying `defaults = { required = false }` makes an
+        // omitted key resolve to optional, so `Some(true)` is the only way to
+        // declare a required secret there.
+        let required =
+            add_secret_to_manifest(MANIFEST, "default", "SCRATCH", "temp", Some(true)).unwrap();
+        assert!(required.contains("SCRATCH = { description = \"temp\", required = true }"));
+    }
+
+    #[test]
+    fn removing_an_explicit_requiredness_declaration_also_restores_the_original_bytes() {
+        // An explicit `required` writes a second key into the inline table, so
+        // it is a longer edit than the default path the round-trip test above
+        // covers. `template-check` compares raw bytes either way, so both
+        // explicit states have to undo just as exactly.
+        for requiredness in [Some(true), Some(false)] {
+            let added =
+                add_secret_to_manifest(MANIFEST, "default", "SCRATCH", "temp", requiredness)
+                    .unwrap();
+            assert_ne!(added, MANIFEST, "add did not change anything");
+
+            let removed = remove_secret_from_manifest(&added, "default", "SCRATCH").unwrap();
+
+            assert_eq!(removed, MANIFEST, "failed for {requiredness:?}");
+        }
+    }
+
+    #[test]
+    fn round_trip_survives_a_document_with_presence_groups_and_full_tables() {
+        // The fixtures above are inline-table-only. toml_edit is likeliest to
+        // reserialize a document that mixes shapes, so the byte-exact claim is
+        // worth proving against one that does: a `required` *table* (presence
+        // group), a full `[profiles.x.y]` table, and a dotted key.
+        let manifest = r#"[project]
+name = "demo"
+revision = "1.0"
+
+[profiles.default]
+GROUPED = { description = "in a group", required = { at_least_one = "auth" } }
+"dotted.name" = { description = "quoted key" }
+
+[profiles.default.NESTED]
+description = "declared as a full table"
+required = false
+"#;
+
+        for requiredness in [None, Some(true), Some(false)] {
+            let added =
+                add_secret_to_manifest(manifest, "default", "SCRATCH", "temp", requiredness)
+                    .unwrap();
+            let removed = remove_secret_from_manifest(&added, "default", "SCRATCH").unwrap();
+
+            assert_eq!(removed, manifest, "failed for {requiredness:?}");
+        }
+    }
+
+    #[test]
+    fn an_optional_declaration_actually_resolves_as_optional() {
+        // The product claim, asserted through the engine rather than through
+        // the emitted text: `check` fails on a required-but-unset secret and
+        // passes on an optional-but-unset one, so the written bytes have to
+        // compile to a secret the engine treats as not-required.
+        use crate::Config;
+
+        let added =
+            add_secret_to_manifest(MANIFEST, "default", "SCRATCH", "temp", Some(false)).unwrap();
+        let config: Config = toml::from_str(&added).expect("edited manifest must parse");
+        config.validate().expect("edited manifest must validate");
+
+        assert_eq!(
+            config.profiles["default"].secrets["SCRATCH"].required,
+            Some(false)
+        );
     }
 
     #[test]
     fn removing_an_optional_declaration_also_restores_the_original_bytes() {
-        // `--optional` writes a second key into the inline table, so it is a
-        // longer edit than the default path the round-trip test above covers.
-        // The boundary's `template-check` compares raw bytes either way, so an
-        // optional declaration has to undo just as exactly.
-        let added = add_secret_to_manifest(MANIFEST, "default", "SCRATCH", "temp", true).unwrap();
+        let added =
+            add_secret_to_manifest(MANIFEST, "default", "SCRATCH", "temp", Some(false)).unwrap();
         assert_ne!(added, MANIFEST, "add did not change anything");
 
         let removed = remove_secret_from_manifest(&added, "default", "SCRATCH").unwrap();
@@ -226,7 +306,7 @@ EXISTING = { description = "already here" }
 
     #[test]
     fn removing_leaves_sibling_declarations_alone() {
-        let added = add_secret_to_manifest(MANIFEST, "default", "SCRATCH", "temp", false).unwrap();
+        let added = add_secret_to_manifest(MANIFEST, "default", "SCRATCH", "temp", None).unwrap();
         let removed = remove_secret_from_manifest(&added, "default", "SCRATCH").unwrap();
         assert!(removed.contains("EXISTING"));
     }
