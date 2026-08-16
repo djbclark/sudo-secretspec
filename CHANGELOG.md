@@ -7,7 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `sudo-secretspec install` refuses to install from the installed boundary
+  itself instead of silently upgrading nothing. `install` copies from the tree
+  its own executable lives in, and `/usr/local` is shaped exactly like the
+  distribution media — so running the *installed* client's `install` resolved
+  every source path back to the already-installed files, copied each onto
+  itself, wrote a rollback snapshot, and exited 0 reporting success while the
+  version never moved. It now stops with an error naming the copy to run
+  instead. Reaching the old client through `PATH` was only the most common way
+  in; a symlink, an alias, or a hard link produced the same silent no-op, and
+  all of them are now caught.
+
 ### Added
+
+- `sudo-secretspec install` reports the version it moved the boundary through
+  (`0.19.1-sudo.12 -> 0.19.1-sudo.13`, or `(reinstalled, unchanged)`) and the
+  media it installed from. Previously the success line was identical whether
+  the boundary had been upgraded or not, so confirming an upgrade meant
+  separately running `--version`.
+- `sudo-secretspec doctor` reports a build staged by the package manager but
+  never installed as the new advisory `UPGRADE_AVAILABLE`, naming the path to
+  run. Advisory, so it never fails `doctor`.
+- The protected config records the installer's `version`. Configs written by
+  earlier installers parse unchanged; until the first install that writes it,
+  `doctor` reports no upgrade rather than guessing at one.
+
+### Changed
+
+- `sudo-secretspec install --dry-run` now resolves and validates the source
+  media, which it previously skipped entirely — the checks ran only after the
+  dry-run had already returned, so a dry run could not report the most likely
+  problem with an install.
 
 - `add` (both `secretspec add` and `sudo-secretspec add`) takes new
   `--optional` and `--required` flags, writing `required = false` or

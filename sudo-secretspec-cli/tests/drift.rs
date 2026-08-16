@@ -193,6 +193,7 @@ fn inspect_reports_a_client_the_callers_path_would_reach_first() {
         &layout,
         &sudo_secretspec_cli::InspectOptions {
             caller_path: Some(caller_path),
+            ..Default::default()
         },
     );
 
@@ -256,10 +257,8 @@ fn inspect_writes_nothing_to_stdout() {
         let mut layout = sudo_secretspec_cli::load_config(&write_config(&dir, minimal_toml()))
             .expect("minimal config");
         layout.sudoers = policy;
-        let _ = sudo_secretspec_cli::inspect(
-            &layout,
-            &sudo_secretspec_cli::InspectOptions { caller_path: None },
-        );
+        let _ =
+            sudo_secretspec_cli::inspect(&layout, &sudo_secretspec_cli::InspectOptions::default());
         return;
     }
 

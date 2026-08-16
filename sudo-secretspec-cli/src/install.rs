@@ -41,6 +41,9 @@ pub(crate) const SNAPSHOT_PREFIX: &str = "sudo-secretspec-rollback-";
 /// Restorable snapshots retained after a successful install. Every install
 /// captures one, so without a bound they accumulate for the life of the host.
 const SNAPSHOT_KEEP: usize = 3;
+/// Version this binary installs, stamped into the protected config so a later
+/// install can report what it replaced.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Error)]
 pub enum InstallError {
@@ -634,6 +637,7 @@ fn config_toml(req: &InstallRequest, vault_real: &Path) -> String {
          service_user = \"{user}\"\n\
          service_group = \"{group}\"\n\
          profile = \"{profile}\"\n\
+         version = \"{version}\"\n\
          adopted_vault = {adopted}\n",
         prefix = PREFIX,
         vault = req.vault.display(),
@@ -641,8 +645,123 @@ fn config_toml(req: &InstallRequest, vault_real: &Path) -> String {
         user = req.service_user,
         group = req.service_group,
         profile = req.profile,
+        version = VERSION,
         adopted = req.adopt_existing,
     )
+}
+
+/// Files the installer copies from the distribution media.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Media {
+    broker: PathBuf,
+    guidance: PathBuf,
+    retired: PathBuf,
+}
+
+/// Root of the distribution media this install copies from.
+///
+/// Inferred from `current_exe()`: the package manager runs
+/// `<keg>/libexec/sudo-secretspec`, so the keg root is two levels up. An
+/// explicit [`InstallRequest::source_root`] overrides the inference, which is
+/// what makes the media checks testable without a real keg.
+fn resolve_source_root(explicit: Option<&Path>) -> Result<PathBuf, InstallError> {
+    if let Some(root) = explicit {
+        return Ok(root.to_path_buf());
+    }
+    let self_exe = std::env::current_exe()
+        .map_err(|e| InstallError::Denied(format!("cannot resolve current exe: {e}")))?;
+    self_exe
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| InstallError::Denied("current exe is not nested in libexec".into()))
+}
+
+/// True when both paths exist and name the same file.
+///
+/// Compared by `(dev, ino)` rather than by canonicalized path so that a hard
+/// link — which canonicalization cannot see through — counts as the same file.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// Resolve the media layout under `source_root`, refusing to install from the
+/// installed boundary itself.
+///
+/// `<PREFIX>` is shaped exactly like the distribution media — install puts a
+/// `libexec/sudo-secretspec` and a `share/sudo-secretspec` there — so the
+/// destination is always a structurally *valid* source. Running the installed
+/// client's own `install` therefore infers `source_root = <PREFIX>`, copies
+/// every artifact onto itself, rewrites the rollback snapshot and exits 0
+/// having upgraded nothing. Nothing is malformed at any step, so no other check
+/// can fail; only comparing source against destination sees it.
+///
+/// `main`'s allowlist already refuses lifecycle through the *broker* path on
+/// the same principle — the installed copy must not be the installer. This is
+/// that rule applied to the installed *client* path, which reaches
+/// `install` because `invoked_as_privileged_broker` is false for it by
+/// construction.
+///
+/// A destination that does not exist yet is a first install and cannot be
+/// self-sourced.
+fn resolve_media(source_root: &Path, broker_dst: &Path) -> Result<Media, InstallError> {
+    let media = Media {
+        broker: source_root.join("libexec/sudo-secretspec"),
+        guidance: source_root.join("share/sudo-secretspec/AI-GUIDANCE.md"),
+        retired: source_root.join("share/sudo-secretspec/sudo-secretspec-retired.toml"),
+    };
+
+    if same_file(&media.broker, broker_dst) {
+        return Err(InstallError::Denied(format!(
+            "refusing to install from the installed boundary itself ({}).\n\
+             This would copy every artifact onto itself and report success while upgrading \
+             nothing.\n\
+             Run install from the copy your package manager ships, which is kept off PATH so \
+             it cannot shadow the installed client:\n  \
+             $(brew --prefix)/opt/sudo-secretspec/libexec/sudo-secretspec install \
+             --adopt-existing",
+            media.broker.display()
+        )));
+    }
+
+    for path in [&media.broker, &media.guidance, &media.retired] {
+        if !path.is_file() {
+            return Err(InstallError::Denied(format!(
+                "source media is incomplete: {} is missing",
+                path.display()
+            )));
+        }
+    }
+    Ok(media)
+}
+
+/// Version recorded by the installer that last wrote `config_dst`.
+///
+/// `None` when no boundary is installed yet, or when it was installed before
+/// the version stamp existed. Read from the root-owned config rather than by
+/// running the outgoing binary: `install` is already root here, and executing
+/// the very binary it is about to replace to ask what it is would be a needless
+/// exec of soon-to-be-stale code.
+fn installed_version(config_dst: &Path) -> Option<String> {
+    let content = fs::read_to_string(config_dst).ok()?;
+    crate::config::Config::parse(&content).ok()?.version
+}
+
+/// How this install moves the boundary's version, for the operator-facing line.
+///
+/// The success message used to say only "installed sudo-secretspec", which is
+/// true of a no-op as much as of a real upgrade — so confirming that an upgrade
+/// had happened meant separately running `--version`, and not doing so is how a
+/// silent no-op went unnoticed.
+fn version_transition(previous: Option<&str>) -> String {
+    match previous {
+        Some(old) if old == VERSION => format!("{VERSION} (reinstalled, unchanged)"),
+        Some(old) => format!("{old} -> {VERSION}"),
+        None => VERSION.to_string(),
+    }
 }
 
 /// Sudoers policy for the operator.
@@ -703,6 +822,19 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
         ));
     }
     validate_protected_ancestors()?;
+
+    // Resolve and validate the source media before the dry-run return, not
+    // after it. These checks used to sit ~110 lines further down, past this
+    // early exit, which left `--dry-run` — the one command reached for to
+    // pre-flight an install — structurally unable to report the most likely
+    // thing to be wrong with one.
+    let client_dst = PathBuf::from(PREFIX).join("bin/sudo-secretspec");
+    let broker_dst = PathBuf::from(PREFIX).join("libexec/sudo-secretspec");
+    let media = resolve_media(
+        &resolve_source_root(req.source_root.as_deref())?,
+        &broker_dst,
+    )?;
+    let previous_version = installed_version(Path::new(CONFIG_PATH));
 
     if req.dry_run {
         if req.adopt_existing {
@@ -765,7 +897,11 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
                 "fresh-install identity or vault already exists; use --adopt-existing".into(),
             ));
         }
-        println!("would install sudo-secretspec");
+        println!(
+            "would install sudo-secretspec {}",
+            version_transition(previous_version.as_deref())
+        );
+        println!("source={}", media.broker.display());
         println!("operator={}", req.operator);
         println!("service={}:{}", req.service_user, req.service_group);
         println!("vault={}", req.vault.display());
@@ -815,21 +951,7 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
         ));
     }
 
-    // Source media layout.
-    let self_exe = std::env::current_exe()
-        .map_err(|e| InstallError::Denied(format!("cannot resolve current exe: {e}")))?;
-    let source_root = self_exe
-        .parent()
-        .and_then(|p| p.parent())
-        .ok_or_else(|| InstallError::Denied("current exe is not nested in libexec".into()))?;
-
-    let broker_src = source_root.join("libexec/sudo-secretspec");
-    let share_src = source_root.join("share/sudo-secretspec");
-    let guidance_src = share_src.join("AI-GUIDANCE.md");
-    let retired_src = share_src.join("sudo-secretspec-retired.toml");
-
-    let client_dst = PathBuf::from(PREFIX).join("bin/sudo-secretspec");
-    let broker_dst = PathBuf::from(PREFIX).join("libexec/sudo-secretspec");
+    // Source media resolved and validated above, before the dry-run return.
     let share = PathBuf::from(PREFIX).join("share/sudo-secretspec");
     let declarations_dst = share.join("secretspec.toml");
     let retired_dst = share.join("sudo-secretspec-retired.toml");
@@ -860,15 +982,15 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     let rollback = libexec.join(format!("{SNAPSHOT_PREFIX}{stamp}"));
     let captured = capture_snapshot(&rollback)?;
 
-    install_file(&broker_src, &client_dst, require_mode(&client_dst)?)?;
-    install_file(&broker_src, &broker_dst, require_mode(&broker_dst)?)?;
+    install_file(&media.broker, &client_dst, require_mode(&client_dst)?)?;
+    install_file(&media.broker, &broker_dst, require_mode(&broker_dst)?)?;
     install_file(
         &req.declarations,
         &declarations_dst,
         require_mode(&declarations_dst)?,
     )?;
-    install_file(&retired_src, &retired_dst, require_mode(&retired_dst)?)?;
-    install_file(&guidance_src, &guidance_dst, require_mode(&guidance_dst)?)?;
+    install_file(&media.retired, &retired_dst, require_mode(&retired_dst)?)?;
+    install_file(&media.guidance, &guidance_dst, require_mode(&guidance_dst)?)?;
     write_bytes(
         &config_dst,
         config_toml(&req, &vault_real).as_bytes(),
@@ -934,7 +1056,11 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     // restored from. Unbounded, they accumulate for the life of the host.
     let pruned = prune_snapshots(&libexec, SNAPSHOT_KEEP);
 
-    println!("installed sudo-secretspec");
+    println!(
+        "installed sudo-secretspec {}",
+        version_transition(previous_version.as_deref())
+    );
+    println!("source={}", media.broker.display());
     println!("config={}", config_dst.display());
     println!("vault={}", req.vault.display());
     if captured == 0 {
@@ -1015,6 +1141,153 @@ fn chrono_like_stamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A directory shaped like distribution media: `libexec/sudo-secretspec`
+    /// plus the two shared assets install copies.
+    fn media_root(tmp: &Path) -> PathBuf {
+        let root = tmp.to_path_buf();
+        fs::create_dir_all(root.join("libexec")).unwrap();
+        fs::create_dir_all(root.join("share/sudo-secretspec")).unwrap();
+        fs::write(root.join("libexec/sudo-secretspec"), b"broker").unwrap();
+        fs::write(root.join("share/sudo-secretspec/AI-GUIDANCE.md"), b"docs").unwrap();
+        fs::write(
+            root.join("share/sudo-secretspec/sudo-secretspec-retired.toml"),
+            b"retired",
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn installing_from_the_installed_tree_itself_is_refused() {
+        // The exact incident: the installed client infers `source_root` from
+        // its own location, so `broker_src` resolves to the boundary that is
+        // already installed. Every copy is a file onto itself, nothing is
+        // malformed, and the install reports success having upgraded nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = media_root(tmp.path());
+        let broker_dst = root.join("libexec/sudo-secretspec");
+
+        let err = resolve_media(&root, &broker_dst)
+            .expect_err("installing from the installed boundary must be refused");
+        assert!(
+            err.to_string()
+                .contains("refusing to install from the installed boundary itself"),
+            "{err}"
+        );
+        // The message has to carry the way out, because the operator reaches
+        // this by running the obvious command.
+        assert!(
+            err.to_string().contains("libexec/sudo-secretspec install"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_hard_link_to_the_installed_broker_is_still_the_same_file() {
+        // Why the check compares (dev, ino) and not canonicalized paths: a hard
+        // link has no link to follow, so path comparison would call these two
+        // distinct files and wave the no-op through.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = media_root(tmp.path());
+        let broker_dst = tmp.path().join("installed-broker");
+        fs::hard_link(root.join("libexec/sudo-secretspec"), &broker_dst).unwrap();
+
+        assert_ne!(root.join("libexec/sudo-secretspec"), broker_dst);
+        let err = resolve_media(&root, &broker_dst)
+            .expect_err("a hard link to the installed broker is the same no-op");
+        assert!(
+            err.to_string()
+                .contains("refusing to install from the installed boundary itself"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn real_media_resolves_to_its_three_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = media_root(tmp.path());
+
+        let media = resolve_media(&root, Path::new("/usr/local/libexec/sudo-secretspec"))
+            .expect("distribution media distinct from the destination must be accepted");
+        assert_eq!(media.broker, root.join("libexec/sudo-secretspec"));
+        assert_eq!(
+            media.guidance,
+            root.join("share/sudo-secretspec/AI-GUIDANCE.md")
+        );
+        assert_eq!(
+            media.retired,
+            root.join("share/sudo-secretspec/sudo-secretspec-retired.toml")
+        );
+    }
+
+    #[test]
+    fn a_first_install_has_no_destination_to_be_confused_with() {
+        // Nothing installed yet: the destination does not exist, so it cannot
+        // be the source, and the media checks must not turn that into a refusal.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = media_root(tmp.path());
+
+        resolve_media(&root, &tmp.path().join("absent/libexec/sudo-secretspec"))
+            .expect("a first install must not be blocked by a missing destination");
+    }
+
+    #[test]
+    fn incomplete_media_names_the_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = media_root(tmp.path());
+        fs::remove_file(root.join("share/sudo-secretspec/AI-GUIDANCE.md")).unwrap();
+
+        let err = resolve_media(&root, Path::new("/usr/local/libexec/sudo-secretspec"))
+            .expect_err("media missing an artifact must be refused");
+        assert!(
+            err.to_string().contains("source media is incomplete"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("AI-GUIDANCE.md"), "{err}");
+    }
+
+    #[test]
+    fn an_explicit_source_root_overrides_the_current_exe_inference() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_source_root(Some(tmp.path())).unwrap(), tmp.path());
+        // Without one it falls back to the running binary's grandparent, which
+        // under `cargo test` is the target directory rather than a keg.
+        assert!(resolve_source_root(None).is_ok());
+    }
+
+    #[test]
+    fn the_version_line_distinguishes_an_upgrade_from_a_reinstall() {
+        // Deliberately not a real predecessor: pinning one would make this test
+        // pass or fail on whatever `VERSION` happens to be today.
+        assert_eq!(
+            version_transition(Some("0.0.0-older")),
+            format!("0.0.0-older -> {VERSION}")
+        );
+        assert_eq!(
+            version_transition(Some(VERSION)),
+            format!("{VERSION} (reinstalled, unchanged)")
+        );
+        // A boundary installed before the stamp existed: report this build
+        // rather than inventing a predecessor.
+        assert_eq!(version_transition(None), VERSION);
+    }
+
+    #[test]
+    fn the_installed_version_is_read_back_from_the_config_it_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("sudo-secretspec.toml");
+        let req = InstallRequest::from_cli(PathBuf::from("/dev/null"), false, false);
+        fs::write(
+            &config,
+            config_toml(&req, Path::new("/private/var/db/sudo-secretspec")),
+        )
+        .unwrap();
+
+        assert_eq!(installed_version(&config).as_deref(), Some(VERSION));
+        // No boundary installed, and a config predating the stamp.
+        assert_eq!(installed_version(&tmp.path().join("absent.toml")), None);
+    }
 
     #[test]
     fn an_install_directory_the_operator_owns_is_refused() {

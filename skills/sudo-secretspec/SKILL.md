@@ -1,7 +1,7 @@
 ---
 name: sudo-secretspec
 description: Use managed credentials through the privilege-separated sudo-secretspec client instead of touching a secret store directly. Use when a task needs an API key, token, or password; when a credential must be declared, set, rotated, read, deleted, or injected into a child process; or when the boundary, drift checker, or audit ledger reports an error. Also covers what is deliberately NOT exposed and must be asked of the operator.
-version: 0.3.0
+version: 0.4.0
 author: Dan Clark (djbclark), Hermes Agent
 license: Apache-2.0
 platforms: [macos]
@@ -18,7 +18,7 @@ consumer execution. Do not access SecretSpec's provider, manifest, or protected
 backing files directly, and never invoke `secretspec` itself for a managed
 deployment.
 
-Verified against client **0.19.1-sudo.12**. `sudo-secretspec --version` is the
+Verified against client **0.19.1-sudo.13**. `sudo-secretspec --version` is the
 authority; if it reports something newer, re-read
 `sudo-secretspec/AI-GUIDANCE.md` rather than trusting this file's specifics.
 If it reports something *older*, the flags marked with a minimum version below
@@ -178,21 +178,29 @@ explicit `unknown` terminal state if restoration cannot be proven.
   `docs/design/template-check-resync.md`.
 - **`install --declarations` does not prune.** It is not a cleanup route for a
   runtime declaration; `undeclare` is.
-- **Upgrading requires the Homebrew `libexec` copy, not `install` on `PATH`.**
+- **Upgrade by running the newly installed copy, not the installed one.**
   `brew upgrade` only replaces files; it never touches the privilege boundary,
-  so `/usr/local/bin/sudo-secretspec` keeps running the old version. Running
-  plain `sudo-secretspec install` then resolves through `PATH` to that *old*
-  client, which reinstalls itself — the version silently does not move. Drive
-  the upgrade from the new copy, which is deliberately off `PATH` so it cannot
-  shadow the installed client:
+  so the installed boundary goes on running the old version until `install`
+  replaces it. The rule for *which* binary to run is: **`install` copies from
+  the tree its own executable lives in.** Run the copy your package manager
+  just staged, which is kept off `PATH` so it cannot shadow the installed
+  client:
 
   ```bash
-  /opt/homebrew/opt/sudo-secretspec/libexec/sudo-secretspec install --adopt-existing
+  "$(brew --prefix)"/opt/sudo-secretspec/libexec/sudo-secretspec install --adopt-existing
   ```
 
-  Confirm with `sudo-secretspec --version` afterwards; if it is unchanged, the
-  upgrade did not happen. This is an operator action — it authenticates
+  Running plain `sudo-secretspec install` instead reaches the *installed*
+  client, whose tree is the destination — so it would copy every artifact onto
+  itself. Since 0.19.1-sudo.13 that is refused outright, with the correct
+  command in the error; before .13 it silently succeeded and upgraded nothing.
+  The install now also prints the version transition
+  (`0.19.1-sudo.12 -> 0.19.1-sudo.13`), so the output itself is the evidence
+  the upgrade happened. This is an operator action — it authenticates
   interactively.
+- **`doctor` reports a staged upgrade** as the `UPGRADE_AVAILABLE` advisory
+  (0.19.1-sudo.13+), naming the path to run. Advisory means `doctor` still
+  exits 0; it is not a stop condition.
 - Permission denied while inspecting a `0700` store is expected and does not
   mean files are missing.
 - Reasons are hashed in the protected broker ledger but may reach SecretSpec's
@@ -216,10 +224,11 @@ Success requires a zero exit status. Some findings are advisory and still exit
 zero — report them to the operator and continue.
 
 **Read the `advisory` field on each finding rather than matching code names.**
-That list has grown twice already; at 0.19.1-sudo.12 it is
-`LEGACY_VAULT_CLUTTER`, `PENDING_ROLLBACK`, `CLIENT_DUPLICATE`, and the three
-`SUDOERS_NEIGHBOUR_*` codes, but treating those names as the definition is how
-this instruction goes stale. Any non-advisory finding is a hard stop.
+That list has grown three times already; at 0.19.1-sudo.13 it is
+`LEGACY_VAULT_CLUTTER`, `PENDING_ROLLBACK`, `CLIENT_DUPLICATE`,
+`UPGRADE_AVAILABLE`, and the three `SUDOERS_NEIGHBOUR_*` codes, but treating
+those names as the definition is how this instruction goes stale. Any
+non-advisory finding is a hard stop.
 
 `CLIENT_SHADOWED` is always a hard stop and must not be worked around: it means
 a different `sudo-secretspec` would run instead of the installed client, so no

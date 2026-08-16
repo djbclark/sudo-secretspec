@@ -7,7 +7,7 @@ Use this policy in `AGENTS.md`, skills, runbooks, and autonomous-agent prompts f
 - Use only the installed `/usr/local/bin/sudo-secretspec` client for credential CRUD and use.
 - Supply a short operational `--reason` for every `add`, `undeclare`, `set`, `delete`, `get`, `check`, `export`, `template-check`, `schema`, or `run` operation. `add` additionally requires `--description`: it declares a secret, it does not set a value. The protected audit ledger stores only its SHA-256 digest.
 - Run a consumer as `sudo-secretspec run --reason "purpose" -- <command>` instead of extracting values into shell history or command arguments.
-- Treat an unavailable broker, failed audit append/verification, declaration mismatch, authorization failure, or non-advisory drift finding as a hard stop. `doctor` marks advisory findings — currently `LEGACY_VAULT_CLUTTER`, `PENDING_ROLLBACK`, `CLIENT_DUPLICATE`, and the three `SUDOERS_NEIGHBOUR_*` codes — and still exits zero; report them to the operator and continue. Read the `advisory` field rather than matching code names: that list has already grown twice, and this sentence is the wrong place to learn it has grown again.
+- Treat an unavailable broker, failed audit append/verification, declaration mismatch, authorization failure, or non-advisory drift finding as a hard stop. `doctor` marks advisory findings — currently `LEGACY_VAULT_CLUTTER`, `PENDING_ROLLBACK`, `CLIENT_DUPLICATE`, `UPGRADE_AVAILABLE`, and the three `SUDOERS_NEIGHBOUR_*` codes — and still exits zero; report them to the operator and continue. Read the `advisory` field rather than matching code names: that list has already grown three times, and this sentence is the wrong place to learn it has grown again.
 - Treat `CLIENT_SHADOWED` as a hard stop and do not work around it: it means a different `sudo-secretspec` would run instead of the installed client, so no operation you perform can be trusted to have reached the boundary. Report the reported path to the operator.
 - Report only the non-secret error and request operator action for boundary installation or repair.
 - Normal broker-mediated credential operations are autonomous when the installed sudoers policy allows them.
@@ -79,14 +79,17 @@ sudo-secretspec doctor
 sudo-secretspec install --dry-run <install options>
 ```
 
-The dry-run still uses `sudo` because protected metadata cannot be validated honestly from the operator UID. It never reads secret contents.
+The dry-run still uses `sudo` because protected metadata cannot be validated honestly from the operator UID. It never reads secret contents. Since 0.19.1-sudo.13 it also resolves and validates the source media, so it catches a bad upgrade invocation rather than reporting on everything except the thing most likely to be wrong.
 
-Upgrading is not `brew upgrade` alone, and not plain `sudo-secretspec install` either. Homebrew only replaces files; it never touches the privilege boundary, so `/usr/local/bin/sudo-secretspec` goes on running the old version. Invoking `sudo-secretspec install` then resolves through `PATH` to that *old* client, which reinstalls itself — the version silently does not move, and the command still reports success. Drive the upgrade from the freshly installed copy, which is kept off `PATH` precisely so it cannot shadow the installed client, then confirm the version actually changed:
+Upgrading is not `brew upgrade` alone: Homebrew only replaces files, and never touches the privilege boundary, so the installed boundary goes on running the old version until `install` replaces it. The rule for which binary to run is that **`install` copies from the tree its own executable lives in**. Run the copy the package manager just staged — kept off `PATH` so it cannot shadow the installed client:
 
 ```bash
-/opt/homebrew/opt/sudo-secretspec/libexec/sudo-secretspec install --adopt-existing
-sudo-secretspec --version
+"$(brew --prefix)"/opt/sudo-secretspec/libexec/sudo-secretspec install --adopt-existing
 ```
+
+Plain `sudo-secretspec install` reaches the *installed* client instead, whose tree is the install destination, so it would copy every artifact onto itself. Since 0.19.1-sudo.13 that is refused with an error naming the correct command; on earlier versions it succeeded, wrote a rollback snapshot, and upgraded nothing. The install now reports the version transition it performed (`0.19.1-sudo.12 -> 0.19.1-sudo.13`, or `(reinstalled, unchanged)`), so its own output is the evidence — a bare success line no longer has to be taken on trust.
+
+`doctor` reports a staged-but-uninstalled build as the advisory `UPGRADE_AVAILABLE`, naming the path to run. Advisory findings do not clear `ok`, so this must not be treated as a stop condition.
 
 Rollback snapshots cover installed artifacts only and deliberately preserve the runtime vault:
 

@@ -104,6 +104,15 @@ After adopt-existing install of the stayturgid vault, doctor may report:
   installed client — that one is a hard stop, not residual noise. This host is
   expected to have exactly one copy, at `/usr/local/bin/sudo-secretspec`; the
   keg's `libexec` bootstrap is not on any search path and is not a shadow.
+- `UPGRADE_AVAILABLE` when the keg's `libexec` bootstrap reports a different
+  version than the installed boundary — a build staged by `brew` but never
+  installed. Also **advisory**: an upgrade the operator has not run yet is not
+  a reason to refuse credential operations. The version it compares against is
+  the `version` key the installer stamps into
+  `/usr/local/etc/sudo-secretspec.toml`; a boundary installed before that key
+  existed reports nothing rather than guessing. Note the staged version is
+  probed by the *unprivileged* client and passed in — the root broker must not
+  execute anything out of an operator-writable Homebrew prefix.
 - audit ledger ownership should be `_secretspec:staff` (fixed in current tree by
   chown-after-open when broker is root). The pre-open metadata check
   deliberately does not assert ownership; the post-open check does, so a

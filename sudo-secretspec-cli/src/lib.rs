@@ -6,4 +6,6 @@ pub mod install;
 pub mod rollback;
 pub mod uninstall;
 
-pub use drift::{Finding, InspectOptions, Layout, Report, inspect, load_config};
+pub use drift::{
+    AvailableBuild, Finding, InspectOptions, Layout, Report, inspect, load_config, media_candidates,
+};

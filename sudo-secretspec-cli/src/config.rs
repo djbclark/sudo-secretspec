@@ -37,6 +37,18 @@ pub struct Config {
     /// them together, so that combination is not reachable.
     #[serde(default = "default_profile")]
     pub profile: String,
+    /// Version of the installer that last wrote this file.
+    ///
+    /// Recorded so an install can report what it replaced and `doctor` can tell
+    /// a pending upgrade from a current one. `Option` rather than a defaulted
+    /// string because a boundary installed before this field existed has no
+    /// honest value to report — `None` means "not recorded", which is different
+    /// from any particular version.
+    ///
+    /// `serde(default)` for the same reason as `profile`: a config written by an
+    /// older installer must still parse.
+    #[serde(default)]
+    pub version: Option<String>,
     #[serde(default)]
     pub adopted_vault: bool,
 }

@@ -182,6 +182,16 @@ enum Cmd {
         /// only widens the shadow scan and is not an operator-facing knob.
         #[arg(long, hide = true)]
         caller_path: Option<OsString>,
+        /// Path of a package-manager build staged but not installed.
+        ///
+        /// Set by the public client alongside `--available-version`. Like
+        /// `caller_path` this is a fact the privileged process cannot safely
+        /// collect for itself, not an operator-facing knob.
+        #[arg(long, hide = true)]
+        available_path: Option<PathBuf>,
+        /// Version that staged build reports.
+        #[arg(long, hide = true, requires = "available_path")]
+        available_version: Option<String>,
     },
     /// Verify the audit ledger's hash chain and report its tip.
     ///
@@ -297,7 +307,16 @@ fn main() {
             json,
             config,
             caller_path,
-        } => doctor(json, config, caller_path),
+            available_path,
+            available_version,
+        } => doctor(
+            json,
+            config,
+            caller_path,
+            available_path
+                .zip(available_version)
+                .map(|(path, version)| sudo_secretspec_cli::AvailableBuild { path, version }),
+        ),
         Cmd::AuditVerify => audit_verify(),
         Cmd::Rollback { snapshot } => {
             if unsafe { libc::geteuid() } != 0 {
@@ -823,7 +842,46 @@ fn run_target(reason: &str, command: &[OsString]) {
     std::process::exit(127);
 }
 
-fn doctor(json: bool, config: Option<PathBuf>, caller_path: Option<OsString>) {
+/// Ask the package manager's staged copy of the boundary what version it is.
+///
+/// Runs only while unprivileged, and that restriction is the point: the
+/// Homebrew prefix is routinely operator-writable, so this is a binary the
+/// *operator* may execute but the root broker must not. `doctor` collects the
+/// answer here and hands it across the elevation boundary as data.
+///
+/// A build that cannot be run, or whose output is not a single version word, is
+/// simply not reported — this feeds an advisory, and guessing would be worse
+/// than staying quiet.
+fn probe_available_build(unprivileged: bool) -> Option<sudo_secretspec_cli::AvailableBuild> {
+    if !unprivileged {
+        return None;
+    }
+    sudo_secretspec_cli::media_candidates()
+        .into_iter()
+        .find_map(|path| {
+            let out = Command::new(&path).arg("--version").output().ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            // `clap` prints "<name> <version>"; take the last word.
+            let version = String::from_utf8(out.stdout)
+                .ok()?
+                .split_whitespace()
+                .next_back()?
+                .to_string();
+            if version.is_empty() {
+                return None;
+            }
+            Some(sudo_secretspec_cli::AvailableBuild { path, version })
+        })
+}
+
+fn doctor(
+    json: bool,
+    config: Option<PathBuf>,
+    caller_path: Option<OsString>,
+    available_build: Option<sudo_secretspec_cli::AvailableBuild>,
+) {
     // `sudo` replaces PATH with the policy's secure_path, so the shadow check
     // has to be told what the caller's PATH was before elevating. Trust the
     // ambient value only while still unprivileged.
@@ -835,11 +893,12 @@ fn doctor(json: bool, config: Option<PathBuf>, caller_path: Option<OsString>) {
             None
         }
     });
+    let available_build = available_build.or_else(|| probe_available_build(unprivileged));
 
     // Privileged checks (sudoers/vault) need root. Prefer NOPASSWD libexec.
     if unprivileged {
         let broker = privileged_broker();
-        let elevated = |with_caller_path: bool| {
+        let elevated = |with_hints: bool| {
             let mut cmd = Command::new(SUDO);
             cmd.arg("-n").arg(&broker).arg("doctor");
             if json {
@@ -848,20 +907,32 @@ fn doctor(json: bool, config: Option<PathBuf>, caller_path: Option<OsString>) {
             if let Some(cfg) = &config {
                 cmd.arg("--config").arg(cfg);
             }
-            if let (true, Some(path)) = (with_caller_path, &caller_path) {
-                cmd.arg("--caller-path").arg(path);
+            if with_hints {
+                if let Some(path) = &caller_path {
+                    cmd.arg("--caller-path").arg(path);
+                }
+                if let Some(build) = &available_build {
+                    cmd.arg("--available-path")
+                        .arg(&build.path)
+                        .arg("--available-version")
+                        .arg(&build.version);
+                }
             }
             cmd
         };
 
         // A client from a newer build can meet an older installed broker: brew
         // hands over a new bootstrap binary before `install` replaces the pair.
-        // The older broker rejects `--caller-path` with clap's usage exit, so
+        // The older broker rejects these hidden flags with clap's usage exit, so
         // capture that attempt rather than letting a bare argument-parsing error
         // stand in for the health check. `doctor` itself exits 0 or 1, so a 2
         // from this path means the broker did not understand the request.
+        //
+        // All hints are passed and dropped together: retrying flag-by-flag would
+        // multiply round trips through `sudo` to recover detail that is
+        // advisory either way.
         let mut can_elevate = true;
-        if caller_path.is_some() {
+        if caller_path.is_some() || available_build.is_some() {
             match elevated(true).output() {
                 Ok(out) if out.status.code() == Some(2) => {
                     // Retry without the flag; the shadow check then runs against
@@ -912,7 +983,10 @@ fn doctor(json: bool, config: Option<PathBuf>, caller_path: Option<OsString>) {
 
     let report = sudo_secretspec_cli::inspect(
         &layout,
-        &sudo_secretspec_cli::InspectOptions { caller_path },
+        &sudo_secretspec_cli::InspectOptions {
+            caller_path,
+            available_build,
+        },
     );
     if json {
         println!("{}", serde_json::to_string_pretty(&report).unwrap());

@@ -48,6 +48,9 @@ pub struct Layout {
     pub sudoers: PathBuf,
     pub source_manifest: PathBuf,
     pub adopted_vault: bool,
+    /// Version stamped into the config by the installer that wrote it, or
+    /// `None` for a boundary installed before the stamp existed.
+    pub installed_version: Option<String>,
 }
 
 impl Layout {
@@ -84,6 +87,7 @@ impl Layout {
             source_manifest: share.join("MANIFEST.sha256"),
             config: config_path,
             adopted_vault: cfg.adopted_vault,
+            installed_version: cfg.version,
         }
     }
 }
@@ -110,7 +114,18 @@ const ADVISORY_CODES: &[&str] = &[
     "SUDOERS_NEIGHBOUR_IGNORED",
     "SUDOERS_NEIGHBOUR_SKIPPED",
     "SUDOERS_NEIGHBOUR_VISUDO_REJECTED",
+    "UPGRADE_AVAILABLE",
 ];
+
+/// Where a package manager keeps the bootstrap copy of the boundary.
+///
+/// Deliberately a fixed list of the two conventional Homebrew prefixes rather
+/// than an invocation of `brew --prefix`: `doctor` reaches this code as root,
+/// and asking an operator-writable tool where to look would let whoever can
+/// write there choose the path a root process stats. Nothing here is executed —
+/// the version is supplied by the unprivileged client, see
+/// [`InspectOptions::available_build`].
+const MEDIA_PREFIXES: &[&str] = &["/opt/homebrew", "/usr/local"];
 
 /// Directories scanned unconditionally for a second copy of the public client.
 ///
@@ -144,6 +159,28 @@ pub struct InspectOptions {
     /// [`SEARCH_DIRS`] is always covered, so a caller passing a doctored value
     /// can add findings but never hide one.
     pub caller_path: Option<OsString>,
+    /// Version reported by the package manager's bootstrap copy, when one is
+    /// present and could be asked.
+    ///
+    /// Obtained by the *unprivileged* client running `<media> --version` before
+    /// it elevates, on the same principle as `caller_path`: the fact is gathered
+    /// where executing it is no more dangerous than the operator doing it by
+    /// hand, and handed in as data. Running that binary from inside the root
+    /// process would be materially different — the Homebrew prefix is routinely
+    /// operator-writable, so it is not code this boundary may execute as root.
+    ///
+    /// Advisory-only, and it can only *add* the [`UPGRADE_AVAILABLE`] finding:
+    /// a caller passing a doctored value nags itself and changes nothing else.
+    ///
+    /// [`UPGRADE_AVAILABLE`]: ADVISORY_CODES
+    pub available_build: Option<AvailableBuild>,
+}
+
+/// A copy of the boundary sitting in package-manager media, not yet installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvailableBuild {
+    pub path: PathBuf,
+    pub version: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -457,6 +494,57 @@ fn classify_candidate(
     }
 }
 
+/// Bootstrap copies of the boundary that a package manager may have staged.
+///
+/// The keg layout is `<prefix>/opt/sudo-secretspec/libexec/sudo-secretspec`,
+/// which the package manager re-points on every upgrade. Note this is *not*
+/// `<prefix>/libexec/sudo-secretspec`: under an Intel Homebrew the install
+/// prefix and the brew prefix are the same `/usr/local`, and those two paths
+/// are what keep the staged copy and the installed boundary distinct there.
+pub fn media_candidates() -> Vec<PathBuf> {
+    MEDIA_PREFIXES
+        .iter()
+        .map(|p| PathBuf::from(p).join("opt/sudo-secretspec/libexec/sudo-secretspec"))
+        .filter(|p| p.is_file())
+        .collect()
+}
+
+/// Decide whether a staged build is worth telling the operator about.
+///
+/// Split out from the filesystem and the subprocess so every branch is testable
+/// without a package manager installed.
+///
+/// Reports only a version *difference*, never an ordering: comparing these
+/// strings as versions would need a parser for a scheme this project does not
+/// own, and "differs" is the honest claim. A staged build that is older than
+/// the installed one is worth surfacing anyway — after a rollback that is
+/// exactly the state the operator needs to see.
+fn classify_available_build(
+    installed_version: Option<&str>,
+    available: Option<&AvailableBuild>,
+) -> Option<Finding> {
+    let available = available?;
+    match installed_version {
+        // Same version staged as installed: the ordinary steady state, and
+        // saying so every run would train the operator to ignore the report.
+        Some(installed) if installed == available.version => None,
+        Some(installed) => Some(finding(
+            "UPGRADE_AVAILABLE",
+            Some(&available.path),
+            format!(
+                "a different build is staged here ({}) than the one installed ({}); install it \
+                 by running that path directly -- it is kept off PATH so it cannot shadow the \
+                 installed client",
+                available.version, installed
+            ),
+        )),
+        // Nothing to compare against: the installed boundary predates the
+        // version stamp. Reporting a difference would be a guess, and the next
+        // install records the stamp and resolves it.
+        None => None,
+    }
+}
+
 /// Report any `sudo-secretspec` outside the installed client path.
 ///
 /// `doctor` otherwise verifies the installation and never asks whether those
@@ -734,6 +822,17 @@ pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
         &mut findings,
     );
 
+    // A build staged by the package manager but never installed. This is the
+    // standing counterpart to the installer's self-source guard: the guard
+    // catches an upgrade attempted the wrong way, this reports an upgrade never
+    // attempted at all.
+    if let Some(f) = classify_available_build(
+        layout.installed_version.as_deref(),
+        opts.available_build.as_ref(),
+    ) {
+        findings.push(f);
+    }
+
     // Source manifest hashes, when present.
     if layout.source_manifest.is_file() {
         for (expected, path) in parse_manifest(&layout.source_manifest) {
@@ -902,6 +1001,73 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
+    fn staged(version: &str) -> AvailableBuild {
+        AvailableBuild {
+            path: PathBuf::from("/opt/homebrew/opt/sudo-secretspec/libexec/sudo-secretspec"),
+            version: version.into(),
+        }
+    }
+
+    #[test]
+    fn a_staged_build_that_differs_from_the_installed_one_is_advised() {
+        let f = classify_available_build(Some("0.19.1-sudo.12"), Some(&staged("0.19.1-sudo.13")))
+            .expect("a staged build the operator has not installed must be reported");
+        assert_eq!(f.code, "UPGRADE_AVAILABLE");
+        // Advisory: `doctor` must still pass, or every automated caller that
+        // treats a drift failure as a hard stop would wedge until the operator
+        // upgraded.
+        assert!(f.advisory);
+        assert!(f.detail.contains("0.19.1-sudo.13"), "{}", f.detail);
+        assert!(f.detail.contains("0.19.1-sudo.12"), "{}", f.detail);
+    }
+
+    #[test]
+    fn the_steady_state_of_staged_matching_installed_is_silent() {
+        assert!(
+            classify_available_build(Some("0.19.1-sudo.13"), Some(&staged("0.19.1-sudo.13")))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn nothing_staged_reports_nothing() {
+        assert!(classify_available_build(Some("0.19.1-sudo.13"), None).is_none());
+    }
+
+    #[test]
+    fn a_boundary_predating_the_version_stamp_is_not_guessed_about() {
+        // No recorded installed version: any claim of difference would be
+        // invented. The next install writes the stamp and resolves it.
+        assert!(classify_available_build(None, Some(&staged("0.19.1-sudo.13"))).is_none());
+    }
+
+    #[test]
+    fn a_staged_build_older_than_the_installed_one_is_still_reported() {
+        // After a rollback this is exactly the state worth surfacing, and the
+        // check deliberately claims only "differs" -- ordering these strings
+        // would need a version parser this project does not own.
+        let f = classify_available_build(Some("0.19.1-sudo.13"), Some(&staged("0.19.1-sudo.12")))
+            .expect("a downgrade is a difference the operator should see");
+        assert_eq!(f.code, "UPGRADE_AVAILABLE");
+    }
+
+    #[test]
+    fn media_candidates_never_name_the_installed_boundary() {
+        // Under an Intel Homebrew the brew prefix and the install prefix are
+        // both /usr/local; the keg path is what keeps the staged copy and the
+        // installed one distinct. If these ever collided, `doctor` would
+        // compare the installed boundary against itself.
+        for candidate in MEDIA_PREFIXES
+            .iter()
+            .map(|p| PathBuf::from(p).join("opt/sudo-secretspec/libexec/sudo-secretspec"))
+        {
+            assert_ne!(
+                candidate,
+                PathBuf::from("/usr/local/libexec/sudo-secretspec")
+            );
+        }
+    }
+
     fn write_cfg(dir: &Path) -> PathBuf {
         let path = dir.join("sudo-secretspec.toml");
         fs::write(
@@ -990,6 +1156,7 @@ service_group = "_sudo_secretspec"
             sudoers: tmp.path().join("sudoers"),
             source_manifest: tmp.path().join("MANIFEST.sha256"),
             adopted_vault: false,
+            installed_version: None,
         };
         let report = inspect(&layout, &InspectOptions::default());
         assert!(
@@ -1022,6 +1189,7 @@ service_group = "_sudo_secretspec"
             sudoers: tmp.join("sudoers"),
             source_manifest: tmp.join("MANIFEST.sha256"),
             adopted_vault: false,
+            installed_version: None,
         }
     }
 
@@ -1524,6 +1692,7 @@ service_group = "_sudo_secretspec"
             sudoers: root.join("sudoers"),
             source_manifest: root.join("MANIFEST.sha256"),
             adopted_vault: false,
+            installed_version: None,
         }
     }
 }
