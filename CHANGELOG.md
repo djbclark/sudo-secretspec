@@ -40,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   media, which it previously skipped entirely — the checks ran only after the
   dry-run had already returned, so a dry run could not report the most likely
   problem with an install.
+- An install that would copy the installed boundary onto itself, or that names
+  incomplete source media, is now refused *before* elevating rather than after.
+  Previously the operator paid an interactive authentication prompt to be told
+  the install would do nothing. The privileged installer still repeats every
+  check as root; that copy remains the authoritative one.
 
 - `add` (both `secretspec add` and `sudo-secretspec add`) takes new
   `--optional` and `--required` flags, writing `required = false` or

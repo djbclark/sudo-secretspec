@@ -738,6 +738,23 @@ fn resolve_media(source_root: &Path, broker_dst: &Path) -> Result<Media, Install
     Ok(media)
 }
 
+/// Resolve and validate the source media without needing root, so a doomed
+/// install can be refused *before* it asks the operator to authenticate.
+///
+/// [`run`] performs the same checks again as root, and that copy is the
+/// authoritative one — this is not a security boundary and must not be treated
+/// as one. It exists because being told "this would upgrade nothing" is only
+/// useful before a Touch ID prompt, not after it. It also means the refusal is
+/// reachable with no authentication at all, so the behaviour can be exercised
+/// unattended rather than only by an operator standing at the machine.
+pub fn preflight_media(source_root: Option<&Path>) -> Result<(), InstallError> {
+    resolve_media(
+        &resolve_source_root(source_root)?,
+        &PathBuf::from(PREFIX).join("libexec/sudo-secretspec"),
+    )
+    .map(|_| ())
+}
+
 /// Version recorded by the installer that last wrote `config_dst`.
 ///
 /// `None` when no boundary is installed yet, or when it was installed before

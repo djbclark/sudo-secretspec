@@ -484,6 +484,16 @@ fn run_install(
     profile: Option<String>,
     non_interactive: bool,
 ) {
+    // Before anything else, and before elevating: an install that would copy
+    // the installed boundary onto itself is refused here rather than after the
+    // operator has authenticated. `install::run` repeats this check as root and
+    // that copy is the authoritative one; this is purely about not charging a
+    // Touch ID prompt for an answer already known.
+    if let Err(e) = sudo_secretspec_cli::install::preflight_media(None) {
+        eprintln!("install denied: {e}");
+        std::process::exit(2);
+    }
+
     let declarations = match resolve_declarations(declarations, non_interactive) {
         Ok(p) => p,
         Err(e) => {
