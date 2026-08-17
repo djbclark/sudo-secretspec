@@ -13,10 +13,30 @@ These options are available on every command:
 |--------|-------------|
 | `-f, --file <FILE>` | Path to `secretspec.toml` (default: auto-detect). Env: `SECRETSPEC_FILE` |
 | `--reason <REASON>` | Reason for accessing secrets, recorded by providers that support audit logging (e.g. Proton Pass agent sessions). Takes precedence over `PROTON_PASS_AGENT_REASON`. Env: `SECRETSPEC_REASON` |
+| `--caller <NAME>` | Software integration invoking SecretSpec; recorded separately from the user reason (0.20+) |
+| `--caller-version <VERSION>` | Version of `--caller`; requires `--caller` (0.20+) |
+| `--caller-operation <OPERATION>` | Integration operation; requires `--caller` (0.20+) |
+| `--caller-resource <RESOURCE>` | Non-secret resource being accessed; requires `--caller` (0.20+) |
 
 ```bash
 $ secretspec run --reason "Deploying web frontend" -- ./deploy.sh
 ```
+
+SecretSpec 0.20+ lets a Git integration identify itself without replacing the
+user-supplied reason:
+
+```bash
+$ secretspec get GITHUB_TOKEN \
+    --caller git \
+    --caller-version 2.51.0 \
+    --caller-operation credential_get \
+    --caller-resource github.com \
+    --reason "push the release tag"
+```
+
+Caller context is caller-asserted audit metadata, not an authenticated identity,
+and never satisfies `require_reason`. Do not put credentials or secret values in
+these fields.
 
 ## Commands
 
@@ -446,10 +466,11 @@ Any cache entry declared for the secret is invalidated so it cannot continue to
 serve the deleted value.
 
 The providers that support deletion in 0.18 are keyring, dotenv, pass, gopass,
-Vault, OpenBao, and Keeper Secrets Manager. Other providers return an explicit
-unsupported-operation error. Vault, OpenBao, and Keeper refuse to delete native
-`ref` entries because their backends would have to destroy a whole externally
-managed path or record rather than only the referenced field.
+Vault, OpenBao, and Keeper Secrets Manager; age supports it starting with
+0.20. Other providers return an explicit unsupported-operation error. Vault,
+OpenBao, and Keeper refuse to delete native `ref` entries because their
+backends would have to destroy a whole externally managed path or record
+rather than only the referenced field.
 
 ### run
 Run a command with secrets injected as environment variables.
@@ -545,7 +566,7 @@ already holds a wider set keeps those values after a scoped `export`, so use
 | Format | Output |
 |--------|--------|
 | `shell` | `export KEY='value'` lines, ready for `eval "$(secretspec export)"` |
-| `dotenv` | `KEY="value"` lines in dotenv syntax (double-quoted, with `\`, `"`, `$`, and newline escaped) |
+| `dotenv` | `KEY=value` lines in dotenv syntax. In 0.20+, values are unquoted when they already round-trip and otherwise double-quoted and escaped; `$` remains literal. |
 | `json` | a single compact JSON object mapping each secret name to its value |
 | `gha` | appends `KEY=value` to the file named by `$GITHUB_ENV` and prints an `::add-mask::` command per value to stdout, so later workflow steps and third-party actions see the secrets |
 
@@ -682,12 +703,58 @@ The log location is read from your user-global config (`[audit]` in `~/.config/s
 
 **Example:**
 ```bash
-$ secretspec audit --action run -n 5
-2026-06-04T18:06:29Z  run    found  ./deploy.sh  API_KEY,DATABASE_URL  (my-app/production)  reason: deploy  [claude-code]
+$ secretspec audit --action get -n 5
+2026-06-04T18:06:29Z  get    found  GITHUB_TOKEN  (my-app/production)  reason: push release tag  caller: git@2.51.0/credential_get github.com
 
 # Pipe raw entries to jq
 $ secretspec audit --json | jq 'select(.outcome == "missing")'
 ```
+
+### completions (0.20+)
+
+:::caution[Version compatibility]
+`completions` is available starting with SecretSpec 0.20.
+:::
+
+Generate a completion script that asks the same command definition used by
+`secretspec --help` for suggestions. Completion results include every command,
+option, possible value, and description supported by the target shell. They
+also provide contextual suggestions for profile, scope, secret, provider, and
+provider-alias names. File arguments complete paths, while `secretspec run`
+completes executables and command-argument paths.
+
+When you press Tab, the completion script invokes `secretspec` to calculate the
+current suggestions. SecretSpec reads the nearest `secretspec.toml` (or the
+manifest selected by `--file` or `SECRETSPEC_FILE`) and user configuration to
+discover names and descriptions. It does not contact providers or read secret
+values.
+
+```bash
+$ secretspec completions <SHELL>
+```
+
+Supported shells are `bash`, `elvish`, `fish`, `nushell`, `powershell`, and
+`zsh`. Load completions for the current session with the command for your
+shell:
+
+- Bash: `source <(secretspec completions bash)`
+- Elvish: `eval (secretspec completions elvish | slurp)`
+- Fish: `secretspec completions fish | source`
+- PowerShell: `secretspec completions powershell | Out-String | Invoke-Expression`
+- Zsh: `autoload -U compinit && compinit && source <(secretspec completions zsh)`
+
+For persistent Bash, Elvish, Fish, PowerShell, or Zsh completions, put the
+corresponding command in your shell's startup file. Generating the script at
+startup keeps it synchronized after a SecretSpec upgrade.
+
+Nushell loads completion modules from a file:
+
+```nu
+secretspec completions nushell | save -f ~/.config/nushell/completions-secretspec.nu
+use ~/.config/nushell/completions-secretspec.nu *
+```
+
+Regenerate that file after upgrading SecretSpec.
 
 ## Environment Variables
 

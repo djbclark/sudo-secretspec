@@ -45,6 +45,14 @@ module Secretspec
     end
   end
 
+  # Caller-asserted software-integration context (SecretSpec 0.20+).
+  CallerContext = Struct.new(:name, :version, :operation, :resource, keyword_init: true) do
+    def to_h
+      { "name" => name, "version" => version, "operation" => operation,
+        "resource" => resource }.compact
+    end
+  end
+
   # One resolved secret. Exactly one of +value+ / +path+ is set.
   ResolvedSecret = Struct.new(:value, :path, :as_path, :source, :source_provider) do
     # The usable string: the file path for as_path secrets, else the value.
@@ -79,12 +87,27 @@ module Secretspec
     # block to Builder#load, which closes automatically) when done so secret
     # files do not accumulate in the temp dir. A file already gone is not an
     # error.
+    #
+    # Every file is attempted even if one cannot be removed; the first such
+    # error is re-raised once the rest have been cleaned up. Stopping at the
+    # first failure would leave the remaining secrets on disk, which is the one
+    # outcome this method exists to prevent. Matches the Go SDK's firstErr and
+    # the .NET SDK's firstError.
     def close
+      first_error = nil
       secrets.each_value do |secret|
         next unless secret.as_path && secret.path
 
-        File.delete(secret.path) if File.exist?(secret.path)
+        begin
+          File.delete(secret.path)
+        rescue Errno::ENOENT
+          # already gone
+        rescue SystemCallError => e
+          first_error ||= e
+        end
       end
+      raise first_error if first_error
+
       nil
     end
   end
@@ -153,6 +176,12 @@ module Secretspec
 
     def with_reason(reason)
       @request["reason"] = reason if reason
+      self
+    end
+
+    # Identify the invoking software integration (SecretSpec 0.20+).
+    def with_caller(caller)
+      @request["caller"] = caller.to_h if caller
       self
     end
 

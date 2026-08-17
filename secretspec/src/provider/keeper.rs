@@ -495,12 +495,6 @@ impl Provider for KeeperProvider {
         self.entry_coordinates(addr).map(|_| ())
     }
 
-    /// This provider implements [`Provider::delete`], so preflight may treat
-    /// its addresses as candidates for deletion.
-    fn supports_delete(&self) -> bool {
-        true
-    }
-
     fn delete(&self, addr: Address<'_>) -> Result<bool> {
         if matches!(addr, Address::Native(_)) {
             return Err(SecretSpecError::ProviderOperationFailed(
@@ -524,6 +518,10 @@ impl Provider for KeeperProvider {
             client.delete_secret(&record.uid)
         })?;
         Ok(true)
+    }
+
+    fn supports_delete(&self) -> bool {
+        true
     }
 
     fn check_deletable(&self, addr: Address<'_>) -> Result<()> {

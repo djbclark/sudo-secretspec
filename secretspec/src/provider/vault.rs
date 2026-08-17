@@ -176,16 +176,14 @@ impl Provider for VaultProvider {
 
     /// Deletes the whole KV path, so it is confined to entries SecretSpec owns;
     /// see [`Self::check_writable`] for the same reasoning about `ref`s.
-    /// This provider implements [`Provider::delete`], so preflight may treat
-    /// its addresses as candidates for deletion.
-    fn supports_delete(&self) -> bool {
-        true
-    }
-
     fn delete(&self, addr: Address<'_>) -> Result<bool> {
         self.core.check_deletable(addr)?;
         let coords = self.resolve_coords(addr)?;
         self.core.delete(&coords)
+    }
+
+    fn supports_delete(&self) -> bool {
+        true
     }
 
     fn check_deletable(&self, addr: Address<'_>) -> Result<()> {

@@ -1,5 +1,6 @@
 //! Core secrets management functionality
 
+use crate::CallerContext;
 use crate::audit::{AuditAction, AuditContext, AuditLogger, AuditOutcome};
 use crate::cache::{self, CacheEntryStatus, CacheOwnership};
 use crate::config::{
@@ -7,7 +8,7 @@ use crate::config::{
     RequireReason, Resolved, SecretEncoding, SecretExtract,
 };
 use crate::error::{Result, SecretSpecError};
-use crate::manifest::{CompiledManifest, MissingPolicy};
+use crate::manifest::{CompiledSpec, MissingPolicy};
 use crate::plan::{PlannedSecret, ResolutionPlan, ResolvedCache, Route};
 use crate::provider::{
     Address, OwnedAddress, ProducedValuePersistence, Provider as ProviderTrait,
@@ -17,6 +18,7 @@ use crate::report::{ResolutionReport, ResolutionStatus, SecretResolution};
 use crate::resolve::{
     NamedResolution, RESOLVE_SCHEMA_VERSION, ResolveResponse, ResolvedSecret, ResolvedSource,
 };
+use crate::spec::Spec;
 use crate::validation::{ConstraintKind, ConstraintViolation, ValidatedSecrets, ValidationErrors};
 use colored::Colorize;
 use data_encoding::{
@@ -24,7 +26,6 @@ use data_encoding::{
 };
 use secrecy::{ExposeSecret, SecretSlice, SecretString};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::convert::TryFrom;
 use std::env;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
@@ -536,7 +537,7 @@ pub struct Secrets {
     config: Config,
     /// Effective profile semantics compiled once from `config` and shared by
     /// planning, runtime resolution, and inventory surfaces.
-    pub(crate) manifest: CompiledManifest,
+    pub(crate) manifest: CompiledSpec,
     /// Directory containing the loaded `secretspec.toml`. Relative filesystem
     /// paths held by file-backed providers (e.g. `dotenv`) are resolved against
     /// this rather than the process's current working directory, so running
@@ -563,6 +564,9 @@ pub struct Secrets {
     /// Reason for this session's secret access, forwarded to providers that
     /// support audit logging (set via [`Secrets::with_reason`]).
     reason: Option<String>,
+    /// Software integration that invoked SecretSpec. This is audit context, not
+    /// a user-supplied reason, and never satisfies `require_reason`.
+    caller: Option<CallerContext>,
     /// Project policy (`[project].require_reason` in secretspec.toml) controlling
     /// when secret access requires an explicit reason.
     require_reason: RequireReason,
@@ -766,7 +770,7 @@ impl Secrets {
         provider: Option<String>,
         profile: Option<String>,
     ) -> Self {
-        let manifest = CompiledManifest::compile(&config);
+        let manifest = CompiledSpec::compile(&config);
         Self {
             config,
             manifest,
@@ -777,6 +781,7 @@ impl Secrets {
             scope: None,
             ignore_ambient_scope: false,
             reason: None,
+            caller: None,
             require_reason: RequireReason::Never,
             audit: None,
             provider_credentials_cache: ProviderCredentialsCache::default(),
@@ -823,13 +828,35 @@ impl Secrets {
     ///
     /// * `path` - Path to the `secretspec.toml` file
     pub fn load_from(path: &Path) -> Result<Self> {
-        let project_config = Config::try_from(path)?;
-        // Semantic validation (required vs default, ref coordinate rules,
-        // generate consistency) runs here so every CLI and SDK entry point
-        // enforces the same rules the config documents. The compiled manifest it
-        // produces is the one stored below, so the effective view is compiled
-        // exactly once per load.
-        let manifest = project_config.validate_and_compile()?;
+        let spec = Spec::try_from(path)?;
+        Self::from_spec(spec)
+    }
+
+    /// Creates a resolver from a Rust-built or parsed [`Spec`].
+    ///
+    /// A spec loaded from a path with [`Spec::try_from`] retains the manifest's
+    /// directory for relative provider paths. Rust-built specs and TOML strings
+    /// use the process's current working directory. [`Self::from_spec_at`]
+    /// explicitly overrides either behavior.
+    ///
+    /// Available starting with SecretSpec 0.20.
+    pub fn from_spec(spec: Spec) -> Result<Self> {
+        let base_dir = spec.base_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+        Self::from_spec_at(spec, base_dir)
+    }
+
+    /// Creates a resolver from a [`Spec`] with an explicit logical base directory.
+    ///
+    /// `base_dir` resolves relative paths held by providers, just as
+    /// [`Self::load_from`] uses the directory containing `secretspec.toml`. The
+    /// path is not canonicalized and does not need to exist at construction
+    /// time.
+    ///
+    /// Available starting with SecretSpec 0.20.
+    pub fn from_spec_at(spec: Spec, base_dir: impl Into<PathBuf>) -> Result<Self> {
+        // A Spec already owns the exact compiled view produced by validation,
+        // so file and Rust frontends both arrive here without recompiling.
+        let (config, manifest) = spec.into_parts();
         let global_config = GlobalConfig::load()?;
         // Auditing is a per-machine concern configured in the user-global config
         // (`[audit]` in ~/.config/secretspec/config.toml), not the project. It is
@@ -840,27 +867,18 @@ impl Secrets {
                 .and_then(|g| g.audit.clone())
                 .unwrap_or_default(),
         );
-        // Directory the config lives in, used to resolve relative provider
-        // paths (e.g. `dotenv:.config/.env`) against the project root instead
-        // of the current working directory. Kept logical (not canonicalized) so
-        // a relative `--file` stays relative to the CWD and Windows extended
-        // (`\\?\`) prefixes are never introduced.
-        let config_dir = path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-
         Ok(Self {
-            require_reason: project_config.project.require_reason.unwrap_or_default(),
-            config: project_config,
+            require_reason: config.project.require_reason.unwrap_or_default(),
+            config,
             manifest,
-            config_dir,
+            config_dir: base_dir.into(),
             global_config,
             provider: None,
             profile: None,
             scope: None,
             ignore_ambient_scope: false,
             reason: env_reason(),
+            caller: None,
             audit,
             provider_credentials_cache: ProviderCredentialsCache::default(),
             write_target_reporter: None,
@@ -1005,6 +1023,38 @@ impl Secrets {
         self
     }
 
+    /// Records the software integration that invoked SecretSpec.
+    ///
+    /// Caller context describes *what* is requesting secrets, while
+    /// [`Secrets::with_reason`] records the user-supplied explanation of *why*.
+    /// It is included in audit events and forwarded to providers, but it never
+    /// satisfies the project's `require_reason` policy.
+    ///
+    /// Blank names are ignored. Optional fields are trimmed and blank values are
+    /// dropped. The context is caller-asserted metadata rather than an
+    /// authenticated identity; it must not contain credentials or secret values.
+    ///
+    /// Available since SecretSpec 0.20.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use secretspec::{CallerContext, Secrets};
+    ///
+    /// let spec = Secrets::load().unwrap().with_caller(
+    ///     CallerContext::new("git")
+    ///         .with_operation("credential_get")
+    ///         .with_resource("github.com"),
+    /// );
+    /// spec.check(false).unwrap();
+    /// ```
+    pub fn with_caller(mut self, caller: CallerContext) -> Self {
+        if let Some(caller) = caller.normalized() {
+            self.caller = Some(caller);
+        }
+        self
+    }
+
     /// Sets a session reason only when none is already in effect.
     ///
     /// This is the "supply a fallback" form of [`Secrets::with_reason`]: an
@@ -1018,6 +1068,9 @@ impl Secrets {
     /// whitespace-only argument still leaves the session without a reason rather
     /// than storing an empty one. Precedence is therefore: an explicit
     /// [`Secrets::with_reason`], then `SECRETSPEC_REASON`, then this default.
+    /// A default reason still counts as a reason for policy purposes. An
+    /// integration that only wants to identify itself should use
+    /// [`Secrets::with_caller`] instead.
     ///
     /// Available since SecretSpec 0.19.
     ///
@@ -1071,7 +1124,7 @@ impl Secrets {
     /// convention-path credentials live at `{project}/{profile}/{credential}`,
     /// so the provider must be built for the same profile its secrets are
     /// addressed under.
-    fn build_provider(
+    pub(crate) fn build_provider(
         &self,
         spec: String,
         profile: Option<&str>,
@@ -1117,7 +1170,12 @@ impl Secrets {
         let credentials = self
             .provider_credentials_cache
             .get_or_try_init(key, || self.resolve_provider_credentials(&spec, &profile))?;
-        self.build_provider_with_credentials(&spec, credentials, allow_inline_cached)
+        self.build_provider_with_credentials(
+            &spec,
+            credentials,
+            allow_inline_cached,
+            Some(&profile),
+        )
     }
 
     /// [`Self::build_provider`], memoized within one resolution so repeated
@@ -1156,18 +1214,32 @@ impl Secrets {
     /// credential source, so credential-source chains are at most one hop and
     /// cannot recurse, and for cache remediation, where the credential source
     /// itself may be what failed.
-    fn build_source_provider(&self, spec: &str) -> Result<Box<dyn ProviderTrait>> {
-        self.build_provider_with_credentials(spec, ProviderCredentials::new(), false)
+    ///
+    /// Deliberately hands the provider no profile: a credential belongs to the
+    /// alias rather than to any one profile ([`PROVIDER_CREDENTIAL_SCOPE`]), and
+    /// [`CredentialSource::address`] must round-trip whichever profile stores and
+    /// reads it. A `ref`-addressed credential would otherwise resolve in the
+    /// storing profile's Infisical environment and read from the reading
+    /// profile's, so a credential stored under `prod` would be missing under
+    /// `dev`. Such a ref keeps needing an explicit `?env=`, which is
+    /// profile-independent by construction.
+    ///
+    /// Cache remediation is the other caller and needs no profile either: it
+    /// addresses through [`Self::cache_address`], which is a convention address
+    /// carrying its own.
+    pub(crate) fn build_source_provider(&self, spec: &str) -> Result<Box<dyn ProviderTrait>> {
+        self.build_provider_with_credentials(spec, ProviderCredentials::new(), false, None)
     }
 
     /// The shared construction body behind generic, routed, and credential
     /// source providers: alias expansion, error enrichment, and the
-    /// base-dir/reason hooks live only here, so those paths cannot drift.
+    /// base-dir/reason/caller hooks live only here, so those paths cannot drift.
     fn build_provider_with_credentials(
         &self,
         spec: &str,
         credentials: ProviderCredentials,
         allow_inline_cached: bool,
+        profile: Option<&str>,
     ) -> Result<Box<dyn ProviderTrait>> {
         // `build_source_provider` calls this body directly, so retain the guard
         // here as well as before credential initialization in the generic path.
@@ -1182,6 +1254,18 @@ impl Secrets {
             .map_err(|err| self.explain_unknown_provider(err, &resolved))?;
         provider.with_base_dir(&self.config_dir);
         provider.set_reason(self.reason.clone());
+        provider.set_caller(self.caller.clone());
+        // Context a native address cannot carry: a `ref` names coordinates only,
+        // so a provider whose store is partitioned by something outside them
+        // (Infisical's environment) reads the operation's profile here. It is
+        // the profile the caller already resolved, so a provider and the
+        // addresses handed to it never disagree about which profile is running.
+        // `None` is for a credential source, which is profile-independent by
+        // contract. Naming stays with the address; this never reaches
+        // `uri`/`storage_identity`.
+        if let Some(profile) = profile {
+            provider.set_profile(profile);
+        }
         Ok(provider)
     }
 
@@ -1308,10 +1392,11 @@ impl Secrets {
         value: &SecretString,
     ) -> Result<String> {
         self.ensure_reason_for(AuditAction::Set, Some(name))?;
-        let provider = self.build_source_provider(&source.provider)?;
         // The store location is profile-independent (see `PROVIDER_CREDENTIAL_SCOPE`);
-        // the session profile is used only to attribute the audit event.
+        // the session profile attributes the audit event, and is the session
+        // context handed to the provider.
         let profile = self.resolve_profile_name(None);
+        let provider = self.build_source_provider(&source.provider)?;
         let project = self.config.project.name.clone();
         let address = source.address(&project, name);
         let result = provider
@@ -1424,9 +1509,9 @@ impl Secrets {
     }
 
     /// Records one audit event with the given variable fields, if auditing is
-    /// enabled (a no-op otherwise). Session-constant fields — project, the session
-    /// reason, and whether auditing is on — are filled here so call sites specify
-    /// only what varies. Single-secret (`get`/`set`/`delete`) and bulk
+    /// enabled (a no-op otherwise). Session-constant fields — project, caller,
+    /// session reason, and whether auditing is on — are filled here so call sites
+    /// specify only what varies. Single-secret (`get`/`set`/`delete`) and bulk
     /// (`check`/`run`/`import`) events go through this one method.
     fn record(
         &self,
@@ -1464,6 +1549,7 @@ impl Secrets {
                     outcome,
                     error_kind: fields.error_kind,
                     reason: self.reason.as_deref(),
+                    caller: self.caller.as_ref(),
                 },
             );
         }
@@ -1703,13 +1789,12 @@ impl Secrets {
                         ),
                     }
                 })?;
-                let selected = match selected {
-                    serde_json::Value::String(value) => value.clone(),
-                    value => {
-                        serde_json::to_string(value).expect("serializing JSON value cannot fail")
-                    }
-                };
-                Ok(SecretString::new(selected.into()))
+                // Rendering is shared with the awssm and scaleway providers.
+                // A null renders as "null" here: this caller was asked for one
+                // pointer and reports what the document holds, unlike a
+                // provider `field`, where a null means "not set" and the chain
+                // continues. See crate::json_field.
+                Ok(crate::json_field::render(selected))
             }
         }
     }
@@ -1809,14 +1894,10 @@ impl Secrets {
         Ok(())
     }
 
-    /// Get a reference to the project configuration.
-    ///
-    /// Used by `secretspec schema` (which needs the manifest, not a provider)
-    /// and by the privilege-separated broker, which must not take the `cli`
-    /// feature. Hidden from the public SDK surface: callers that need a
-    /// manifest load it themselves.
-    #[doc(hidden)]
-    pub fn config(&self) -> &Config {
+    /// Get a reference to the project configuration. Used by `secretspec
+    /// codegen` (which needs the manifest, not a provider) and by tests.
+    #[cfg(any(feature = "cli", test))]
+    pub(crate) fn config(&self) -> &Config {
         &self.config
     }
 
@@ -6130,7 +6211,7 @@ fn write_export(
             // rebuilding and re-sorting a map (which would also re-copy values).
             let content = crate::provider::dotenv::serialize_dotenv_pairs(
                 entries.iter().map(|(key, value)| (*key, *value)),
-            );
+            )?;
             out.write_all(content.as_bytes())
                 .map_err(SecretSpecError::Io)?;
         }
@@ -6250,6 +6331,32 @@ fn gha_heredoc_delimiter(value: &str) -> String {
         if !value.lines().any(|line| line == delimiter) {
             return delimiter;
         }
+    }
+}
+
+#[cfg(test)]
+mod construction_tests {
+    use super::*;
+
+    #[test]
+    fn from_spec_uses_explicit_logical_base_directory() {
+        let spec = Spec::from_toml(
+            r#"
+            [project]
+            name = "embedded"
+            revision = "1.0"
+            require_reason = false
+
+            [profiles.default]
+            TOKEN = { description = "Embedded token", required = false }
+        "#,
+        )
+        .unwrap();
+        let base_dir = PathBuf::from("a-base-directory-that-does-not-exist");
+
+        let secrets = Secrets::from_spec_at(spec, &base_dir).unwrap();
+
+        assert_eq!(secrets.config_dir, base_dir);
     }
 }
 
@@ -6408,9 +6515,9 @@ mod export_tests {
     }
 
     #[test]
-    fn dotenv_format_double_quotes_and_escapes() {
+    fn dotenv_format_uses_minimal_round_trip_quoting() {
         let out = rendered(ExportFormat::Dotenv, &[("A", "pa$$"), ("B", "x")]);
-        assert_eq!(out, "A=\"pa\\$\\$\"\nB=\"x\"\n");
+        assert_eq!(out, "A=pa$$\nB=x\n");
     }
 
     /// The runner unescapes add-mask data before registering it, so the data we
@@ -6490,6 +6597,38 @@ mod policy_tests {
             spec().with_reason("deploy").with_default_reason("").reason,
             Some("deploy".to_string())
         );
+    }
+
+    #[test]
+    fn caller_context_is_normalized_but_never_counts_as_a_reason() {
+        let mut spec = Secrets::new(
+            crate::tests::resolve_test_config(HashMap::new()),
+            None,
+            None,
+            None,
+        )
+        .with_caller(
+            CallerContext::new("  git  ")
+                .with_operation(" credential_get ")
+                .with_resource(" github.com "),
+        );
+
+        assert_eq!(
+            spec.caller,
+            Some(
+                CallerContext::new("git")
+                    .with_operation("credential_get")
+                    .with_resource("github.com")
+            )
+        );
+        spec.require_reason = RequireReason::Always;
+        assert!(matches!(
+            spec.ensure_reason(),
+            Err(SecretSpecError::ReasonRequired)
+        ));
+
+        // A real reason remains independent and satisfies the policy.
+        assert!(spec.with_reason("release package").ensure_reason().is_ok());
     }
 
     #[test]
@@ -7089,7 +7228,7 @@ mod run_prompt_tests {
         assert_eq!(prompts.load(Ordering::SeqCst), 1);
         assert_eq!(
             std::fs::read_to_string(dotenv_path).unwrap(),
-            "DEPLOY_PASSWORD=\"persisted-answer\"\n"
+            "DEPLOY_PASSWORD=persisted-answer\n"
         );
     }
 

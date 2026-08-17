@@ -47,7 +47,7 @@
 //! secretspec check --provider awssm://production@us-east-1
 //! ```
 
-use super::{Address, Provider, ProviderUrl};
+use super::{Address, Provider, ProviderUrl, join_slash_path};
 use crate::{Result, SecretSpecError};
 use aws_sdk_secretsmanager::Client;
 use aws_sdk_secretsmanager::error::{ProvideErrorMetadata, SdkError};
@@ -100,6 +100,15 @@ pub struct AwssmConfig {
     pub tags: BTreeMap<String, String>,
 }
 
+/// Removes redundant trailing separators without changing the effective AWS
+/// secret namespace. A slash-only prefix still represents the root namespace.
+fn canonicalize_prefix(prefix: &str) -> String {
+    match prefix.trim_end_matches('/') {
+        "" => "/".to_string(),
+        prefix => prefix.to_string(),
+    }
+}
+
 impl TryFrom<&ProviderUrl> for AwssmConfig {
     type Error = SecretSpecError;
 
@@ -123,7 +132,9 @@ impl TryFrom<&ProviderUrl> for AwssmConfig {
 
         let region = url.host().filter(|s| !s.is_empty());
 
-        let prefix = url.query_value("prefix");
+        let prefix = url
+            .query_value("prefix")
+            .map(|prefix| canonicalize_prefix(&prefix));
 
         let kms_key_id = url.query_value("kms_key_id");
 
@@ -210,9 +221,10 @@ impl AwssmProvider {
             ));
         }
 
+        let convention_name = format!("secretspec/{project}/{profile}/{key}");
         let secret_name = match prefix {
-            Some(p) => format!("{}/secretspec/{}/{}/{}", p, project, profile, key),
-            None => format!("secretspec/{}/{}/{}", project, profile, key),
+            Some(prefix) => join_slash_path(prefix, &convention_name),
+            None => convention_name,
         };
 
         // AWS secret names can be up to 512 characters
@@ -250,12 +262,9 @@ impl AwssmProvider {
                 name, json_key, e
             ))
         })?;
-        match json.get(json_key) {
-            Some(serde_json::Value::String(s)) => Ok(Some(SecretString::new(s.clone().into()))),
-            // Non-string JSON values (numbers, bools) are rendered as-is.
-            Some(other) => Ok(Some(SecretString::new(other.to_string().into()))),
-            None => Ok(None),
-        }
+        // Selection is a flat key here; rendering the selected value is shared
+        // with the scaleway provider and Secrets::extract_stored_value.
+        Ok(json.get(json_key).and_then(crate::json_field::render_field))
     }
 
     /// Retrieves a secret by its full name/ARN, optionally extracting one key
@@ -455,7 +464,10 @@ impl Provider for AwssmProvider {
         // iterates in sorted key order and `uri()` is deterministic.
         let mut params: Vec<String> = Vec::new();
         if let Some(prefix) = &self.config.prefix {
-            params.push(format!("prefix={}", ProviderUrl::encode_query(prefix)));
+            params.push(format!(
+                "prefix={}",
+                ProviderUrl::encode_query(&canonicalize_prefix(prefix))
+            ));
         }
         if let Some(kms_key_id) = &self.config.kms_key_id {
             params.push(format!(
@@ -553,6 +565,21 @@ mod tests {
     }
 
     #[test]
+    fn test_format_secret_name_normalizes_prefix_boundary() {
+        for (prefix, expected) in [
+            ("myteam", "myteam/secretspec/myapp/prod/DB_URL"),
+            ("myteam/", "myteam/secretspec/myapp/prod/DB_URL"),
+            ("myteam///", "myteam/secretspec/myapp/prod/DB_URL"),
+            ("/myteam/", "/myteam/secretspec/myapp/prod/DB_URL"),
+            ("/", "/secretspec/myapp/prod/DB_URL"),
+        ] {
+            let name =
+                AwssmProvider::format_secret_name(Some(prefix), "myapp", "prod", "DB_URL").unwrap();
+            assert_eq!(name, expected, "prefix {prefix:?}");
+        }
+    }
+
+    #[test]
     fn test_format_secret_name_too_long() {
         let long_key = "A".repeat(500);
         let result = AwssmProvider::format_secret_name(None, "myapp", "prod", &long_key);
@@ -579,6 +606,26 @@ mod tests {
         let p = AwssmProvider::new(config("awssm://us-east-1?prefix=myteam"));
         let coords = p.convention_address("proj", "default", "A").unwrap();
         assert_eq!(coords.item, "myteam/secretspec/proj/default/A");
+    }
+
+    #[test]
+    fn test_convention_address_with_trailing_slash_prefix() {
+        let p = AwssmProvider::new(config("awssm://us-east-1?prefix=myteam/"));
+        let coords = p.convention_address("proj", "default", "A").unwrap();
+        assert_eq!(coords.item, "myteam/secretspec/proj/default/A");
+    }
+
+    #[test]
+    fn trailing_slash_prefix_has_canonical_storage_identity() {
+        let canonical = AwssmProvider::new(config("awssm://us-east-1?prefix=myteam"));
+        let trailing_slash = AwssmProvider::new(config("awssm://us-east-1?prefix=myteam/"));
+
+        assert_eq!(trailing_slash.config.prefix.as_deref(), Some("myteam"));
+        assert_eq!(trailing_slash.uri(), canonical.uri());
+        assert!(crate::provider::same_storage_container(
+            &trailing_slash,
+            &canonical
+        ));
     }
 
     #[test]
@@ -744,6 +791,32 @@ mod tests {
                 .unwrap()
                 .expose_secret(),
             "true"
+        );
+    }
+
+    #[test]
+    fn extract_json_key_null_is_none_not_the_string_null() {
+        // A null value is no value. Rendering it as "null" would satisfy a
+        // required secret and hand the program a password spelled n-u-l-l.
+        let value = r#"{"password": null}"#;
+        assert!(
+            AwssmProvider::extract_json_key("db", value, "password")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn extract_json_key_null_matches_a_missing_key() {
+        let with_null = r#"{"password": null}"#;
+        let without = r#"{"username": "admin"}"#;
+        assert_eq!(
+            AwssmProvider::extract_json_key("db", with_null, "password")
+                .unwrap()
+                .is_none(),
+            AwssmProvider::extract_json_key("db", without, "password")
+                .unwrap()
+                .is_none()
         );
     }
 

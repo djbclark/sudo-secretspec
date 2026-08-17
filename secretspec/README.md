@@ -40,6 +40,7 @@ SecretSpec fixes this by separating secret **declaration** from secret **storage
   - [environment variables](https://secretspec.dev/providers/env)
   - [null](https://secretspec.dev/providers/null) (0.19+)
   - [systemd credentials](https://secretspec.dev/providers/systemd-credential) (0.17+)
+  - [Fly.io application secrets](https://secretspec.dev/providers/fly) (0.20+, write-only)
   - [Google Cloud Secret Manager](https://secretspec.dev/providers/gcsm)
   - [AWS Secrets Manager](https://secretspec.dev/providers/awssm)
   - [AWS Systems Manager Parameter Store](https://secretspec.dev/providers/awsps) (0.18+)
@@ -49,6 +50,7 @@ SecretSpec fixes this by separating secret **declaration** from secret **storage
   - [Bitwarden Password Manager](https://secretspec.dev/providers/bw) (0.18+)
   - [Bitwarden Secrets Manager](https://secretspec.dev/providers/bws) (official `bws` CLI required in SecretSpec 0.17+)
   - [Azure Key Vault](https://secretspec.dev/providers/akv)
+  - [Azure App Configuration](https://secretspec.dev/providers/aac) (0.20+)
   - [Infisical](https://secretspec.dev/providers/infisical) (0.16+)
   - [age](https://secretspec.dev/providers/age) (0.17+)
   - [SOPS](https://secretspec.dev/providers/sops) (0.17+)
@@ -85,6 +87,7 @@ $ secretspec config global init  # 0.17+
   env: Read-only environment variables
   null: Use defaults, generation, or run prompts without storage (0.19+)
   systemd-credential: Read-only systemd service credentials (0.17+)
+  fly: Fly.io application secrets via flyctl, write-only (0.20+)
   pass: Unix password manager with GPG encryption
   gopass: Gopass CLI password manager with GPG encryption (0.15+)
   protonpass: Proton Pass via official pass-cli
@@ -100,6 +103,7 @@ $ secretspec config global init  # 0.17+
   bw: Bitwarden Password Manager (0.18+)
   bws: Bitwarden Secrets Manager
   akv: Azure Key Vault
+  aac: Azure App Configuration (0.20+)
   infisical: Infisical secret management (0.16+)
   age: age-encrypted file (0.17+)
   sops: SOPS encrypted files (0.17+)
@@ -203,6 +207,7 @@ SecretSpec supports multiple storage backends for secrets:
 - **[Environment variables](https://secretspec.dev/providers/env)** - Read-only for CI/CD
 - **[Null](https://secretspec.dev/providers/null)** (0.19+) - Use committed defaults, ephemeral generation, or ephemeral run prompts without secret storage
 - **[systemd credentials](https://secretspec.dev/providers/systemd-credential)** (0.17+) - Read-only credentials passed to the current service
+- **[Fly.io application secrets](https://secretspec.dev/providers/fly)** (0.20+) - Write and delete app secrets through `flyctl`; Fly.io does not expose plaintext values
 - **[Pass](https://secretspec.dev/providers/pass)** - Unix password manager with GPG encryption
 - **[Gopass](https://secretspec.dev/providers/gopass)** (0.15+) - GPG-based password manager with git-synced password store
 - **[Proton Pass](https://secretspec.dev/providers/protonpass)** - End-to-end encrypted via Proton's official pass-cli
@@ -220,6 +225,7 @@ SecretSpec supports multiple storage backends for secrets:
 - **[Bitwarden Password Manager](https://secretspec.dev/providers/bw)** (0.18+) - Bitwarden Password Manager vault via the `bw` CLI
 - **[Bitwarden Secrets Manager](https://secretspec.dev/providers/bws)** - Bitwarden Secrets Manager integration (official `bws` CLI required in SecretSpec 0.17+)
 - **[Azure Key Vault](https://secretspec.dev/providers/akv)** - Azure secret management
+- **[Azure App Configuration](https://secretspec.dev/providers/aac)** (0.20+) - Azure key-value management with Key Vault reference resolution
 - **[Infisical](https://secretspec.dev/providers/infisical)** (0.16+) - Infisical secret management
 - **[age](https://secretspec.dev/providers/age)** (0.17+) - age-encrypted file
 - **[SOPS](https://secretspec.dev/providers/sops)** (0.17+) - SOPS-encrypted files
@@ -309,6 +315,9 @@ secretspec run -- command        # Run command with secrets as env vars
 
 # Inspect access
 secretspec audit                 # Show the local audit log of secret access
+
+# Enable contextual Fish completions for this session (0.20+)
+secretspec completions fish | source
 ```
 
 See the [full CLI reference](https://secretspec.dev/reference/cli) for all commands and options.

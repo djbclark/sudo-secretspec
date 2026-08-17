@@ -7,20 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- `sudo-secretspec install` refuses to install from the installed boundary
-  itself instead of silently upgrading nothing. `install` copies from the tree
-  its own executable lives in, and `/usr/local` is shaped exactly like the
-  distribution media — so running the *installed* client's `install` resolved
-  every source path back to the already-installed files, copied each onto
-  itself, wrote a rollback snapshot, and exited 0 reporting success while the
-  version never moved. It now stops with an error naming the copy to run
-  instead. Reaching the old client through `PATH` was only the most common way
-  in; a symlink, an alias, or a hard link produced the same silent no-op, and
-  all of them are now caught.
-
 ### Added
+
+- The `secretspec` crate gains a `codegen-schema` feature, which exposes JSON
+  Schema emission from a manifest without enabling the full `cli` feature. It
+  exists for the same reason as `manifest-edit`: the privilege boundary needs
+  the emitter and must not pull `clap` and `inquire` into a root-privileged
+  process. Enabling `cli` turns it on, so nothing changes for existing users.
+- **Azure App Configuration provider** (`aac://`, 0.20+): select direct
+  values and Azure Key Vault references by label, prefix, and tags, with Entra
+  ID or connection-string authentication and guarded writes, deletion, and
+  declaration discovery. Azure Key Vault references can pin an exact secret
+  version, cached-route validation compares canonical vault endpoints
+  independently of authentication choice, and discovery rejects ambiguous or
+  invalid convention keys. HTTP redirects are rejected so reads and
+  secret-bearing writes remain confined to the configured store endpoint.
+- The Rust SDK can describe secrets without TOML through the public `Spec`,
+  `SpecBuilder`, `Profile`, and `Secret` API. TOML parsing and code generation
+  use the same validated model, so Rust-first and file-backed projects share
+  inheritance, generation, and provider behavior, including profile-level
+  requiredness defaults and explicit opt-outs from inherited path, prompt, and
+  generation settings. Existing specs can be copied or consumed back into a
+  builder to add, replace, or remove declarations before rebuilding a validated
+  spec. This validated declaration API replaces the previously exposed raw
+  configuration and code-generation implementation types. Custom provider
+  implementations should now return declarations such as
+  `Secret::required(...)` from `Provider::reflect` instead of constructing raw
+  configuration secrets.
+- Structured caller context lets CLI and SDK integrations identify the invoking
+  software, version, operation, and non-secret resource independently of the
+  user-supplied access reason. Audit records and providers receive the context,
+  but it never satisfies the `require_reason` policy.
+- A secret's declared `description` now reaches the generated JSON Schema as
+  a `description` key on its property. [quicktype](https://quicktype.io)
+  turns that into a native docstring in every target language, so SDKs
+  generated from a manifest carry the same descriptions the manifest already
+  declares, instead of losing them at the schema boundary.
+- The Fly.io `fly` provider publishes and deletes application secrets with
+  `secretspec set` and `secretspec delete`, and discovers their names with
+  `init --from`. Fly.io never exposes plaintext secret values, so the provider
+  clearly rejects read operations and CLI guidance recommends only supported
+  workflows. Writes keep values off process arguments by streaming them to
+  `flyctl secrets set` over stdin, refuse boundary whitespace that `flyctl`
+  would silently trim, and scrub ambient Fly token variables before injecting
+  the token selected through the provider credential mechanism.
+- `secretspec completions <shell>` generates completion scripts for Bash,
+  Elvish, Fish, Nushell, PowerShell, and Zsh directly from the CLI definition,
+  including descriptions and contextual suggestions for profiles, scopes,
+  secret names, providers, aliases, paths, and commands. Completion reads
+  configuration metadata only; it never queries providers or reads secret
+  values.
+- OnePassword: a batch resolution no longer degrades to per-secret `op read`
+  calls when some referenced items don't exist. The provider now identifies
+  missing items with one `op item list` per vault and retries the batch once
+  without them (measured: 153-secret resolve with 3 missing items dropped
+  from ~32s to ~6s). Authentication and unavailable-CLI errors during batch
+  resolution now fail immediately instead of retrying every secret
+  individually.
+- OnePassword optional references whose item names resemble authentication
+  diagnostics are omitted as missing instead of aborting batch resolution.
 
 - `sudo-secretspec install` reports the version it moved the boundary through
   (`0.19.1-sudo.12 -> 0.19.1-sudo.13`, or `(reinstalled, unchanged)`) and the
@@ -35,6 +80,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `doctor` reports no upgrade rather than guessing at one.
 
 ### Changed
+
+- Dotenv parsing and rendering now use dotenv-ng throughout the dotenv
+  provider, age-encrypted dotenv blobs, and `secretspec export --format
+  dotenv`. Values containing `$` remain literal, output uses only the quoting
+  needed to round-trip, and bcrypt-style strings containing `$2a$10$...` are
+  no longer corrupted while reading ([#73]). Dotenv keys may include hyphens,
+  leading digits, leading dots, and Unicode. Whitespace, `=`, `#`, and control
+  characters remain invalid in keys.
+
+  [#73]: https://github.com/cachix/secretspec/issues/73
+
+- Provider behavior, configuration, and supported URIs remain unchanged after
+  reorganizing the shared provider infrastructure into focused modules.
+- Applying an active profile preserves each provider's public URI and
+  storage/cache identities, so profile-aware native references continue to
+  match the same provider during planning and resolution.
 
 - `sudo-secretspec install --dry-run` now resolves and validates the source
   media, which it previously skipped entirely — the checks ran only after the
@@ -154,56 +215,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ignored by sudo — its rules are live — even though `visudo -c` complains
   about it.
 
-### Security
-
-- The privileged broker no longer reads configuration the calling user can
-  write. `sudo` on macOS hands the caller's `HOME` to the elevated process
-  (the stock `/etc/sudoers` keeps `HOME` in `env_keep`, which overrides
-  `env_reset`), and the SecretSpec engine resolves its user-global
-  `config.toml` from that `HOME`. A root process was therefore reading
-  `~/.config/secretspec/config.toml`, whose `[audit] path` aims a root writer
-  at any absolute path — creating directories, appending the plaintext reason,
-  and truncating the file once `max_size_bytes` is passed — and whose
-  `[defaults] profile` selects which profile of the protected manifest
-  resolves. The broker now pins `HOME` to `/var/root` and clears the whole
-  `XDG_*` family before dispatching any operation, and the installed sudoers
-  policy carries `env_keep-="HOME"` and `always_set_home` so the same
-  guarantee holds before the process even starts. Re-run
-  `sudo-secretspec install` to update the policy.
-- The broker now clears **every** `SECRETSPEC_*` variable rather than four of
-  them. The engine reads roughly twenty, and four (`SECRETSPEC_OPCLI_PATH`,
-  `SECRETSPEC_BWS_CLI_PATH`, `SECRETSPEC_PASSBOLT_CLI_PATH`,
-  `SECRETSPEC_PROTONPASS_CLI_PATH`) name an executable it launches — as root.
-  The purge is now a prefix rule, so a knob added upstream is covered the day
-  it lands, and it runs before dispatch rather than partway through.
-- The reason for a credential operation is now hashed before it crosses the
-  privilege boundary, which is what the design always claimed. It was passed
-  to the broker as plaintext in `argv`, readable via `ps` and
-  `KERN_PROCARGS2` by every process running as the same user, and left in
-  shell history. `--reason` on the client is unchanged; only the internal
-  broker protocol moved to a digest. A side effect worth having: the engine's
-  own JSONL audit now records the same digest as the SQLite ledger, so the two
-  can be joined on it. A client newer than the installed broker fails with a
-  message pointing at `sudo-secretspec install` rather than falling back to
-  plaintext.
-- The manifest profile the broker resolves from is now recorded in the
-  root-owned `/usr/local/etc/sudo-secretspec.toml` (new `profile` key,
-  defaulting to `default`, settable with `sudo-secretspec install --profile`).
-  It was previously allowed to fall through to the caller's user-global
-  SecretSpec config. Existing configuration files without the key keep
-  working.
-- The bundled agent skill (`skills/sudo-secretspec/SKILL.md`) now documents the
-  full mediated surface — `add`, `undeclare`, `export`, `template-check`, and
-  `audit-verify` were missing — along with the six engine subcommands that are
-  deliberately not exposed, the runtime declaration lifecycle and its `delete`
-  then `undeclare` inverse, and the hazards worth knowing before the first
-  command: `get`/`export` stream values to stdout, `check` reports to stderr,
-  and every lifecycle command authenticates even under `--dry-run`. It also now
-  tells readers to check each `doctor` finding's `advisory` field instead of
-  matching a hardcoded list of codes, and flags `CLIENT_SHADOWED` as a hard
-  stop.
-
 ### Fixed
+
+- Bare `bws://<project-uuid>` provider URIs now target the Bitwarden US cloud
+  vault instead of the public marketing site, restoring reads and writes while
+  keeping the server pinned independently of ambient `bws` configuration.
+  ([#359](https://github.com/cachix/secretspec/issues/359))
+
+- Node SDK processes using `loadAsync()` or `reportAsync()` with AWS Secrets
+  Manager or Parameter Store now exit normally after resolution. Provider
+  runtime and TLS state is torn down on a short-lived resolver thread instead
+  of remaining attached to a persistent libuv worker during macOS process
+  shutdown. ([#343])
+
+  [#343]: https://github.com/cachix/secretspec/issues/343
+
+- The `awssm` and `scaleway` providers now treat a JSON `null` in a `ref` field
+  as no value, the same as an absent key, so the provider chain continues.
+  Previously it was rendered as the four-character string `null`, which
+  satisfied a required secret and reached the program as a password or token
+  spelled `n-u-l-l`. The `bw` and `dashlane` providers already behaved this way.
+  An `extract` pointer is unchanged: it names one location and still reports a
+  `null` there, and the two policies now sit next to each other in one place.
+- The Python and Ruby SDKs' `Resolved.close()`/`Resolved#close` now remove every
+  `as_path` temp file even when one of them cannot be removed, raising the first
+  such error only after the rest are cleaned up. Previously the first failure
+  aborted the loop and left the remaining secret files on disk, which is the
+  outcome `close` exists to prevent. This matches the Go SDK's `firstErr` and the
+  .NET SDK's `firstError`. The Ruby SDK also no longer skips a dangling symlink,
+  which `File.exist?` reports as absent.
+- The `awssm` provider now accepts a trailing slash in `?prefix=` without
+  inserting a second slash into the AWS secret name. For example,
+  `?prefix=myteam/` resolves to `myteam/secretspec/...`, matching
+  `?prefix=myteam`, and both spellings share one provider identity so import
+  diagnostics still recognize alias-specific references. This avoids silently
+  treating the secret as missing or writing to a distinct double-slash name. Closes
+  [#344](https://github.com/cachix/secretspec/issues/344).
+
+- `import --delete-source` no longer fails partway through, after already
+  writing the destination, for a provider that cannot delete. `check_deletable`
+  previously answered whether an address's coordinates resolve, not whether
+  the provider supports deletion at all, so a provider inheriting the default
+  `delete` (which errors) still passed preflight. A new `Provider::supports_delete`
+  capability lets `check_deletable` reject those providers up front, before the
+  copy phase runs.
+
+- Infisical secret references no longer require `?env=` in the provider URI: a
+  `ref` names a folder and key but never an environment, so it now falls back to
+  the profile the run resolves under. One alias can therefore serve every profile
+  while naming secrets flat — `ref = { item = "/{key}" }` — instead of needing
+  one alias per environment. An explicit `?env=` still pins the environment.
+  When every requested secret gets Infisical's ambiguous 404, SecretSpec now
+  checks the environment root once without requesting secret values and reports
+  a missing environment or project, naming whether the profile or `?env=`
+  selected it. A genuinely absent secret or folder in an existing environment
+  remains unset so provider fallback still works. A credential declared with a
+  `ref` still needs `?env=`, so it resolves the same way whichever profile is
+  running. ([#338])
+
+  [#338]: https://github.com/cachix/secretspec/issues/338
+
+- `secretspec set` against an Infisical secret names the environment in its
+  pre-write preview, which the previous description left out.
+
+- Infisical import collision checks now recognize when aliases target the same
+  secret through a profile-derived versus explicit environment, or through an
+  absolute ref that overrides different configured path defaults, preventing
+  aliased destinations from overwriting one another.
+
+- `sudo-secretspec install` refuses to install from the installed boundary
+  itself instead of silently upgrading nothing. `install` copies from the tree
+  its own executable lives in, and `/usr/local` is shaped exactly like the
+  distribution media — so running the *installed* client's `install` resolved
+  every source path back to the already-installed files, copied each onto
+  itself, wrote a rollback snapshot, and exited 0 reporting success while the
+  version never moved. It now stops with an error naming the copy to run
+  instead. Reaching the old client through `PATH` was only the most common way
+  in; a symlink, an alias, or a hard link produced the same silent no-op, and
+  all of them are now caught.
 
 - The Homebrew formula now declares its SQLite dependencies. The companion
   builds `rusqlite` against the system SQLite rather than the bundled copy, so
@@ -450,6 +539,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   newer version, but the manifest advertised a version the workspace no longer
   contained.
 
+### Security
+
+- The privileged broker no longer reads configuration the calling user can
+  write. `sudo` on macOS hands the caller's `HOME` to the elevated process
+  (the stock `/etc/sudoers` keeps `HOME` in `env_keep`, which overrides
+  `env_reset`), and the SecretSpec engine resolves its user-global
+  `config.toml` from that `HOME`. A root process was therefore reading
+  `~/.config/secretspec/config.toml`, whose `[audit] path` aims a root writer
+  at any absolute path — creating directories, appending the plaintext reason,
+  and truncating the file once `max_size_bytes` is passed — and whose
+  `[defaults] profile` selects which profile of the protected manifest
+  resolves. The broker now pins `HOME` to `/var/root` and clears the whole
+  `XDG_*` family before dispatching any operation, and the installed sudoers
+  policy carries `env_keep-="HOME"` and `always_set_home` so the same
+  guarantee holds before the process even starts. Re-run
+  `sudo-secretspec install` to update the policy.
+- The broker now clears **every** `SECRETSPEC_*` variable rather than four of
+  them. The engine reads roughly twenty, and four (`SECRETSPEC_OPCLI_PATH`,
+  `SECRETSPEC_BWS_CLI_PATH`, `SECRETSPEC_PASSBOLT_CLI_PATH`,
+  `SECRETSPEC_PROTONPASS_CLI_PATH`) name an executable it launches — as root.
+  The purge is now a prefix rule, so a knob added upstream is covered the day
+  it lands, and it runs before dispatch rather than partway through.
+- The reason for a credential operation is now hashed before it crosses the
+  privilege boundary, which is what the design always claimed. It was passed
+  to the broker as plaintext in `argv`, readable via `ps` and
+  `KERN_PROCARGS2` by every process running as the same user, and left in
+  shell history. `--reason` on the client is unchanged; only the internal
+  broker protocol moved to a digest. A side effect worth having: the engine's
+  own JSONL audit now records the same digest as the SQLite ledger, so the two
+  can be joined on it. A client newer than the installed broker fails with a
+  message pointing at `sudo-secretspec install` rather than falling back to
+  plaintext.
+- The manifest profile the broker resolves from is now recorded in the
+  root-owned `/usr/local/etc/sudo-secretspec.toml` (new `profile` key,
+  defaulting to `default`, settable with `sudo-secretspec install --profile`).
+  It was previously allowed to fall through to the caller's user-global
+  SecretSpec config. Existing configuration files without the key keep
+  working.
+- The bundled agent skill (`skills/sudo-secretspec/SKILL.md`) now documents the
+  full mediated surface — `add`, `undeclare`, `export`, `template-check`, and
+  `audit-verify` were missing — along with the six engine subcommands that are
+  deliberately not exposed, the runtime declaration lifecycle and its `delete`
+  then `undeclare` inverse, and the hazards worth knowing before the first
+  command: `get`/`export` stream values to stdout, `check` reports to stderr,
+  and every lifecycle command authenticates even under `--dry-run`. It also now
+  tells readers to check each `doctor` finding's `advisory` field instead of
+  matching a hardcoded list of codes, and flags `CLIENT_SHADOWED` as a hard
+  stop.
+
 ## [0.19.1] - 2026-08-11
 
 Republishes 0.19.0's command-line artifacts. The library and CLI behave exactly
@@ -457,6 +595,11 @@ as in 0.19.0.
 
 ### Added
 
+- The age provider supports deleting secrets: `secretspec delete`,
+  `secretspec import --delete-source`, and cache invalidation now work with
+  it, so an age-encrypted file can serve as the local store of a cached
+  provider alias — an encrypted-at-rest cache with no keyring daemon or OS
+  keychain involved.
 - Windows ARM64 CLI release artifacts (`aarch64-pc-windows-msvc`), attached to
   the GitHub Release as `secretspec-aarch64-pc-windows-msvc.zip` with a
   checksum. The static installer keeps selecting the x86_64 build on Windows

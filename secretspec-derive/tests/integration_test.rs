@@ -102,23 +102,6 @@ mod complex_generation {
     }
 }
 
-mod empty_generation {
-    use super::*;
-
-    declare_secrets!("tests/fixtures/empty.toml");
-
-    #[test]
-    fn test_empty_struct() {
-        // Verify the struct is generated even with no secrets
-        let _size = std::mem::size_of::<SecretSpec>();
-
-        // The struct should have no fields
-        fn _test_no_fields(_s: SecretSpec) {
-            // Empty struct
-        }
-    }
-}
-
 mod as_path_lifetime {
     use super::*;
     use std::fs;
@@ -351,6 +334,16 @@ mod profile_inheritance {
         // SECRETSPEC_REASON env var. (Not loading; just verifying the API exists.)
         let _ = SecretSpec::builder()
             .with_reason("running database migrations")
+            .with_provider("dotenv://.env");
+
+        // Caller context identifies an integration without standing in for a
+        // user-supplied reason (0.20+).
+        let _ = SecretSpec::builder()
+            .with_caller(
+                secretspec::CallerContext::new("git")
+                    .with_operation("credential_get")
+                    .with_resource("github.com"),
+            )
             .with_provider("dotenv://.env");
     }
 }

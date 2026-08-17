@@ -870,7 +870,15 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
         // profile is the one in the root-owned config, not a caller flag —
         // an arbitrary profile would enumerate shapes the boundary is not
         // configured for.
-        "source-schema" => match emit_schema(secrets.config(), &cfg.profile) {
+        // Loaded from the protected manifest path rather than taken off
+        // `secrets`: the schema needs the declarations only, and `Spec` is the
+        // supported way to obtain them. `manifest` is the same root-owned file
+        // `Secrets` was loaded from, so the two cannot describe different
+        // declarations.
+        "source-schema" => match secretspec::Spec::try_from(manifest.as_path())
+            .map_err(|e| e.to_string())
+            .and_then(|spec| emit_schema(&spec, &cfg.profile))
+        {
             Ok(schema) => {
                 print!("{schema}");
                 (0, vec![])
@@ -888,9 +896,18 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
 ///
 /// Value-free: `codegen` reads declarations only. The caller supplies the
 /// profile; the broker always passes the one from the root-owned config.
-fn emit_schema(config: &secretspec::Config, profile: &str) -> Result<String, String> {
-    let ir = secretspec::codegen::build_ir(config);
-    secretspec::codegen::schema::emit(&ir, Some(profile))
+///
+/// Both halves come from `secretspec::__private`, which upstream marks
+/// `#[doc(hidden)]` and disclaims. That is deliberate and temporary: upstream
+/// consolidated the public API on `Spec` but left no `Spec`-shaped path to
+/// schema emission, so there is no supported alternative today. The clean
+/// shape is a `Spec::schema_json(profile)` method upstream — tracked in
+/// `sudo-secretspec/UPSTREAM-CONTACT.md` under "shape debt". If a future merge
+/// breaks this function, that is the debt coming due; ask for the `Spec`
+/// method rather than reaching further into internals.
+fn emit_schema(spec: &secretspec::Spec, profile: &str) -> Result<String, String> {
+    let ir = secretspec::__private::codegen::build_ir(spec);
+    secretspec::__private::codegen::schema::emit(&ir, Some(profile))
 }
 
 #[cfg(test)]
@@ -1049,7 +1066,8 @@ mod tests {
         // The public client does not take `--profile`. This helper is what the
         // broker calls with the root-owned config's profile, so a production-
         // only name must not appear when that profile is `default`.
-        let config: secretspec::Config = r#"
+        let spec = secretspec::Spec::from_toml(
+            r#"
 [project]
 name = "schema-test"
 revision = "1.0"
@@ -1061,12 +1079,12 @@ API_KEY = { description = "optional api key", required = false }
 [profiles.production]
 DATABASE_URL = { description = "prod database", required = true }
 PROD_ONLY = { description = "production-only token", required = true }
-"#
-        .parse()
+"#,
+        )
         .unwrap();
 
         let schema: serde_json::Value =
-            serde_json::from_str(&emit_schema(&config, "default").unwrap()).unwrap();
+            serde_json::from_str(&emit_schema(&spec, "default").unwrap()).unwrap();
         assert_eq!(schema["title"], "DefaultSecrets");
         assert_eq!(schema["properties"]["DATABASE_URL"]["type"], "string");
         assert_eq!(
@@ -1082,11 +1100,11 @@ PROD_ONLY = { description = "production-only token", required = true }
         assert!(schema["properties"]["DATABASE_URL"].get("const").is_none());
 
         let production: serde_json::Value =
-            serde_json::from_str(&emit_schema(&config, "production").unwrap()).unwrap();
+            serde_json::from_str(&emit_schema(&spec, "production").unwrap()).unwrap();
         assert!(production["properties"]["PROD_ONLY"].is_object());
         // Effective profile fields include inheritance from `default`.
         assert!(production["properties"]["API_KEY"].is_object());
 
-        assert!(emit_schema(&config, "staging").is_err());
+        assert!(emit_schema(&spec, "staging").is_err());
     }
 }

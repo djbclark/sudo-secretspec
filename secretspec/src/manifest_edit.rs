@@ -12,6 +12,7 @@
 
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 
+/// Rejects names that cannot occupy a flattened secret key in a profile.
 pub(crate) fn validate_add_secret_name(name: &str) -> Result<()> {
     if !crate::config::is_valid_identifier(name) {
         return Err(miette!(
@@ -36,6 +37,12 @@ pub(crate) fn validate_add_secret_name(name: &str) -> Result<()> {
 /// filesystem. Exposed so the downstream privilege boundary can perform the
 /// same edit without shelling out to this CLI — it must write the result
 /// itself, in place, to preserve the vault file's ownership.
+///
+/// `toml_edit` retains the user's comments, whitespace, ordering, and any
+/// syntax that `Config` does not represent, so the rest of the document is not
+/// re-serialized. The caller validates the selected profile against the fully
+/// loaded configuration first; this helper creates a local profile table when
+/// that profile currently comes only from `extends`.
 ///
 /// `required` is tri-state, and the third state is the reason it is not a
 /// plain `bool`. `None` writes no `required` key, which is what this function
@@ -274,7 +281,7 @@ required = false
         // the emitted text: `check` fails on a required-but-unset secret and
         // passes on an optional-but-unset one, so the written bytes have to
         // compile to a secret the engine treats as not-required.
-        use crate::Config;
+        use crate::config::Config;
 
         let added =
             add_secret_to_manifest(MANIFEST, "default", "SCRATCH", "temp", Some(false)).unwrap();

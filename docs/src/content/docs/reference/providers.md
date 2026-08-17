@@ -303,6 +303,39 @@ passbolt://?template=teams/{project}/{profile}/{key}   # Replace the convention 
 
 **Write limitation**: `go-passbolt-cli` accepts created/updated values only as flags, so a value being written is visible in the child process argv until it exits. See the [Passbolt provider security notes](/providers/passbolt/#security-considerations-and-limitations).
 
+## Fly.io secrets provider (0.20+)
+
+**Availability**: Added in SecretSpec 0.20.
+
+**URI**: `fly://APP[?stage=true][&detach=true]` - Publishes application
+secrets through `flyctl secrets`
+
+```text
+fly://my-app                    # Update Machines and monitor the rollout
+fly://my-app?stage=true         # Register changes without deploying them
+fly://my-app?detach=true        # Start the rollout without monitoring it
+```
+
+**Features (0.20+)**: Write, delete, provider credentials, and name-only
+discovery through `init --from`; secret values are sent to `flyctl` over stdin
+instead of process arguments
+
+**Prerequisites (0.20+)**: `flyctl`, an authenticated login or an
+`access_token` provider credential (`FLY_API_TOKEN` and `FLY_ACCESS_TOKEN` are
+fallbacks), and permission to manage the app named in the URI
+
+**Storage (0.20+)**: Fly app secret `{key}`. The app URI, rather than the
+SecretSpec project or profile name, supplies isolation.
+
+**Read limitation**: Fly.io exposes secret names and digests but never
+plaintext values. `get`, `check`, `run`, fallback reads, generation-on-miss,
+and prompting-on-miss cannot use this write-only provider. See the
+[Fly.io provider guide](/providers/fly/).
+
+**Write limitation (0.20+)**: `flyctl` trims values read from stdin. SecretSpec
+rejects leading or trailing whitespace rather than silently publishing a
+different value.
+
 ## Google Cloud Secret Manager Provider
 
 **URI**: `gcsm://PROJECT_ID` - Stores secrets in Google Cloud Secret Manager
@@ -497,9 +530,45 @@ akv://myvault.vault.azure.cn             # Sovereign cloud (full DNS name)
 akv://myvault?suffix=vault.azure.cn      # Sovereign cloud (explicit suffix, bare vault name)
 ```
 
-**Features**: Read/write, cloud sync, profiles, service principal/managed identity/workload identity auth
+**Features**: Read/write, cloud sync, profiles, service principal/managed identity/workload identity auth, version-pinned refs (0.20+)
 **Prerequisites**: An Azure Key Vault instance, authenticated via one of the methods above, build with `--features akv`
 **Storage**: Secret name `secretspec--{base32(project)}--{base32(profile)}--{base32(key)}` (lowercase, unpadded Base32 preserves case and punctuation distinctions within Azure's case-insensitive secret-name namespace)
+
+## Azure App Configuration Provider (0.20+)
+
+:::caution[Version compatibility]
+The `aac` provider is added in SecretSpec 0.20.
+:::
+
+**URI**:
+`aac://STORE[?auth=METHOD][&label=LABEL][&prefix=PREFIX][&tag=NAME=VALUE]...`
+- Reads and manages Azure App Configuration key-values and resolves canonical
+  Azure Key Vault references
+
+```bash
+aac://payments-production
+aac://shared?label=production&prefix=payments:
+aac://shared?tag=app=payments&tag=stage=production
+aac://shared?auth=connection_string&key_vault_auth=managed_identity
+```
+
+**Features (0.20+)**: Read/write/delete, project and profile namespacing,
+declaration discovery, exact label and tag selection, sovereign-cloud endpoint
+configuration, Entra or connection-string authentication, and Key Vault
+reference resolution
+**Prerequisites (0.20+)**: An Azure App Configuration store and matching
+data-plane permissions. Official and default builds include AAC; custom minimal
+builds use `--features aac`. Key Vault references also require an Entra
+identity with secret-read access.
+**Authentication (0.20+)**: `env`, `cli`, `managed_identity`,
+`workload_identity`, or `connection_string`. Prefer Entra authentication so
+workloads use Azure RBAC without distributing App Configuration access keys;
+reserve connection strings for environments where Entra is unavailable. See
+the [provider guide](/providers/aac/#authentication) for App
+Configuration and Key Vault identity separation.
+**Storage (0.20+)**:
+`{prefix}secretspec:{project}:{profile}:{key}` under one exact label; omission
+selects the null label
 
 ## Infisical Provider
 
@@ -524,8 +593,15 @@ legacy `INFISICAL_API_URL`, then defaults to Infisical Cloud.
 **Storage**: Secret `{key}` in folder `/secretspec/{project}/{profile}`, in the environment named by the profile (or by `?env=`). Keys are stored verbatim.
 
 By default the SecretSpec profile names the Infisical environment, so a `production` profile reads
-the `production` environment. Projects whose environments do not correspond to profiles pin one with
+the `production` environment. This covers refs as well as convention naming (0.20+).
+Projects whose environments do not correspond to profiles pin one with
 `?env=`; the profile still names the folder, so profiles never share a secret.
+
+Infisical uses the same 404 for a missing secret, folder, environment, or
+project. In SecretSpec 0.20+, an all-missing read checks the environment root
+once and reports a missing environment or project, including whether the
+profile or `?env=` selected the environment. Ordinary missing secrets and
+folders remain unset so provider fallback continues.
 
 Values are read with Infisical's secret references expanded, matching its own CLI, so a value of
 `postgres://${DB_USER}@host` arrives resolved.
@@ -542,7 +618,7 @@ age://secrets.age?identity=/home/alice/.config/age/plugin-identity.txt
 age://secrets.age?recipients-file=secrets.age.recipients # Share with a roster
 ```
 
-**Features**: Read/write, committed-file storage, X25519 and SSH keys, native tagged recipients, and non-interactive `age-plugin-*` recipients and identities
+**Features**: Read/write, delete (0.20+), committed-file storage, X25519 and SSH keys, native tagged recipients, and non-interactive `age-plugin-*` recipients and identities
 **Prerequisites**: An age identity; hybrid ML-KEM-768 + X25519 keys from `age-keygen -pq` are recommended for new setups and currently require the non-interactive `age-plugin-pq` compatibility plugin. Build with `--features age`.
 **Authentication**: The `identity` credential, `AGE_IDENTITY`, or `?identity=`; recipients from `?recipients-file=` or derived from the identity
 **Storage**: One `KEY=value` entry per secret inside the encrypted blob at PATH
@@ -617,6 +693,7 @@ $ export SECRETSPEC_PROVIDER="dotenv:///config/.env"
 | Gopass | ✅ GPG encryption | Local filesystem | ❌ No |
 | Proton Pass | ✅ End-to-end | Cloud (Proton) | ✅ Yes |
 | Passbolt (0.19+) | ✅ End-to-end | Self-hosted (Passbolt server) | ✅ Yes |
+| Fly.io secrets (0.20+) | ✅ Fly.io-managed | Cloud (Fly.io app vault) | ✅ Yes |
 | LastPass | ✅ End-to-end | Cloud (LastPass) | ✅ Yes |
 | Dashlane (0.18+) | ✅ End-to-end | Cloud (Dashlane), synced locally | Yes — `dcli` auto-syncs hourly |
 | 1Password | ✅ End-to-end | Cloud (1Password) | ✅ Yes |
@@ -630,6 +707,7 @@ $ export SECRETSPEC_PROVIDER="dotenv:///config/.env"
 | BW (0.18+) | ✅ End-to-end | Cloud (Bitwarden) or self-hosted | ✅ Yes |
 | BWS | ✅ End-to-end | Cloud (Bitwarden) | ✅ Yes |
 | AKV | ✅ Azure-managed | Cloud (Azure) | ✅ Yes |
+| Azure App Configuration (0.20+) | ✅ Azure-managed | Cloud (Azure) | ✅ Yes |
 | Infisical | ✅ Infisical-managed | Cloud (Infisical) or self-hosted | ✅ Yes |
 | age (0.17+) | ✅ age encryption | Local filesystem | ❌ No |
 | SOPS (0.17+) | ✅ Configured SOPS encryption | Local filesystem | Depends on configured key service |

@@ -205,12 +205,6 @@ impl Provider for KeyringProvider {
         Ok(())
     }
 
-    /// This provider implements [`Provider::delete`], so preflight may treat
-    /// its addresses as candidates for deletion.
-    fn supports_delete(&self) -> bool {
-        true
-    }
-
     fn delete(&self, addr: Address<'_>) -> Result<bool> {
         let (service, username) = self.entry_target(addr)?;
         let entry = Entry::new(&service, &username)?;
@@ -219,6 +213,10 @@ impl Provider for KeyringProvider {
             Err(keyring::Error::NoEntry) => Ok(false),
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn supports_delete(&self) -> bool {
+        true
     }
 }
 

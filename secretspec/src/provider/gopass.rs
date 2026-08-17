@@ -242,12 +242,6 @@ impl Provider for GoPassProvider {
         Ok(())
     }
 
-    /// This provider implements [`Provider::delete`], so preflight may treat
-    /// its addresses as candidates for deletion.
-    fn supports_delete(&self) -> bool {
-        true
-    }
-
     fn delete(&self, addr: Address<'_>) -> crate::Result<bool> {
         let entry_name = super::flat_item(self, addr)?;
         let output = self
@@ -274,6 +268,10 @@ impl Provider for GoPassProvider {
         Err(SecretSpecError::ProviderOperationFailed(format!(
             "gopass command failed: {stderr}"
         )))
+    }
+
+    fn supports_delete(&self) -> bool {
+        true
     }
 
     fn name(&self) -> &'static str {

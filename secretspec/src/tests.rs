@@ -13,6 +13,15 @@ use std::sync::{Arc, Mutex};
 use std::{fs, io};
 use tempfile::TempDir;
 
+fn dotenv_values(path: &Path) -> HashMap<String, String> {
+    dotenv::EnvLoader::with_path(path)
+        .sequence(dotenv::EnvSequence::InputOnly)
+        .load()
+        .unwrap()
+        .into_iter()
+        .collect()
+}
+
 // Helper function for tests that need to parse from string
 fn parse_spec_from_str(content: &str, _base_path: Option<&Path>) -> Result<Config> {
     // Parse the TOML content directly
@@ -2989,16 +2998,8 @@ fn test_import_between_dotenv_files() {
     let result = spec.import(&from_provider);
     assert!(result.is_ok(), "Import should succeed: {:?}", result);
 
-    // Verify using dotenvy that the values are correct
-    let vars: HashMap<String, String> = {
-        let mut result = HashMap::new();
-        let env_vars = dotenvy::from_path_iter(&target_env_path).unwrap();
-        for item in env_vars {
-            let (k, v) = item.unwrap();
-            result.insert(k, v);
-        }
-        result
-    };
+    // Verify using the same dotenv parser that the values are correct.
+    let vars = dotenv_values(&target_env_path);
 
     // SECRET_ONE should be imported
     assert_eq!(
@@ -3120,16 +3121,8 @@ fn test_import_edge_cases() {
         result
     );
 
-    // Verify using dotenvy that the values are correct
-    let vars: HashMap<String, String> = {
-        let mut result = HashMap::new();
-        let env_vars = dotenvy::from_path_iter(&target_env_path).unwrap();
-        for item in env_vars {
-            let (k, v) = item.unwrap();
-            result.insert(k, v);
-        }
-        result
-    };
+    // Verify using the same dotenv parser that the values are correct.
+    let vars = dotenv_values(&target_env_path);
 
     // Empty value should be imported
     assert_eq!(
@@ -3383,16 +3376,8 @@ fn test_import_with_profiles() {
     let result = spec.import(&from_provider);
     assert!(result.is_ok());
 
-    // Verify using dotenvy
-    let vars: HashMap<String, String> = {
-        let mut result = HashMap::new();
-        let env_vars = dotenvy::from_path_iter(&target_env_path).unwrap();
-        for item in env_vars {
-            let (k, v) = item.unwrap();
-            result.insert(k, v);
-        }
-        result
-    };
+    // Verify using the same dotenv parser.
+    let vars = dotenv_values(&target_env_path);
 
     // Only DEV_SECRET and SHARED_SECRET should be imported (not PROD_SECRET)
     assert_eq!(
@@ -3744,9 +3729,12 @@ fn test_import_dotenv_profile_issue_36() {
                 println!("{}", target_contents);
 
                 // The real bug: JWT_SECRET should be imported from .env
-                assert!(
-                    target_contents.contains("JWT_SECRET=\"super-secret-jwt-token\""),
-                    "JWT_SECRET should have been imported from source .env"
+                assert_eq!(
+                    dotenv_values(&target_env_path)
+                        .get("JWT_SECRET")
+                        .map(String::as_str),
+                    Some("super-secret-jwt-token"),
+                    "JWT_SECRET should have been imported from source .env",
                 );
 
                 // The import should NOT import defaults - those stay as defaults
@@ -4285,7 +4273,7 @@ fn operation_scoped_provider_cache_refreshes_snapshots_between_resolutions() {
 }
 
 #[test]
-fn operation_scoped_provider_cache_applies_changed_reason_on_later_resolution() {
+fn operation_scoped_provider_cache_applies_changed_session_context_on_later_resolution() {
     let _lock = scrub_resolution_env();
     let temp_dir = TempDir::new().unwrap();
     let primary_file = temp_dir.path().join("empty.env");
@@ -4295,6 +4283,7 @@ fn operation_scoped_provider_cache_applies_changed_reason_on_later_resolution() 
     const SECRET: &str = "AUDITED_SECRET";
     let item = format!("{PROJECT}/default/{SECRET}");
     crate::provider::tests::take_stateful_reason_reads(&item);
+    crate::provider::tests::take_stateful_caller_reads(&item);
     let store = crate::provider::provider_from_spec(
         "statefultest://",
         crate::provider::ProviderCredentials::new(),
@@ -4307,9 +4296,19 @@ fn operation_scoped_provider_cache_applies_changed_reason_on_later_resolution() 
         )
         .unwrap();
 
-    let spec = stateful_fallback_spec(PROJECT, SECRET, &primary_file).with_reason("first reason");
+    let spec = stateful_fallback_spec(PROJECT, SECRET, &primary_file)
+        .with_reason("first reason")
+        .with_caller(
+            crate::CallerContext::new("git")
+                .with_operation("credential_get")
+                .with_resource("github.com"),
+        );
     spec.validate().unwrap().expect("first resolution succeeds");
-    let spec = spec.with_reason("second reason");
+    let spec = spec.with_reason("second reason").with_caller(
+        crate::CallerContext::new("git")
+            .with_operation("credential_store")
+            .with_resource("github.com"),
+    );
     spec.validate()
         .unwrap()
         .expect("second resolution succeeds");
@@ -4321,12 +4320,27 @@ fn operation_scoped_provider_cache_applies_changed_reason_on_later_resolution() 
             Some("second reason".to_string())
         ]
     );
+    assert_eq!(
+        crate::provider::tests::take_stateful_caller_reads(&item),
+        vec![
+            Some(
+                crate::CallerContext::new("git")
+                    .with_operation("credential_get")
+                    .with_resource("github.com")
+            ),
+            Some(
+                crate::CallerContext::new("git")
+                    .with_operation("credential_store")
+                    .with_resource("github.com")
+            ),
+        ]
+    );
 }
 
 /// When the primary provider in a chain errors (e.g. authentication failure),
 /// validation should fall back to the next provider rather than propagating
 /// the error. Simulated here by pointing the primary dotenv at a directory,
-/// which causes `from_path_iter` to fail on read.
+/// which causes its loader to fail on read.
 #[test]
 fn test_validate_falls_back_on_primary_provider_error() {
     let temp_dir = TempDir::new().unwrap();
@@ -5313,6 +5327,34 @@ FALLBACK = {{ description = "logical default", providers = ["documents"], ref = 
 }
 
 #[test]
+fn test_json_extract_renders_a_null_while_a_provider_field_treats_it_as_absent() {
+    use crate::config::{ExtractFormat, SecretExtract};
+
+    // An extract pointer names one location and reports what the document
+    // holds there, so a null renders. test_json_extract_resolves_structured_
+    // values_after_decoding pins this end to end.
+    let extract = SecretExtract {
+        format: ExtractFormat::Json,
+        pointer: "/database/password".to_string(),
+    };
+    let rendered =
+        Secrets::extract_stored_value(&extract, "PASSWORD", r#"{"database":{"password":null}}"#)
+            .unwrap();
+    assert_eq!(rendered.expose_secret(), "null");
+
+    // A provider `field` is a lookup that can come up empty, so the same null
+    // is absent and the provider chain continues.
+    let value: serde_json::Value = serde_json::from_str(r#"{"password":null}"#).unwrap();
+    assert!(crate::json_field::render_field(&value["password"]).is_none());
+
+    // Everything that is not null renders identically on both paths.
+    let port =
+        Secrets::extract_stored_value(&extract, "PASSWORD", r#"{"database":{"password":5432}}"#)
+            .unwrap();
+    assert_eq!(port.expose_secret(), "5432");
+}
+
+#[test]
 fn test_json_extract_errors_do_not_expose_stored_documents() {
     use crate::config::{ExtractFormat, SecretExtract};
 
@@ -6121,11 +6163,11 @@ fn build_chain_scenario(
 }
 
 fn read_env_var(path: &std::path::Path, key: &str) -> Option<String> {
-    dotenvy::from_path_iter(path)
+    dotenv::EnvLoader::with_path(path)
+        .sequence(dotenv::EnvSequence::InputOnly)
+        .load()
         .ok()?
-        .filter_map(|res| res.ok())
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v)
+        .remove(key)
 }
 
 /// Builds a `Secrets` whose single required `MY_SECRET` declares the given
@@ -7847,20 +7889,20 @@ fn audit_failed_get_records_scoped_and_alias_template_refs() {
         (
             ProviderAlias::from(uri.clone())
                 .with_reference_template(NativeAddressTemplate {
-                    item: "invalid-{key}".to_string(),
+                    item: "invalid={key}".to_string(),
                     ..Default::default()
                 })
                 .unwrap(),
             None,
-            "item=invalid-REQUIRED",
+            "item=invalid=REQUIRED",
         ),
         (
             ProviderAlias::from(uri),
             Some(NativeAddress {
-                item: "invalid-scoped".to_string(),
+                item: "invalid=scoped".to_string(),
                 ..Default::default()
             }),
-            "item=invalid-scoped",
+            "item=invalid=scoped",
         ),
     ];
 
@@ -9478,10 +9520,7 @@ secrets = ["IN_SCOPE"]
         spec.import(&format!("dotenv://{}", source.display()))
             .unwrap();
 
-        let imported: HashMap<String, String> = dotenvy::from_path_iter(&target)
-            .unwrap()
-            .map(|item| item.unwrap())
-            .collect();
+        let imported = dotenv_values(&target);
         assert_eq!(imported.get("IN_SCOPE"), Some(&"a".to_string()));
         assert_eq!(
             imported.get("OUT_OF_SCOPE"),
@@ -10146,12 +10185,10 @@ fn set_writes_authoritative_provider_then_refreshes_cache() {
     let secrets = cached_dotenv_secrets(&[&source], &cache, "1h");
 
     secrets.set("API_KEY", Some("written".to_string())).unwrap();
-    let source_value = dotenvy::from_path_iter(&source)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap();
-    assert_eq!(source_value, ("API_KEY".to_string(), "written".to_string()));
+    assert_eq!(
+        dotenv_values(&source).get("API_KEY").map(String::as_str),
+        Some("written")
+    );
     fs::remove_file(&source).unwrap();
     assert_eq!(resolved_value(&secrets, "API_KEY"), "written");
 }
@@ -10310,11 +10347,7 @@ fn cache_write_failure_does_not_hide_authoritative_value() {
 /// Rewrite a dotenv-backed cache entry's expiration, so it reads as expired.
 fn expire_cache_entry(cache: &Path, project: &str, name: &str) {
     let marker = crate::cache::CACHE_ENVELOPE_MARKER;
-    let (_, stored) = dotenvy::from_path_iter(cache)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap();
+    let stored = dotenv_values(cache).remove("API_KEY").unwrap();
     let payload = stored
         .strip_prefix(marker)
         .expect("a cache entry carries the ownership marker");
@@ -10331,11 +10364,7 @@ fn expire_cache_entry(cache: &Path, project: &str, name: &str) {
 /// Rewrite the current dotenv-backed entry in the released v2 envelope format.
 fn rewrite_cache_entry_as_v2(cache: &Path, project: &str, name: &str) {
     let marker = crate::cache::CACHE_ENVELOPE_MARKER;
-    let (_, stored) = dotenvy::from_path_iter(cache)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap();
+    let stored = dotenv_values(cache).remove("API_KEY").unwrap();
     let payload = stored
         .strip_prefix(marker)
         .expect("a cache entry carries the current ownership marker");
@@ -10535,10 +10564,7 @@ fn cache_construction_failure_drops_the_superseded_entry() {
 
 /// The value a cache store holds at `API_KEY`'s cache address, or `None`.
 fn stored_cache_entry(cache: &Path) -> Option<String> {
-    dotenvy::from_path_iter(cache).unwrap().find_map(|item| {
-        let (key, value) = item.unwrap();
-        (key == "API_KEY").then_some(value)
-    })
+    dotenv_values(cache).remove("API_KEY")
 }
 
 #[test]
@@ -10761,4 +10787,83 @@ fn cache_clear_clears_what_it_can_before_reporting_a_failure() {
         !fs::read_to_string(&cache).unwrap().contains("B_KEY"),
         "one unclearable cache must not leave the rest of the profile cached"
     );
+}
+
+/// A provider built for an operation carries that operation's profile, so an
+/// Infisical `ref` — whose coordinates name no environment — resolves in the
+/// environment the profile names. Deleting the `set_profile` call at the
+/// construction chokepoint leaves every other test green, so this is the one
+/// that holds the wiring in place.
+#[cfg(feature = "infisical")]
+#[test]
+fn a_built_provider_carries_the_operation_profile() {
+    use crate::provider::Address;
+
+    let config = Config {
+        project: Project {
+            name: "myapp".to_string(),
+            ..Default::default()
+        },
+        profiles: HashMap::new(),
+        providers: None,
+        scopes: None,
+    };
+    let mut secrets = Secrets::new(config, None, None, None);
+    secrets.set_profile("production");
+
+    let reference = crate::config::NativeAddress {
+        item: "/DB_PASSWORD".to_string(),
+        ..Default::default()
+    };
+    let provider = secrets
+        .build_provider(
+            "infisical://app.infisical.com/7e2f1a4c-0000-0000-0000-000000000000".to_string(),
+            None,
+        )
+        .unwrap();
+
+    let target = provider
+        .describe_write_target(Address::Native(&reference))
+        .unwrap();
+    assert!(
+        target.contains("environment production"),
+        "a ref must resolve in the operation's profile environment, got {target}"
+    );
+}
+
+/// A credential source gets no profile, so a `ref`-addressed Infisical
+/// credential still needs an explicit `?env=`. Without this the environment
+/// would come from whichever profile ran: a credential stored under `prod`
+/// would be missing under `dev`, breaking the round-trip
+/// `PROVIDER_CREDENTIAL_SCOPE` promises.
+#[cfg(feature = "infisical")]
+#[test]
+fn a_credential_source_provider_gets_no_profile() {
+    use crate::provider::Address;
+
+    let config = Config {
+        project: Project {
+            name: "myapp".to_string(),
+            ..Default::default()
+        },
+        profiles: HashMap::new(),
+        providers: None,
+        scopes: None,
+    };
+    let mut secrets = Secrets::new(config, None, None, None);
+    secrets.set_profile("production");
+
+    let reference = crate::config::NativeAddress {
+        item: "/ci/VAULT_TOKEN".to_string(),
+        ..Default::default()
+    };
+    let provider = secrets
+        .build_source_provider("infisical://app.infisical.com/7e2f1a4c-0000-0000-0000-000000000000")
+        .unwrap();
+
+    let err = provider
+        .describe_write_target(Address::Native(&reference))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("?env="), "{err}");
 }

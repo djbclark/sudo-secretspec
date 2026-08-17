@@ -35,6 +35,7 @@ pub(crate) fn display_error_chain(error: &(dyn std::error::Error + 'static)) -> 
 /// This enum represents all possible errors that can occur when working with
 /// the secretspec library.
 #[derive(Error, Debug, Diagnostic)]
+#[non_exhaustive]
 pub enum SecretSpecError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -50,7 +51,9 @@ pub enum SecretSpecError {
     #[error("Keyring error: {0}")]
     Keyring(#[from] keyring::Error),
     #[error("Dotenv error: {0}")]
-    Dotenv(#[from] dotenvy::Error),
+    Dotenv(#[from] dotenv::Error),
+    #[error("Dotenv rendering error: {0}")]
+    DotenvRender(#[from] dotenv::RenderError),
     #[error(
         "No provider backend configured.\n\nTo fix this, either:\n  1. Run 'secretspec config global init' to set up your default provider\n  2. Use --provider flag (e.g., 'secretspec check --provider keyring')"
     )]
@@ -93,6 +96,9 @@ pub enum SecretSpecError {
     InvalidProfile(String),
     #[error("Invalid scope: {0}")]
     InvalidScope(String),
+    /// A parsed or Rust-built declaration failed semantic validation (0.20+).
+    #[error("Invalid SecretSpec declaration: {0}")]
+    InvalidSpec(String),
     #[error("Validation failed: {0}")]
     ValidationFailed(Box<ValidationErrors>),
     #[error("Secret generation failed: {0}")]
@@ -126,7 +132,7 @@ impl SecretSpecError {
             SecretSpecError::TomlSer(_) => "toml_ser",
             #[cfg(feature = "keyring")]
             SecretSpecError::Keyring(_) => "keyring",
-            SecretSpecError::Dotenv(_) => "dotenv",
+            SecretSpecError::Dotenv(_) | SecretSpecError::DotenvRender(_) => "dotenv",
             SecretSpecError::NoProviderConfigured => "no_provider_configured",
             SecretSpecError::ProviderNotFound(_) => "provider_not_found",
             SecretSpecError::SecretNotFound(_) => "secret_not_found",
@@ -144,6 +150,7 @@ impl SecretSpecError {
             SecretSpecError::Json(_) => "json",
             SecretSpecError::InvalidProfile(_) => "invalid_profile",
             SecretSpecError::InvalidScope(_) => "invalid_scope",
+            SecretSpecError::InvalidSpec(_) => "invalid_spec",
             SecretSpecError::ValidationFailed(_) => "validation_failed",
             SecretSpecError::GenerationFailed(_) => "generation_failed",
             SecretSpecError::DecodeFailed { .. } => "decode_failed",
@@ -173,9 +180,7 @@ impl From<ParseError> for SecretSpecError {
             ParseError::CircularDependency(msg) => {
                 SecretSpecError::Io(io::Error::new(io::ErrorKind::InvalidData, msg))
             }
-            ParseError::Validation(msg) => {
-                SecretSpecError::Io(io::Error::new(io::ErrorKind::InvalidData, msg))
-            }
+            ParseError::Validation(msg) => SecretSpecError::InvalidSpec(msg),
             ParseError::ExtendedConfigNotFound(path) => {
                 SecretSpecError::ExtendedConfigNotFound(path)
             }
@@ -267,6 +272,10 @@ mod tests {
             (
                 SecretSpecError::InvalidProfile("ghost".into()),
                 "invalid_profile",
+            ),
+            (
+                SecretSpecError::InvalidSpec("bad declaration".into()),
+                "invalid_spec",
             ),
             (
                 SecretSpecError::GenerationFailed("rng".into()),
