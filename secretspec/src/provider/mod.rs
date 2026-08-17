@@ -177,6 +177,8 @@ pub mod protonpass;
 pub mod scaleway;
 #[cfg(feature = "sops")]
 pub mod sops;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 pub mod systemd_credential;
 #[cfg(feature = "vault")]
 pub mod vault;

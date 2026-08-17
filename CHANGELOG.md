@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SQLite provider** (`sqlite://`, 0.20+): stores each secret as one row in a
+  local SQLite database, behind a new `sqlite` feature (enabled by default).
+  Confidentiality comes entirely from filesystem permissions on the database
+  file, so identical code serves an ordinary user-owned store and a
+  privilege-boundary vault file with no code difference between them. Plain
+  `get`/`set`/`delete`, no history retention yet.
 - The `secretspec` crate gains a `codegen-schema` feature, which exposes JSON
   Schema emission from a manifest without enabling the full `cli` feature. It
   exists for the same reason as `manifest-edit`: the privilege boundary needs

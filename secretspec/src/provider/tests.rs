@@ -1205,6 +1205,15 @@ mod integration_tests {
                     Box::<dyn Provider>::try_from("pass").expect("Should create pass provider");
                 (provider, None)
             }
+            #[cfg(feature = "sqlite")]
+            "sqlite" => {
+                let temp_dir = TempDir::new().expect("Create temp directory");
+                let db_path = temp_dir.path().join("secrets.db");
+                let provider_spec = format!("sqlite:{}", db_path.to_str().unwrap());
+                let provider = Box::<dyn Provider>::try_from(provider_spec.as_str())
+                    .expect("Should create sqlite provider with path");
+                (provider, Some(temp_dir))
+            }
             #[cfg(feature = "vault")]
             // "vault" tests KV v2 (default), "vault-kv1" tests KV v1.
             // Set VAULT_TOKEN and run a Vault-compatible dev server.

@@ -46,6 +46,10 @@ google-cloud-secretmanager-v1 = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
 aws-sdk-secretsmanager = { workspace = true, optional = true }
 aws-sdk-ssm = { workspace = true, optional = true }
+# Pinned independently of the workspace's `rusqlite` (which enables `bundled`)
+# per FORK-AI.md: `bundled` can hang `libsqlite3-sys` build scripts on macOS.
+# Link against system SQLite instead.
+rusqlite = { version = "0.31", optional = true }
 azure_core = { workspace = true, optional = true }
 azure_identity = { workspace = true, optional = true }
 azure_security_keyvault_secrets = { workspace = true, optional = true }
@@ -59,7 +63,7 @@ detect-coding-agent.workspace = true
 age = { workspace = true, optional = true }
 
 [features]
-default = ["cli", "keyring", "kdbx", "keeper", "gcsm", "awssm", "awsps", "vault", "openbao", "bws", "akv", "aac", "infisical", "bw", "age", "scaleway", "sops"]
+default = ["cli", "keyring", "kdbx", "keeper", "gcsm", "awssm", "awsps", "vault", "openbao", "bws", "akv", "aac", "infisical", "bw", "age", "scaleway", "sops", "sqlite"]
 cli = ["manifest-edit", "codegen-schema", "dep:clap_complete", "dep:clap_complete_nushell", "dep:is_executable"]
 manifest-edit = ["dep:toml_edit"]
 # JSON Schema emission from a manifest, without the interactive CLI. Same
@@ -89,6 +93,7 @@ akv = ["dep:azure_core", "dep:azure_identity", "dep:azure_security_keyvault_secr
 aac = ["akv", "dep:reqwest", "azure_core/hmac_rust"]
 age = ["dep:age"]
 sops = []
+sqlite = ["dep:rusqlite"]
 
 [dev-dependencies]
 # Validates serialized resolution reports against the committed JSON Schema.
