@@ -59,6 +59,39 @@ First pass, 2026-08-17:
 - Before building fork-only, ask whether upstream wants a shape of this —
   the delete/versioning surface touches the provider trait (PR #354 lineage).
 
+Second pass, 2026-08-17 (re-run per the directive above, with the queue ahead
+now clear through `0.19.1-sudo.18`):
+
+- **Upstream issues and PRs**: re-searched the same eight terms. **Still no
+  dedicated thread.** The hits are unchanged in kind and all incidental —
+  #370 (ours), #64 (out-of-tree providers via gRPC), #202 (orphaned cache
+  entries), #176 (file-shaped secrets), #156 (property tests), #11 (dynamic
+  secrets), #339 (a provider-registry test). Nothing to join or defer to.
+- **Web**: still no secretspec-specific discussion of vault backup/restore.
+  The prior-art list above stands as written; no newer local-versioning
+  design surfaced that changes the candidate set.
+
+### What the second pass *did* find: the cache is a second value store
+
+Not a backup/restore thread, but a direct input this design has to absorb —
+`secretspec/src/cache.rs` is in-tree, with `max_age` expiry, `cache clear`,
+and writes audited as `cache_refresh` rather than `set`. Consequences:
+
+- **A restore that only rewinds the vault is not a restore.** A cached copy of
+  a *newer* value can outlive the rewind and still resolve, silently defeating
+  it. Restore must invalidate affected cache entries, and the invalidation has
+  to be part of the same audited operation, not a follow-up the operator is
+  told to run.
+- **`cache_refresh` is useful precedent.** Upstream already models a
+  value-touching mutation that is deliberately *not* `set`. `restore` wants
+  the same treatment — a distinct verb in the ledger, so a rewind never reads
+  back as an ordinary write.
+- **Not urgent, but do not discover it later.** Verified 2026-08-17: the
+  privileged CLI does not reference the cache at all, so the boundary serves
+  uncached today and nothing is currently at risk. This becomes live the
+  moment caching is enabled inside the boundary, which is exactly when it
+  would be most expensive to notice.
+
 ## Operator constraints and backend candidates (2026-08-17)
 
 Constraint from the operator: the history store must **not be a network
