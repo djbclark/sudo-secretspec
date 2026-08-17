@@ -57,7 +57,10 @@ class SudoSecretspec < Formula
       /usr/local/bin/sudo-secretspec. The libexec copy is deliberately not on
       PATH so it cannot shadow the installed client.
 
-      Existing protected stores must be adopted explicitly; see
+      Upgrading an installed boundary adopts the vault its own config records,
+      so the command above is also the upgrade command. A store found only by
+      path scan -- including the retired wrapper's, which migration leaves on
+      disk on purpose -- is never adopted without --adopt-existing. See
       sudo-secretspec/AI-GUIDANCE.md in the source distribution.
     EOS
   end

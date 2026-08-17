@@ -868,9 +868,7 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
                 .map(|s| s.success())
                 .unwrap_or(false))
     {
-        return Err(InstallError::Denied(
-            "fresh-install identity or vault already exists; use --adopt-existing".into(),
-        ));
+        return Err(fresh_install_refusal(&req.declarations));
     }
 
     if req.dry_run {
@@ -1101,6 +1099,66 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     Ok(())
 }
 
+/// How [`detect_existing_vault`] arrived at the store it names.
+///
+/// This is a trust boundary, not bookkeeping. An installed boundary naming its
+/// own vault is a fact the host recorded about itself; a path scan is a guess
+/// that happens to be right most of the time. `install` treats only the first
+/// as sufficient grounds to adopt without being told to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultOrigin {
+    /// Named by the installed root-owned config: the boundary vouching for the
+    /// vault it already serves from. Reinstalling over this is an upgrade.
+    InstalledConfig,
+    /// Guessed by scanning well-known paths, with nothing installed to confirm
+    /// it. May name [`LEGACY_VAULT`], which migration leaves on disk on purpose.
+    PathScan,
+}
+
+/// A store `install` could adopt, and the evidence for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingVault {
+    pub vault: PathBuf,
+    pub service_user: String,
+    pub service_group: String,
+    pub origin: VaultOrigin,
+}
+
+/// Refusal for a fresh install onto a boundary that already exists.
+///
+/// Split out of [`run`] so the wording is reachable from a test: the guard
+/// itself only fires as root against a populated `/var/db`, which is exactly
+/// the situation no test can set up, and the last thing hidden behind that
+/// unreachability truncated a vault.
+///
+/// It names the command that works rather than only the flag that is missing.
+/// The failure mode this guard invites is a script or an operator "fixing" the
+/// refusal by removing the obstacle -- deleting the vault so that a fresh
+/// install succeeds -- which is precisely the data loss it exists to prevent.
+fn fresh_install_refusal(declarations: &Path) -> InstallError {
+    InstallError::Denied(format!(
+        "fresh-install identity or vault already exists; to adopt it, run:\n  \
+         sudo-secretspec install --declarations {} --adopt-existing",
+        declarations.display(),
+    ))
+}
+
+/// Whether `install` adopts a detected vault without `--adopt-existing`.
+///
+/// Lives here, named and tested, rather than as a comparison inline in the
+/// binary's `run_install`: the trust rule is the whole point of the
+/// distinction, and the last guard that decided something this consequential
+/// from inside an unreachable code path truncated a populated vault.
+///
+/// Only [`VaultOrigin::InstalledConfig`] qualifies. That is the host's own
+/// record of the store it serves from, so reinstalling over it is an upgrade.
+/// A [`VaultOrigin::PathScan`] answer is a guess whose candidates include the
+/// retired [`LEGACY_VAULT`]; binding a new boundary to retired secrets is not
+/// something to infer from a directory listing.
+pub fn adopts_without_flag(origin: VaultOrigin) -> bool {
+    matches!(origin, VaultOrigin::InstalledConfig)
+}
+
 /// Vault and service identity an unattended `install` should adopt.
 ///
 /// `config_path` is the installed protected config; `dir_exists` reports whether
@@ -1114,6 +1172,10 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
 /// reinstall silently repoints a migrated boundary back at retired secrets and a
 /// retired service identity.
 ///
+/// The returned [`VaultOrigin`] carries that distinction to the caller rather
+/// than discarding it. Both answers name a vault; only one of them is the host
+/// telling you about itself.
+///
 /// Unprivileged and read-only. The config is root-owned `0444`, and the
 /// privileged side re-validates every value before acting on it, so a config
 /// that is missing, unreadable, or invalid falls through to detection rather
@@ -1121,7 +1183,7 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
 pub fn detect_existing_vault(
     config_path: &Path,
     dir_exists: impl Fn(&Path) -> bool,
-) -> Option<(PathBuf, String, String)> {
+) -> Option<ExistingVault> {
     if let Some(existing) = installed_identity(config_path, &dir_exists) {
         return Some(existing);
     }
@@ -1134,7 +1196,12 @@ pub fn detect_existing_vault(
     ] {
         let vault = PathBuf::from(vault);
         if dir_exists(&vault) {
-            return Some((vault, user.into(), group.into()));
+            return Some(ExistingVault {
+                vault,
+                service_user: user.into(),
+                service_group: group.into(),
+                origin: VaultOrigin::PathScan,
+            });
         }
     }
     None
@@ -1143,14 +1210,19 @@ pub fn detect_existing_vault(
 fn installed_identity(
     config_path: &Path,
     dir_exists: &impl Fn(&Path) -> bool,
-) -> Option<(PathBuf, String, String)> {
+) -> Option<ExistingVault> {
     let content = fs::read_to_string(config_path).ok()?;
     let config = crate::config::Config::parse(&content).ok()?;
     let vault = config.vault().to_path_buf();
     if !dir_exists(&vault) {
         return None;
     }
-    Some((vault, config.service_user, config.service_group))
+    Some(ExistingVault {
+        vault,
+        service_user: config.service_user,
+        service_group: config.service_group,
+        origin: VaultOrigin::InstalledConfig,
+    })
 }
 
 /// Create the vault's runtime files for a fresh install, refusing to overwrite.
@@ -1495,11 +1567,12 @@ adopted_vault = true
             "_sudo_secretspec",
         ));
 
-        let (vault, user, group) = detect_existing_vault(&config, |_| true).unwrap();
+        let found = detect_existing_vault(&config, |_| true).unwrap();
 
-        assert_eq!(vault, PathBuf::from(DEFAULT_VAULT));
-        assert_eq!(user, DEFAULT_USER);
-        assert_eq!(group, DEFAULT_GROUP);
+        assert_eq!(found.vault, PathBuf::from(DEFAULT_VAULT));
+        assert_eq!(found.service_user, DEFAULT_USER);
+        assert_eq!(found.service_group, DEFAULT_GROUP);
+        assert_eq!(found.origin, VaultOrigin::InstalledConfig);
     }
 
     #[test]
@@ -1513,33 +1586,40 @@ adopted_vault = true
             LEGACY_GROUP,
         ));
 
-        let (vault, user, group) = detect_existing_vault(&config, |_| true).unwrap();
+        let found = detect_existing_vault(&config, |_| true).unwrap();
 
-        assert_eq!(vault, PathBuf::from(LEGACY_VAULT));
-        assert_eq!(user, LEGACY_USER);
-        assert_eq!(group, LEGACY_GROUP);
+        assert_eq!(found.vault, PathBuf::from(LEGACY_VAULT));
+        assert_eq!(found.service_user, LEGACY_USER);
+        assert_eq!(found.service_group, LEGACY_GROUP);
+        // Origin, not path, is what decides automatic adoption: this IS the
+        // legacy vault, but the installed config named it, so an upgrade here
+        // is still an upgrade.
+        assert_eq!(found.origin, VaultOrigin::InstalledConfig);
     }
 
     #[test]
     fn with_no_boundary_installed_the_canonical_vault_wins() {
         let missing = PathBuf::from("/nonexistent/sudo-secretspec.toml");
 
-        let (vault, user, _) = detect_existing_vault(&missing, |_| true).unwrap();
+        let found = detect_existing_vault(&missing, |_| true).unwrap();
 
-        assert_eq!(vault, PathBuf::from(DEFAULT_VAULT));
-        assert_eq!(user, DEFAULT_USER);
+        assert_eq!(found.vault, PathBuf::from(DEFAULT_VAULT));
+        assert_eq!(found.service_user, DEFAULT_USER);
+        assert_eq!(found.origin, VaultOrigin::PathScan);
     }
 
     #[test]
-    fn with_no_boundary_installed_the_legacy_vault_is_adopted_when_alone() {
+    fn with_no_boundary_installed_the_legacy_vault_is_detected_when_alone() {
         let missing = PathBuf::from("/nonexistent/sudo-secretspec.toml");
 
-        let (vault, user, group) =
-            detect_existing_vault(&missing, |p| p == Path::new(LEGACY_VAULT)).unwrap();
+        let found = detect_existing_vault(&missing, |p| p == Path::new(LEGACY_VAULT)).unwrap();
 
-        assert_eq!(vault, PathBuf::from(LEGACY_VAULT));
-        assert_eq!(user, LEGACY_USER);
-        assert_eq!(group, LEGACY_GROUP);
+        assert_eq!(found.vault, PathBuf::from(LEGACY_VAULT));
+        assert_eq!(found.service_user, LEGACY_USER);
+        assert_eq!(found.service_group, LEGACY_GROUP);
+        // Nothing installed vouches for this, and it is the retired store.
+        // `install` must not adopt it without being told to.
+        assert_eq!(found.origin, VaultOrigin::PathScan);
     }
 
     #[test]
@@ -1556,11 +1636,15 @@ adopted_vault = true
 
         assert_eq!(
             found,
-            Some((
-                PathBuf::from(LEGACY_VAULT),
-                LEGACY_USER.into(),
-                LEGACY_GROUP.into()
-            ))
+            Some(ExistingVault {
+                vault: PathBuf::from(LEGACY_VAULT),
+                service_user: LEGACY_USER.into(),
+                service_group: LEGACY_GROUP.into(),
+                // The config named a vault that is gone, so this answer came
+                // from the scan after all -- and must demand the flag, even
+                // though a config exists.
+                origin: VaultOrigin::PathScan,
+            })
         );
     }
 
@@ -1568,9 +1652,12 @@ adopted_vault = true
     fn an_unparseable_config_falls_back_instead_of_failing() {
         let (_tmp, config) = write_config("this is not toml {{{");
 
-        let (vault, _, _) = detect_existing_vault(&config, |_| true).unwrap();
+        let found = detect_existing_vault(&config, |_| true).unwrap();
 
-        assert_eq!(vault, PathBuf::from(DEFAULT_VAULT));
+        assert_eq!(found.vault, PathBuf::from(DEFAULT_VAULT));
+        // An unparseable config vouches for nothing, so the fallback answer is
+        // a guess and is reported as one.
+        assert_eq!(found.origin, VaultOrigin::PathScan);
     }
 
     #[test]
@@ -1578,6 +1665,47 @@ adopted_vault = true
         let missing = PathBuf::from("/nonexistent/sudo-secretspec.toml");
 
         assert_eq!(detect_existing_vault(&missing, |_| false), None);
+    }
+
+    #[test]
+    fn an_installed_vault_is_adopted_without_the_flag_but_a_scanned_one_is_not() {
+        // The whole trust rule, in one assertion pair. Reinstalling over the
+        // vault the installed config names is an upgrade, so it needs no flag.
+        // A scanned vault is a guess -- and one of the candidates is the retired
+        // wrapper's store -- so it still does.
+        assert!(adopts_without_flag(VaultOrigin::InstalledConfig));
+        assert!(!adopts_without_flag(VaultOrigin::PathScan));
+    }
+
+    #[test]
+    fn a_scanned_legacy_vault_never_adopts_itself_even_when_it_is_the_only_one() {
+        // The regression that makes the split worth having. With nothing
+        // installed, detection happily names the retired vault; if that answer
+        // adopted automatically, a first install on a not-yet-migrated host
+        // would silently bind the new boundary to retired secrets and a retired
+        // service identity, with no operator decision anywhere in the flow.
+        let missing = PathBuf::from("/nonexistent/sudo-secretspec.toml");
+
+        let found = detect_existing_vault(&missing, |p| p == Path::new(LEGACY_VAULT)).unwrap();
+
+        assert_eq!(found.vault, PathBuf::from(LEGACY_VAULT));
+        assert!(!adopts_without_flag(found.origin));
+    }
+
+    #[test]
+    fn the_fresh_install_refusal_names_a_runnable_command() {
+        // The refusal is the only thing standing between a script and the
+        // truncation path, and the failure mode it invites is "make the
+        // obstacle go away" -- deleting the vault so a fresh install succeeds.
+        // Handing back the command that works is what makes that unnecessary,
+        // so the text is asserted rather than left to drift.
+        let text = fresh_install_refusal(Path::new("/tmp/decl.toml")).to_string();
+        assert!(text.contains("--adopt-existing"), "{text}");
+        assert!(text.contains("/tmp/decl.toml"), "{text}");
+        assert!(
+            text.contains("sudo-secretspec install --declarations"),
+            "{text}"
+        );
     }
 
     #[test]

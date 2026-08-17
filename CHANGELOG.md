@@ -81,6 +81,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `sudo-secretspec install` now adopts the vault named by the installed
+  root-owned config without `--adopt-existing`, announcing on stderr which
+  vault it adopted and where that was recorded. Upgrading an existing boundary
+  therefore needs no flag; pass `--vault` to install somewhere else. A vault
+  found only by scanning well-known paths — which includes the retired
+  wrapper's store that migration deliberately leaves on disk — still requires
+  `--adopt-existing`, so a new boundary is never silently bound to retired
+  secrets. The refusal for a fresh install onto an existing boundary now prints
+  the full command that adopts it instead of only naming the missing flag.
+
 - Dotenv parsing and rendering now use dotenv-ng throughout the dotenv
   provider, age-encrypted dotenv blobs, and `secretspec export --format
   dotenv`. Values containing `$` remain literal, output uses only the quoting

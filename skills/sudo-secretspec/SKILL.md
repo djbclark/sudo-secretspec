@@ -207,15 +207,20 @@ explicit `unknown` terminal state if restoration cannot be proven.
   (`0.19.1-sudo.13 -> 0.19.1-sudo.14`), so the output itself is the evidence
   the upgrade happened. A *correct* install is still an operator action — it
   authenticates interactively.
-- **`--adopt-existing` is mandatory on any host that already has a boundary.**
-  Never hand an operator a plain `install` on a machine with a populated vault.
-  Before 0.19.1-sudo.16 the fresh-install path recreated the vault's runtime
-  files and truncated `.env` to zero bytes, destroying every stored secret
-  value — and the guard that refused it ran only under `--dry-run`, so the
-  rehearsal refused exactly what the live command then performed. A green
-  `--dry-run` was therefore *not* evidence the real run was safe. Since .16
-  both paths refuse, and the runtime files are created only when missing. On a
-  host still running an older boundary, treat plain `install` as destructive.
+- **`--adopt-existing` is mandatory on any host running 0.19.1-sudo.16 or
+  earlier that already has a boundary.** Never hand such an operator a plain
+  `install` on a machine with a populated vault. Before .16 the fresh-install
+  path recreated the vault's runtime files and truncated `.env` to zero bytes,
+  destroying every stored secret value — and the guard that refused it ran only
+  under `--dry-run`, so the rehearsal refused exactly what the live command
+  then performed. A green `--dry-run` was therefore *not* evidence the real run
+  was safe. Since .16 both paths refuse, and the runtime files are created only
+  when missing. On a host still running an older boundary, treat plain
+  `install` as destructive.
+  Since 0.19.1-sudo.17 the flag is no longer needed for an upgrade: `install`
+  adopts the vault the installed root-owned config names, and announces it on
+  stderr. It is still required for a vault found only by path scan — including
+  the retired wrapper's store, which migration leaves on disk on purpose.
   A vault that has been truncated shows as `.env` at 0 bytes with `check`
   reporting most secrets missing; recovery is from backup, not from the
   rollback snapshot, which deliberately excludes the vault.

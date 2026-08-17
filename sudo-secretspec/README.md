@@ -22,7 +22,12 @@ sudo-secretspec doctor
 ```
 
 `install` auto-detects common declaration paths and existing vaults, and
-prompts on a TTY when needed. Use flags only to override defaults:
+prompts on a TTY when needed. Since `0.19.1-sudo.17` it adopts the vault the
+installed root-owned config names without `--adopt-existing`, announcing it on
+stderr, so the plain form above is also the upgrade form. `--adopt-existing`
+is still required for a vault found only by scanning well-known paths, which
+includes the retired wrapper's store that migration leaves in place. Use flags
+only to override defaults:
 
 > **Which binary runs `install` matters.** `install` copies from the tree its
 > own executable lives in, so it must be run from the copy your package manager

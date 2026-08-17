@@ -57,6 +57,13 @@ loaded into agent context automatically.
 9. **Adopt-existing must not chown/chmod the vault.** Only verify metadata.
 10. **Install UX goal:** short forms (`install`, `install --adopt-existing`) with
     auto-detection/prompts; long flags are overrides only.
+11. **Adoption defaults on provenance, not on convenience.** A vault named by
+    the installed root-owned config is adopted with no flag — the host vouching
+    for the store it already serves from, so a reinstall over it is an upgrade.
+    A vault found only by path scan still requires `--adopt-existing`, because
+    one of the scan candidates is the retired wrapper's store. The rule is
+    `install::adopts_without_flag`; keep it there rather than re-deciding it
+    inline in `main.rs`.
 
 ## Useful commands
 

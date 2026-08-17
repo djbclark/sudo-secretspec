@@ -361,6 +361,43 @@ def test_install_dry_run_plans_the_vault_the_boundary_already_serves(config):
 
 
 @pytest.mark.usefixtures("lifecycle_allowed")
+def test_install_dry_run_adopts_the_installed_vault_without_the_flag(config):
+    """Since 0.19.1-sudo.17, an upgrade needs no `--adopt-existing`: the
+    installed root-owned config names the vault this host serves from, so
+    reinstalling over it is an upgrade rather than a trust decision.
+
+    Asserted through the plan rather than the flag parser, because the claim is
+    that the *same* vault and identity get adopted -- a version of this that
+    adopted by default but resolved somewhere else would satisfy a flag-only
+    test while repointing the boundary.
+
+    Requires a boundary at 0.19.1-sudo.17 or newer; against .16 it fails with
+    the fresh-install refusal, which is the correct signal for a post-install
+    gate."""
+    result = run("install", "--dry-run", "--non-interactive")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    planned = dict(
+        line.split("=", 1)
+        for line in result.stdout.splitlines()
+        if "=" in line and not line.startswith(" ")
+    )
+    assert planned.get("adopt_existing") == "1", (
+        "a flagless install onto an installed boundary must plan an adoption, "
+        f"not a fresh install; stdout={result.stdout[:300]!r}"
+    )
+    assert planned.get("vault") == config["vault"]
+    assert (
+        planned.get("service") == f"{config['service_user']}:{config['service_group']}"
+    )
+    # The adoption is announced rather than silent: an operator who believed
+    # they were installing clean finds out here, not from a later surprise.
+    assert config["vault"] in result.stderr, (
+        f"the automatic adoption must be announced on stderr: {result.stderr[:300]!r}"
+    )
+
+
+@pytest.mark.usefixtures("lifecycle_allowed")
 def test_uninstall_dry_run_keeps_the_vault_and_the_service_identity():
     """Both survive unless explicitly opted into, each behind its own flag."""
     result = run("uninstall", "--dry-run")
