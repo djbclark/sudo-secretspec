@@ -15,37 +15,50 @@ summary. It looks like normal program output. But all of it is going out the
 
 So if you try to do the obvious thing:
 
-```console
-$ secretspec check | grep DATABASE_URL
-$
-```
-
 …you get nothing, and it looks like `check` found no secrets. It found them
 fine — the text just went somewhere `grep` wasn't looking.
 
 ### The bug
 
-Every line `check` emits goes to stderr. stdout is completely empty.
+Every line `check` emits goes to stderr. stdout is completely empty. Captured
+against `main` at `dfa4b10`, with a two-secret manifest and a `dotenv` provider:
 
 ```console
-$ secretspec check 2>/dev/null          # stdout only — silent
-$ secretspec check 2>&1 >/dev/null      # stderr only — the whole report
-Checking secrets in demo (profile: default)...
+$ secretspec check --reason "deploy preflight" 2>/dev/null   # stdout only
+[exit 0]
 
-✓ DATABASE_URL
-○ SENTRY_DSN (optional)
-
-Summary: 1 found, 0 missing, 1 optional
+$ secretspec check --reason "deploy preflight" | grep DATABASE_URL
+[grep exit 1]
 ```
 
-Source, on current `main` (`secretspec/src/secrets.rs`):
+Both silent. The report is there — it's on stderr — so the exit status says
+"all good" while every pipeline sees an empty report.
 
-- `check()` — the header, ~line 3679
-- `display_validation_success()` — every status line and the summary, ~3701
+Source, on `main` at `dfa4b10` (`secretspec/src/secrets.rs`):
+
+- `check()` — the header, line 3678
+- `display_validation_success()` — every status line and the summary, 3701
 - `display_validation_errors()` — same for the failure path, plus constraint
-  violations, ~3731
+  violations, 3731
 
-All use `eprintln!`.
+11 `eprintln!` calls across the three.
+
+With them writing to stdout instead, same manifest, same commands:
+
+```console
+$ secretspec check --reason "deploy preflight" 2>/dev/null   # stdout only
+Checking secrets in demo (profile: default)...
+
+✓ DATABASE_URL - app database
+○ SENTRY_DSN - error reporting (optional)
+
+Summary: 1 found, 0 missing, 1 optional
+[exit 0]
+
+$ secretspec check --reason "deploy preflight" | grep DATABASE_URL
+✓ DATABASE_URL - app database
+[grep exit 0]
+```
 
 ### Why this is worth fixing beyond the piping annoyance
 
@@ -98,10 +111,41 @@ stderr instead and I'll send that patch.
 
 ### Proposed fix
 
-Mechanical: `eprintln!` → `println!` at the 11 call sites across those three
-functions. No change to exit codes, no change to what is printed, no new
-dependency, no colour rework. `ensure_secrets` is deliberately untouched — its
-output is prompts and diagnostics, not report.
+`eprintln!` → stdout at the 11 call sites across those three functions. No
+change to exit codes, no change to what is printed, no new dependency, no
+colour rework. `ensure_secrets` is deliberately untouched — its output is
+prompts and diagnostics, not report. `check --json` and `--explain` return
+early at `cli/mod.rs:1443-1465`, before the header, so neither is affected.
+
+**One thing worth doing at the same time, and the reason I'd not just swap the
+macros.** Putting the report on stdout puts it on a stream a reader can close
+early, and `println!` panics on EPIPE. Since Rust's stdout is a `LineWriter`,
+each report line is its own write, so this needs no large output:
+
+```console
+$ secretspec check --reason r | head -1
+Checking secrets in demo (profile: default)...
+thread 'main' panicked at library/std/src/io/stdio.rs:1165:9:
+failed printing to stdout: Broken pipe (os error 32)
+[exit 101]
+```
+
+That pipeline exits 0 today, precisely because stdout gets nothing. So a naive
+macro swap trades a silent-empty-report bug for a panic on `| head`.
+
+My patch therefore writes the report through an injected sink, which is the
+pattern the codebase already documents for this exact reason —
+`write_export`'s doc comment says an injected sink "turns a broken pipe into a
+returned error instead of a panic". `check` locks stdout once and passes
+`&mut dyn io::Write` to both display helpers. A closed pipe then behaves as
+`export | head` already does: a clean `IO error: Broken pipe`, exit 1.
+
+Two related things I noticed while doing this, both pre-existing and neither
+touched by my patch, flagging in case you want them: `check --json | head`
+already panics the same way (`cli/mod.rs:1456`), and if you'd rather a broken
+pipe exit 0 silently — as `git` and `ls` do — that's a different and slightly
+larger change, since `export` would presumably want to match. Happy either way;
+tell me which and I'll do it consistently across both.
 
 Open question for maintainers, happy to go either way:
 
@@ -165,8 +209,12 @@ right.
   3701, `display_validation_errors` 3731, the `check()` header 3678.
   `export` → stdout at `cli/mod.rs:1466`. `check --json` → `cli/mod.rs:1507`,
   `--explain` → `:1509`. `import`'s stderr summary at `secrets.rs:4313/4320/4328`.
-- Still need a real reproduction transcript from the merged tree before posting —
-  do NOT post the illustrative block above as if it were captured output. Note
-  the real output includes descriptions (`✓ DATABASE_URL - app database`) and a
-  first-run `note: secretspec is now recording secret access to ...` line on
-  stderr; include or trim that deliberately rather than by accident.
+- Transcripts above are REAL, captured 2026-08-16 from two binaries built from
+  the merged tree: one with upstream's `secrets.rs` verbatim, one with the fix.
+  The first-run `note: secretspec is now recording secret access to ...` stderr
+  line was trimmed deliberately (it fires once per state dir and is noise here).
+- The broken-pipe panic was found by review, not by me, AFTER I had already
+  committed the naive swap and verified it with `| grep` — which reads to EOF
+  and so cannot reproduce it. Reproduced 20/20 with `| head -1`. Fixed in
+  `be901ba`; regression test confirmed to fail against the pre-fix commit.
+- READY TO POST. Nothing outstanding.
