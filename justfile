@@ -54,5 +54,7 @@ release version: preflight-disk
     packaging/release.py --version {{version}}
     echo
     echo "Published. The INSTALLED boundary is still the previous version until:"
-    echo "  sudo \"$(brew --prefix sudo-secretspec)/libexec/sudo-secretspec\" install --adopt-existing"
-    echo "(--adopt-existing is REQUIRED on a machine with a populated vault)"
+    echo "  sudo \"$(brew --prefix sudo-secretspec)/libexec/sudo-secretspec\" install"
+    echo "Upgrading adopts the vault the installed config records, so no flag is"
+    echo "needed. --adopt-existing is still required for a vault found only by"
+    echo "path scan, which includes the retired wrapper's store."
