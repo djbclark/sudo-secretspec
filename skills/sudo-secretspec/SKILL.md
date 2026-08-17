@@ -1,7 +1,7 @@
 ---
 name: sudo-secretspec
 description: Use managed credentials through the privilege-separated sudo-secretspec client instead of touching a secret store directly. Use when a task needs an API key, token, or password; when a credential must be declared, set, rotated, read, deleted, or injected into a child process; or when the boundary, drift checker, or audit ledger reports an error. Also covers what is deliberately NOT exposed and must be asked of the operator.
-version: 0.5.0
+version: 0.6.0
 author: Dan Clark (djbclark), Hermes Agent
 license: Apache-2.0
 platforms: [macos]
@@ -18,7 +18,7 @@ consumer execution. Do not access SecretSpec's provider, manifest, or protected
 backing files directly, and never invoke `secretspec` itself for a managed
 deployment.
 
-Verified against client **0.19.1-sudo.14**. `sudo-secretspec --version` is the
+Verified against client **0.19.1-sudo.15**. `sudo-secretspec --version` is the
 authority; if it reports something newer, re-read
 `sudo-secretspec/AI-GUIDANCE.md` rather than trusting this file's specifics.
 If it reports something *older*, the flags marked with a minimum version below
@@ -169,7 +169,10 @@ explicit `unknown` terminal state if restoration cannot be proven.
   present, `1` at least one missing. Against an older boundary the report is on
   stderr instead, so read *both* streams if you must support both, and never
   treat an empty stdout as a pass on its own. The report names secrets but
-  never prints values, so it is safe to log.
+  never prints values, so it is safe to log. Because it is now on a stream you
+  can close early, `check | head` ends with `IO error: Broken pipe` and a
+  non-zero exit rather than a panic — that exit status means your reader closed
+  the pipe, not that a secret is missing, so do not read it as a check failure.
 - **Lifecycle commands authenticate even under `--dry-run`.** `install`,
   `uninstall`, and `rollback` re-exec through interactive `sudo` before the
   dry-run flag is ever considered, under `timestamp_timeout=0`. Every
