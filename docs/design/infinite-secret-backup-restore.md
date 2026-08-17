@@ -31,6 +31,34 @@ With built-in history, that incident would have been
 operator-driven GUI recovery. Off-machine backup (Arq) remains necessary for
 disk loss; this feature removes the dependency on it for logical loss.
 
+## Search for prior discussion FIRST (operator directive, 2026-08-17)
+
+Design work on this feature must begin by searching for existing discussion —
+upstream issues/PRs and the web generally — and must repeat the search even
+though a first pass was done, because the queue ahead of this is long and
+upstream moves.
+
+First pass, 2026-08-17:
+
+- **Upstream (`cachix/secretspec`) issues and PRs**: searched `backup`,
+  `restore`, `versioning`, `snapshot`, `rollback`, `history`, `undo`,
+  `revert`. **No dedicated thread exists.** Every hit was an incidental
+  keyword match (#64 out-of-tree providers, our own #370, #202 cache
+  clearing, #176 file-shaped secrets, #156 property tests).
+- **Web**: no secretspec-specific discussion of backup/restore found. What
+  exists is prior art in other managers, worth studying at design time:
+  - [Vault KV v2 version history](https://oneuptime.com/blog/post/2026-02-09-vault-secret-versioning-rollback/view)
+    — every write creates a version; distinct delete / destroy / undelete
+    verbs; any historical version retrievable.
+  - [AWS Secrets Manager restore-secret](https://docs.aws.amazon.com/secretsmanager/latest/userguide/manage_restore-secret.html)
+    — deletion is a scheduled recovery window, not an immediate destroy.
+  - [Azure Key Vault backup/restore](https://learn.microsoft.com/en-za/dotnet/api/azure.security.keyvault.secrets.secretclient.restoresecretbackupasync?view=azure-dotnet)
+    — per-secret encrypted backup blobs restorable through the API.
+  - Also in the same family: 1Password item history, `pass` (git history is
+    the vault history), [Velero for Kubernetes secrets](https://oneuptime.com/blog/post/2026-02-09-secrets-backup-restore-velero/view).
+- Before building fork-only, ask whether upstream wants a shape of this —
+  the delete/versioning surface touches the provider trait (PR #354 lineage).
+
 ## Non-binding sketch (to be designed properly when the queue clears)
 
 - History lives **inside the privilege boundary** (root-owned, e.g.
