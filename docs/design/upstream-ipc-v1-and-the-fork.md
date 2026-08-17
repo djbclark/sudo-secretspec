@@ -110,13 +110,31 @@ Two risks worth naming rather than dismissing:
 
 1. Comment on #362 — supportive, announcing intent to ship the first
    out-of-tree **privileged** `secretspec.provider/1` endpoint, closing the loop
-   on #345. Carry one technical point from shipped experience: the registration
-   trust check validates only the **immediate parent** directory
-   (`external.rs:335-361`, via symlink-following `fs::metadata`), but on macOS
-   the ancestor `/Library/Application Support` is admin-group writable. This
-   fork walks the full ancestor chain with `symlink_metadata`
-   (`drift.rs` `check_ancestor_chain`) for exactly that reason. Offer it as
-   review feedback plus conformance cases, not a demand.
+   on #345. **CORRECTED 2026-08-17** (verified against PR head `337950c` and
+   this machine, macOS 26.6.1 — the original claim below was false and must
+   not be posted): `/Library/Application Support` is `root:admin 0755`, no
+   ACL, **not** group-writable. The real gaps, verified in
+   `external.rs` `check_file_security`/`check_parent_security`
+   (lines ~307-360 as of `337950c`):
+   - Both check only `metadata.mode() & 0o022` via `std::fs::metadata`, which
+     is **blind to macOS ACLs** — a third-party installer can grant
+     `add_file`/`write` to a group via an extended ACL while POSIX mode reads
+     clean. The Windows path in the same file already validates ACLs
+     (`path_acl_is_trusted`); the unix path has no equivalent.
+   - `std::fs::metadata` **follows symlinks**, so a symlinked path component
+     anywhere in the chain is validated at its resolved target, not the
+     literal registered path.
+   - Trust genuinely does stop at the **immediate parent** — everything above
+     it is unchecked. Soundness of the macOS default chain is assumed, not
+     verified, and one loosened ancestor (by mode or by ACL) upstream of the
+     parent defeats both checks below it.
+   This fork's `drift.rs` `check_ancestor_chain` walks the resolved chain to
+   `/`, rejects non-root ownership, group/world-writable mode, **any extended
+   ACL**, and symlinked components, at every level — not just the parent.
+   Offer the corrected points as review feedback plus conformance cases
+   (ancestor-writable-by-ACL, symlinked-component), not a demand. Draft at
+   `docs/design/pr362-comment.md` (write it there before posting, so the next
+   session inherits the exact wording rather than re-deriving it).
 2. Prototype the provider endpoint against `feat/ipc-v1` in a scratch worktree.
    It is a small shim, and it proves the "no upstream patching" claim rather
    than asserting it.
