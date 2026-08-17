@@ -164,8 +164,12 @@ explicit `unknown` terminal state if restoration cannot be proven.
   transcript, log, or tool output — parse and assert on keys. The client
   deliberately does not capture this stream, so redaction is entirely on the
   caller.
-- **`check` reports to stderr, not stdout.** An empty stdout is not a pass; read
-  the exit status.
+- **`check` reports to stdout (0.19.1-sudo.15+; it was stderr before).** Read
+  the exit status, not the presence of output: `0` all required secrets
+  present, `1` at least one missing. Against an older boundary the report is on
+  stderr instead, so read *both* streams if you must support both, and never
+  treat an empty stdout as a pass on its own. The report names secrets but
+  never prints values, so it is safe to log.
 - **Lifecycle commands authenticate even under `--dry-run`.** `install`,
   `uninstall`, and `rollback` re-exec through interactive `sudo` before the
   dry-run flag is ever considered, under `timestamp_timeout=0`. Every

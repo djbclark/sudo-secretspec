@@ -228,6 +228,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   codes are unchanged, and the error message for a missing required secret
   stays on stderr where it belongs.
 
+  The report is written through a sink rather than `println!`, so a reader that
+  closes the pipe early — `check | head` — reports a broken pipe as an ordinary
+  error instead of panicking, the same way `export` already behaves. Note this
+  hazard only exists at all because the report moved to stdout; the previous
+  stderr-only behaviour could not encounter it.
+
 - Bare `bws://<project-uuid>` provider URIs now target the Bitwarden US cloud
   vault instead of the public marketing site, restoring reads and writes while
   keeping the server pinned independently of ambient `bws` configuration.

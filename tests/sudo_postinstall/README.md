@@ -24,7 +24,7 @@ Read-only, no prompts, safe to run any time:
 - **Health** — `doctor`, `template-check`.
 - **Audit** — `audit-verify` reports an intact chain, an audited operation
   advances the tip, and the chain still verifies afterwards.
-- **Reads** — `check` (summary on stderr, stdout clean, never prompts), `get`,
+- **Reads** — `check` (report on stdout so it is pipeable, never prompts), `get`,
   `export` (keys only — never values), `run` (environment reaches the child,
   `--` passes through, child exit code propagates).
 - **Refusals** — every credential operation requires `--reason`; `get` refuses an

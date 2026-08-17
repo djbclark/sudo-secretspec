@@ -8,6 +8,11 @@
 //! These assert the stream split rather than the wording: the report on
 //! stdout, diagnostics and the failure message on stderr, and the exit codes
 //! unchanged in both directions.
+//!
+//! One of them guards the hazard that moving to stdout introduced: a reader
+//! that closes the pipe early (`check | head -1`) makes the next write fail
+//! with EPIPE, and Rust's `println!` *panics* on that. Writing through a sink
+//! turns it into an ordinary error instead.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -147,4 +152,71 @@ fn a_failing_check_reports_on_stdout_but_errors_on_stderr() {
         !err.contains("Summary:"),
         "the report's summary must not appear on stderr:\n{err}"
     );
+}
+
+// Unix-only: this drives a real `sh` pipeline with `head`, and EPIPE is the
+// Unix mechanism under test. The other two tests in this file are portable and
+// do run on the Windows leg.
+#[cfg(unix)]
+#[test]
+fn a_reader_that_closes_the_pipe_early_does_not_panic() {
+    // Moving the report to stdout put it on a stream a reader can close early.
+    // `println!` panics on EPIPE ("failed printing to stdout: Broken pipe"),
+    // exiting 101 — so before the sink was introduced, the very pipeline this
+    // change exists to enable would abort the process partway through the
+    // report. Worse for the downstream broker: a panic unwinds past the audit
+    // bookkeeping, stranding an operation that has an attempt event and no
+    // terminal one.
+    //
+    // Driven through `sh` because the hazard is the shell pipeline itself: the
+    // reader must exit while the writer still has lines to emit.
+    let project = project_with(".env", "DATABASE_URL=postgres://localhost/demo\n");
+    let env_path = project.path().join(".env");
+
+    let script = format!(
+        "{bin} --file {manifest} --reason 'closing the pipe early' \
+         check --no-prompt --provider 'dotenv://{env}' | head -1",
+        bin = shell_quote(env!("CARGO_BIN_EXE_secretspec")),
+        manifest = shell_quote(project.path().join("secretspec.toml").to_str().unwrap()),
+        env = env_path.display(),
+    );
+
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(&script)
+        .current_dir(project.path())
+        .env("HOME", project.path())
+        .env("XDG_CONFIG_HOME", config_home(project.path()))
+        .env("XDG_STATE_HOME", project.path().join("state"))
+        .env_remove("SECRETSPEC_PROVIDER")
+        .env_remove("SECRETSPEC_PROFILE")
+        .env_remove("SECRETSPEC_SCOPE")
+        .env_remove("SECRETSPEC_REASON")
+        .output()
+        .expect("run the pipeline");
+
+    let err = stderr(&output);
+    assert!(
+        !err.contains("panicked"),
+        "check panicked on a closed pipe:\n{err}"
+    );
+    assert!(
+        !err.contains("failed printing to stdout"),
+        "check hit the `println!` EPIPE panic:\n{err}"
+    );
+
+    // `head` consumed the first line, so the pipeline itself succeeded.
+    assert!(
+        stdout(&output).contains("Checking secrets in stream-demo"),
+        "the reader should still have received the first line: {:?}",
+        stdout(&output)
+    );
+}
+
+#[cfg(unix)]
+/// Single-quote a path for `sh -c`. The temp paths here never contain quotes,
+/// but constructing a shell command without escaping is a habit worth not
+/// forming.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
