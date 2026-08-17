@@ -2,14 +2,18 @@
 
 Written 2026-08-17, on operator request, with `sudo-main` at `b97abf1`.
 
-**Status: DESIGNED 2026-08-17, not implemented.** The work it was sequenced
-behind is done — `0.19.1-sudo.16` through `.18` are released, the `Spec`-shaped
-manifest-edit reference implementation is upstream as
-[PR #374](https://github.com/cachix/secretspec/pull/374), and the comment on
-upstream [PR #362](https://github.com/cachix/secretspec/pull/362) is posted.
-See [The design](#the-design-decided-2026-08-17-with-sudo-main-at-22e5178)
-below and its implementation plan; the open questions this document used to
-end with are answered there, not pending.
+**Status: PARTLY BUILT, THEN REDIRECTED 2026-08-17.** Steps 1–4 of the original
+plan shipped (`5efb816`, `bd17934`, `dff3830`). The operator then raised a
+better architecture, and the storage half of this design was **superseded the
+same day** — see
+[Redirection: storage moves into a `sqlite://` provider](#redirection-storage-moves-into-a-sqlite-provider)
+below, which is the current plan and takes precedence over the storage
+decisions in [The design](#the-design-decided-2026-08-17-with-sudo-main-at-22e5178).
+
+Read the redirection section **first**. The design section below it is retained
+because its reasoning about chaining, destroy/tombstones, authorisation and
+scope still holds and transfers; only the question of *where the values live*
+changed.
 
 ## What the operator asked for
 
@@ -123,7 +127,146 @@ keep none. Local candidates to evaluate at design time:
   write ourselves, but as trivial schema on a substrate the boundary already
   trusts, and it could share the ledger's integrity design.
 
+## Redirection: storage moves into a `sqlite://` provider
+
+Decided 2026-08-17, after steps 1–4 had shipped. **This section is the current
+plan.**
+
+### What changed
+
+The original design put value history in a boundary-owned sidecar
+(`broker-history.sqlite3`) beside a dotenv vault that remained the source of
+truth. The operator asked whether the whole stack should instead sit on a
+**normal-plugin-interface `sqlite://` provider** — storage as an ordinary
+secretspec provider like `keyring` or `onepassword`, rather than a private
+store bolted beside one.
+
+It should. Three things decided it:
+
+1. **The provider is boundary-unaware, and that is what makes it reusable.**
+   Point it at a `0600` file owned by the service user and an unprivileged
+   caller gets `EACCES` while the mediated broker works; point it at a file
+   owned by the running user and it is an ordinary local provider with no
+   privilege story at all. *Identical code in both cases.* The privilege model
+   stays entirely external to it.
+2. **It fills a gap this document already identified.** "No existing secretspec
+   provider gives local versioning out of the box" — every versioned provider
+   upstream ships (Vault KV v2, AWS Secrets Manager, Azure, Keeper) is a
+   network service, and the operator's binding constraint was no network
+   dependency. A local versioned provider is the missing row in upstream's own
+   matrix, so it is a far better upstream candidate than a fork-only sidecar
+   could ever be.
+3. **Switching now wastes less than finishing first.** Six further steps built
+   on the sidecar would each need reworking. The recommendation to finish the
+   original plan first was momentum rather than analysis, and is withdrawn.
+
+### Two corrections to the original design's reasoning
+
+- **The trait surface is not a prerequisite.** This document previously treated
+  upstream's unsettled provider `delete`/versioning surface (the PR #354
+  lineage) as a gate. It is not. A `sqlite://` provider can be upstreamed as a
+  plain `get`/`set`/`delete` provider that *retains* history internally, with
+  history and restore reached through concrete methods the fork's broker calls.
+  A generic trait surface becomes a later improvement, not a blocker.
+- **A provider store would not have survived the incident either.** The
+  argument that "a provider cannot cover the install truncation" was true but
+  not a point of distinction: had `install` blindly `File::create`'d a
+  `vault.sqlite3`, it would have destroyed the values *and* their history
+  together. Install-time capture is required under **both** designs. It counts
+  against neither.
+
+### What does not move into the provider
+
+Smaller than first claimed, but real, and it is what remains of the boundary
+piece:
+
+1. **Declarations.** `secretspec.toml` is not provider data. Manifest history
+   stays boundary-level — and that is the file the `undeclare` gap was about.
+2. **Install-time capture.** Outside the provider under either design, per the
+   correction above.
+3. **Authorisation.** Forward-safe-for-agents versus operator-only `--force`,
+   `--all` and `destroy` is boundary policy wherever the bytes live.
+
+### What survives from steps 1–4
+
+Nothing is reverted; all three commits stay.
+
+- `5efb816` — the `undeclare` rollback-copy fix is independent of storage
+  entirely and stands as shipped.
+- `bd17934` / `dff3830` — the chain design, the digest-not-bytes rule that
+  makes destroy auditable, the `destroyed_by` schema `CHECK`, the shared
+  hardened opener, and the "failed archive keeps the copies" contract all
+  transfer into the provider. `capture` / `list` / `restore` were deliberately
+  built as the seam the value half moves behind, so the surface does not
+  change shape when it does.
+- The verified fact that the live vault's dotenv round-trips byte-exactly
+  (39 names, 2858 bytes, identical digest) is what makes the **migration**
+  safe to attempt: the values can be read out through the same grammar that
+  wrote them.
+
+### Companion change: drop the broker from root to the service user
+
+Independent of storage, and worth taking separately. The broker requires root
+today (`ALL=(root)` in the installed sudoers policy, `install.rs:825`), but
+that requirement looks **largely incidental** — root is there to `chown` things
+*to* the service user:
+
+- `require_boundary` reads a `0700` directory owned by `_sudo_secretspec` —
+  being that user suffices
+- `Mutation::begin` chowns its copies to `uid:gid` — unnecessary if the process
+  already is that user
+- `audit::open_connection` chowns the ledger `if geteuid() == 0` — already
+  correct as that user
+- the config is `0444`; the vault is service-user-owned
+
+sudo's `Runas_Spec` already supports a non-root target, so `ALL=(_sudo_secretspec)`
+would drop the privileged identity from root to a service user while keeping
+**sudoers as the policy engine**. `install` stays root; it is already a
+separate privileged step.
+
+*Rejected: a setuid binary.* It reaches the same privilege reduction by
+hand-writing the hardening `sudo` performs for us — environment sanitisation,
+`closefrom`, saved-set-uid ordering, supplementary-group dropping, argv, fd,
+umask and cwd hygiene — in a binary guarding real credentials. It also moves
+authorisation out of an externally auditable policy file and into `getuid()`
+checks in our own code, which is the wrong direction for this system: the
+operator-only-versus-agent-callable split for `restore` and `destroy` is
+naturally expressed as sudoers rules. Estimated at 3–4× the cost of the whole
+remaining plan, with the failure mode surfacing late.
+
+### Design points to settle early
+
+- **History retention must be opt-in** (`sqlite://path?history=…` or similar).
+  An upstream user pointing the provider at their own store would be surprised
+  to find every prior value retained by default. The fork turns it on
+  explicitly.
+- **Migration of the live vault** — 39 secrets, currently in
+  `/var/db/sudo-secretspec/.env`, on a host where that file has already been
+  truncated once. Needs a rehearsal and a rollback, not a one-shot import.
+
+### Honest caveat on the upstream justification
+
+This decision leans on upstream acceptance, so the current evidence belongs
+next to it: **upstream is not merging our work right now.** #362, #372, #373
+and #374 are all open with zero maintainer engagement, and #374 has not had CI
+run at all — which djbclark cannot trigger, having pull-only access. #354 and
+#355 merged earlier, so the channel is not dead. Build the better upstream
+candidate, but do not price the plan on acceptance arriving soon.
+
+### Cost
+
+Roughly **560–750k tokens** across the provider (~250–350k), the runas
+reduction (~60–100k), the reduced boundary piece (~150–200k), and migration
+plus release and live verification (~100k). That is **more** than the
+~250–350k needed to finish the original plan. The justification is
+architecture and a reusable artifact, not cost — recorded plainly so nobody
+later reads "switching wastes less" as "switching is cheaper".
+
 ## The design (decided 2026-08-17, with `sudo-main` at `22e5178`)
+
+> **Storage decisions in this section are superseded** by the redirection
+> above. Its reasoning about chaining, destroy/tombstones, authorisation,
+> scope, retention and upstream posture still holds and transfers.
 
 Status of this section: **designed, not implemented.** The open questions
 below it are answered, not pending.
@@ -315,10 +458,40 @@ first contributing the boundary.
 Revisit only if upstream settles a provider `delete`/versioning surface
 (the PR #354 lineage), which would give the storage half somewhere to land.
 
-## Implementation plan
+## Implementation plan (current, post-redirection)
 
-Ordered so that each step is independently shippable and the two incidental
-gaps are closed early, where they are cheap.
+Steps 1–4 of the superseded plan below already shipped. What follows replaces
+its steps 5–10.
+
+1. **`sqlite://` provider in the `secretspec` crate.** A plain
+   `get`/`set`/`delete` provider following the ~35 sibling conventions:
+   module in `secretspec/src/provider/sqlite.rs`, `#[provider]` registration,
+   URI parsing, profile-aware storage, and cases in
+   `secretspec/src/provider/tests.rs`. No boundary awareness whatsoever.
+2. **Internal versioning, opt-in.** Retention behind a URI option, with the
+   chain design carried over from `history.rs`: entries hash-chained over
+   metadata and value *digests*, `destroyed_by` outside the hash and kept
+   honest by the schema `CHECK`.
+3. **Provider documentation**, all seven locations in `CLAUDE.md`'s checklist
+   plus the credentials catalog and `npm --prefix docs run
+   check:provider-credentials`. Version-label everything unreleased.
+4. **Reduced boundary piece**: manifest history and install-time capture, which
+   is what `history.rs` becomes once values live in the provider.
+5. **Restore and destroy verbs**, with the authorisation split unchanged from
+   the superseded design — forward-safe for agents, `--force` / `--all` /
+   `destroy` operator-only behind a separate sudoers verb.
+6. **Migration** of the live 39-secret vault off dotenv, rehearsed with a
+   rollback before it is run for real.
+7. **Runas reduction** (`ALL=(root)` → `ALL=(_sudo_secretspec)`), independent
+   of all of the above and takeable at any point.
+8. **Docs, sudoers, CHANGELOG, release, postinstall verification.**
+
+Still owed from steps 1–4 regardless: `CHANGELOG.md` has **no** entry for any
+of `5efb816`, `bd17934`, `dff3830` — those commits are code-only.
+
+## Superseded implementation plan
+
+Retained for the reasoning; steps 1–4 shipped, steps 5–10 are replaced above.
 
 1. **Wrap `source-undeclare` in `Mutation`** (`broker.rs:529`). One-line
    `matches!` change plus a test; independent of everything below.
