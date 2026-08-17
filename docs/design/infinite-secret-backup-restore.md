@@ -59,6 +59,35 @@ First pass, 2026-08-17:
 - Before building fork-only, ask whether upstream wants a shape of this —
   the delete/versioning surface touches the provider trait (PR #354 lineage).
 
+## Operator constraints and backend candidates (2026-08-17)
+
+Constraint from the operator: the history store must **not be a network
+dependency**, and should ideally be a backend that *already implements
+versioning* rather than versioning written from scratch.
+
+No existing secretspec provider gives local versioning out of the box: the
+versioned providers (Vault KV v2, AWS Secrets Manager, Azure, Keeper, …) are
+all network services; keyring/Keychain has no history API; dotenv and file
+keep none. Local candidates to evaluate at design time:
+
+- **git as the history layer** (the `pass` model, applied to our vault) —
+  wrap the existing root-owned dotenv vault in a local git repo inside the
+  boundary. Infinite history, diffs, restore = checkout, integrity via
+  `git fsck`; no remote ever needed. Minimal change to the current vault
+  shape, and git is already on every machine this runs on.
+- **`pass` / `gopass` providers** (both already in-tree) — GPG-encrypted
+  files in a local git store; gopass auto-commits every change. Gets
+  versioning "for free" but brings a GPG toolchain dependency the boundary
+  doesn't otherwise need.
+- **`kdbx` provider** (in-tree) — the KeePass format keeps per-entry history
+  inside one encrypted local file. But history depth is capped/configurable,
+  not infinite, and whether the Rust kdbx stack preserves history on write
+  needs verification.
+- **SQLite append-only history table** — `rusqlite` is already a dependency
+  of the privileged CLI crate (the audit ledger), so this is versioning we'd
+  write ourselves, but as trivial schema on a substrate the boundary already
+  trusts, and it could share the ledger's integrity design.
+
 ## Non-binding sketch (to be designed properly when the queue clears)
 
 - History lives **inside the privilege boundary** (root-owned, e.g.
