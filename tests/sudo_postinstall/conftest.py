@@ -150,15 +150,19 @@ _RESOLVED, _OPTIONAL, _MISSING = "✓", "○", "✗"
 def _check_report() -> dict[str, set[str]]:
     """Parse `check` into {marker: names}.
 
-    `check` writes its human report to **stderr** and keeps stdout clean, so
-    `export` and `get` stay consumable by a shell without the report
-    contaminating them. Read the right stream.
+    Reads **both** streams on purpose. 0.19.1-sudo.15 moved the report from
+    stderr to stdout, and this helper only wants the names -- pinning it to one
+    stream would make it silently return nothing against a boundary from the
+    other side of that change, which is worse than useless here: an empty
+    result feeds `resolved_name`, which skips rather than fails, quietly
+    disabling every test that reads a value. `test_check_writes_its_report_to_stdout`
+    is where the stream itself is asserted.
     """
     result = run("check", "--reason", REASON)
     assert result.returncode in (0, 1), result.stderr
 
     report: dict[str, set[str]] = {_RESOLVED: set(), _OPTIONAL: set(), _MISSING: set()}
-    for line in result.stderr.splitlines():
+    for line in (result.stdout + "\n" + result.stderr).splitlines():
         parts = line.strip().split(None, 2)
         if (
             len(parts) >= 2
@@ -190,6 +194,14 @@ def resolved_name(check_report) -> str:
     """
     resolved = check_report[_RESOLVED]
     if not resolved:
+        # A vault where nothing resolves is a legitimate state, but so is a
+        # parsing bug that found nothing at all. Distinguish them: if the
+        # report named no secrets whatsoever, the parse failed and skipping
+        # would hide it.
+        assert set().union(*check_report.values()), (
+            "check reported no secrets at all -- _check_report failed to parse "
+            "the report, so skipping here would silently disable the read tests"
+        )
         pytest.skip("no secret in this vault resolves to a value")
     return min(resolved)
 

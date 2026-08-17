@@ -146,14 +146,36 @@ def test_check_reports_a_summary_and_never_prompts():
     or errors -- it cannot silently pass."""
     result = run("check", "--reason", REASON, timeout=60)
     assert result.returncode in (0, 1), result.stderr
-    assert re.search(r"\d+ found", result.stderr), result.stderr
+    # Either stream: this test is about prompting and the summary existing, not
+    # about where it is printed. `test_check_writes_its_report_to_stdout` owns
+    # the stream contract.
+    assert re.search(r"\d+ found", result.stdout + result.stderr), (
+        result.stdout + result.stderr
+    )
 
 
-def test_check_keeps_stdout_clean():
-    """The report goes to stderr so that stdout stays consumable by a shell.
-    A report on stdout would corrupt `export` and `get` pipelines."""
+def test_check_writes_its_report_to_stdout():
+    """The report is the output the operator asked for, so it belongs on stdout
+    and must be pipeable: `sudo-secretspec check | grep NAME` has to work.
+
+    This inverts an earlier assertion in this suite, which required stdout to be
+    empty on the theory that a report there would corrupt `export` and `get`
+    pipelines. That theory was wrong -- those are separate invocations, so
+    `check` cannot contaminate them -- and the cost was real: the whole report
+    was unpipeable, and because `colored` decides on ANSI by testing *stdout*,
+    a report written to stderr leaked escape bytes into redirected logs.
+
+    Requires a boundary at 0.19.1-sudo.15 or newer; against .14 it fails, which
+    is the correct signal for a post-install gate."""
     result = run("check", "--reason", REASON)
-    assert result.stdout == "", f"check wrote to stdout: {result.stdout[:120]!r}"
+    assert result.returncode in (0, 1), result.stderr
+    assert re.search(r"\d+ found", result.stdout), (
+        f"summary missing from stdout; stdout={result.stdout[:200]!r} "
+        f"stderr={result.stderr[:200]!r}"
+    )
+    assert "found" not in result.stderr, (
+        f"the report must not be duplicated onto stderr: {result.stderr[:200]!r}"
+    )
 
 
 def test_check_requires_a_reason():

@@ -68,19 +68,40 @@ both mistakes are reachable today:
 Routing the report to stdout makes the existing TTY detection correct as a side
 effect, rather than requiring any new colour logic.
 
-### Convention
+### `check` already contradicts itself
 
-The usual split is that a command's primary output — the thing the user asked
-for — goes to stdout, and stderr carries diagnostics, progress and errors. The
-`check` report *is* the requested output. (This is also why `git status`,
-`cargo tree`, `kubectl get` etc. are all pipeable.) Note `export` already writes
-to stdout via `io::stdout()`, so `check` is the outlier within secretspec
-itself.
+The clearest evidence that this is an oversight rather than a decision is that
+the *same subcommand* routes the *same report* to different streams depending
+on a flag:
+
+- `check --json` → `println!` (`cli/mod.rs:1507`) — stdout
+- `check --explain` → `print!` (`cli/mod.rs:1509`) — stdout
+- `check` → `eprintln!` (`secrets.rs:3678` and the two `display_validation_*`
+  helpers) — stderr
+
+So a caller can already pipe the machine-readable and the explain renderings,
+but not the default human one. Whatever the right stream is, it should not
+depend on which flag was passed.
+
+More broadly, a command's primary output — the thing the user asked for — goes
+to stdout, and stderr carries diagnostics, progress and errors. `export` writes
+to stdout via `io::stdout()` (`cli/mod.rs:1466`), as do `get`, `schema` and
+`completions`.
+
+**In fairness, `check` is not the only stderr reporter.** `import`'s summary is
+also on stderr (`secrets.rs:4313`, `:4320`, `:4328`), as are the interactive
+set/generation confirmations. I've left `import` alone here because I don't want
+to widen a focused fix, but if you consider its summary primary output too, I'm
+happy to include it — or to be told the house rule is the opposite of what I've
+assumed, in which case the consistent fix is to move `--json`/`--explain` to
+stderr instead and I'll send that patch.
 
 ### Proposed fix
 
-Mechanical: `eprintln!` → `println!` at those three sites. No change to exit
-codes, no change to what is printed, no new dependency, no colour rework.
+Mechanical: `eprintln!` → `println!` at the 11 call sites across those three
+functions. No change to exit codes, no change to what is printed, no new
+dependency, no colour rework. `ensure_secrets` is deliberately untouched — its
+output is prompts and diagnostics, not report.
 
 Open question for maintainers, happy to go either way:
 
@@ -99,12 +120,33 @@ Open question for maintainers, happy to go either way:
    terminal is currently impossible without escape codes leaking into the file
    (see above).
 
+### Library API
+
+`Secrets::check()` is public (`secrets.rs:3674`) and appears in the SDK doc
+examples, so this makes a *library* write to its consumer's stdout — a fair
+objection, and arguably worse than writing to stderr, since a consumer emitting
+JSON on stdout would have the report interleaved into it.
+
+Two things make me think it's still right as proposed. The printing already
+happens unconditionally today, just to the other stream, so no consumer is
+currently spared it; and in practice the CLI is the only caller — the one
+non-CLI caller I know of is my own downstream broker.
+
+That said, if you'd rather not have a library print at all, the cleaner shape is
+to move rendering into the CLI layer, or have `check` take an `impl Write`
+(defaulting to `io::stdout()`) so an embedder can redirect it. I'm happy to do
+either instead; say which and I'll send that patch.
+
 ### Compatibility
 
-Anyone currently capturing via `2>&1` keeps working unchanged — that captures
-both streams. The breaking case is a script that captures stderr *specifically*
-(`2>report.txt` with stdout discarded); I'd expect that to be rare, and it is
-arguably relying on the bug.
+Anyone capturing via `2>&1` keeps working — that captures both streams. The
+breaking case is a script capturing stderr *specifically* (`2>report.txt` with
+stdout discarded).
+
+I won't claim that's rare, because it caught me: my own downstream post-install
+suite asserted the report was on stderr and asserted stdout was empty, and I had
+to update three fixtures. Worth a `Changed` note rather than only a `Fixed` one,
+and I'd expect a small number of wrappers to need the same edit.
 
 I have a patch with tests and can open a PR immediately if the approach looks
 right.
@@ -116,10 +158,15 @@ right.
 - Verified the defect exists on upstream `main` independently of our fork:
   `git show upstream/main:secretspec/src/secrets.rs` has the same 37 `eprintln!`
   calls and the same three functions.
-- `secrets.rs` is upstream-owned: the fork has touched it once since the merge
-  base (0a17ce0, unrelated), upstream 7 times. Fork-local-only fix = permanent
-  conflict site. This is the argument for upstreaming rather than just patching.
-- Need to confirm the exact upstream line numbers against dfa4b10 before posting
-  (numbers above are from the pre-merge read; re-check after the merge lands).
-- Need a real reproduction transcript from the merged tree before posting —
-  do NOT post the illustrative block above as if it were captured output.
+- `secrets.rs` is upstream-owned, and after the dfa4b10 merge our copy is
+  **byte-identical to upstream**, so the patch applies cleanly. That is the
+  strong form of the argument for upstreaming rather than patching locally.
+- Line numbers CONFIRMED against dfa4b10 (2026-08-16): `display_validation_success`
+  3701, `display_validation_errors` 3731, the `check()` header 3678.
+  `export` → stdout at `cli/mod.rs:1466`. `check --json` → `cli/mod.rs:1507`,
+  `--explain` → `:1509`. `import`'s stderr summary at `secrets.rs:4313/4320/4328`.
+- Still need a real reproduction transcript from the merged tree before posting —
+  do NOT post the illustrative block above as if it were captured output. Note
+  the real output includes descriptions (`✓ DATABASE_URL - app database`) and a
+  first-run `note: secretspec is now recording secret access to ...` line on
+  stderr; include or trim that deliberately rather than by accident.

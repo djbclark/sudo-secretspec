@@ -48,11 +48,14 @@ fn run_check(project: &Path, dotenv: &str) -> Output {
         .env("HOME", project)
         .env("XDG_CONFIG_HOME", config_home(project))
         .env("XDG_STATE_HOME", project.join("state"))
+        // Windows ignores the XDG variables: there the config and audit
+        // directories come from APPDATA and the cache from LOCALAPPDATA.
         .env("APPDATA", config_home(project))
         .env("LOCALAPPDATA", project.join("state"))
         .env_remove("SECRETSPEC_PROVIDER")
         .env_remove("SECRETSPEC_PROFILE")
         .env_remove("SECRETSPEC_SCOPE")
+        .env_remove("SECRETSPEC_REASON")
         .output()
         .expect("run secretspec check")
 }

@@ -3675,12 +3675,8 @@ impl Secrets {
         self.ensure_reason_for(AuditAction::Check, None)?;
         let profile_display = self.resolve_profile_name(None);
 
-        // The report is the output the user asked for, so it belongs on stdout
-        // — `secretspec check | grep ...` otherwise sees nothing at all. This
-        // also makes the existing colour handling correct: `colored` decides
-        // whether to emit ANSI escapes by testing stdout's TTY, so writing the
-        // report to stderr leaked escapes into redirected logs and stripped
-        // them from terminals. `export` already writes to stdout.
+        // The report is this command's output, so it goes to stdout, matching
+        // the `--json` and `--explain` paths above it.
         println!(
             "Checking secrets in {} (profile: {})...\n",
             self.config.project.name.bold(),
