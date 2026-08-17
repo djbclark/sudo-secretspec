@@ -24,7 +24,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from conftest import REASON, audit_tip, parse_audit, run
+from conftest import REASON, audit_tip, parse_audit, run, run_installer
 
 # --------------------------------------------------------------------------
 # Identity: is the boundary the one this checkout builds?
@@ -338,12 +338,16 @@ def test_the_round_trip_leaves_the_ledger_verifiable(scratch_name):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.usefixtures("lifecycle_allowed")
+@pytest.mark.usefixtures("lifecycle_allowed", "installer")
 def test_install_dry_run_plans_the_vault_the_boundary_already_serves(config):
     """The regression that shipped in 0.19.1-sudo.6: detection scanned a fixed
     list of directory names instead of reading the installed config, so on a
-    migrated host a reinstall planned to adopt the retired vault."""
-    result = run("install", "--adopt-existing", "--dry-run", "--non-interactive")
+    migrated host a reinstall planned to adopt the retired vault.
+
+    Driven through the package broker, not the installed client: `install`
+    refuses to source itself from the boundary it would overwrite.
+    """
+    result = run_installer("install", "--adopt-existing", "--dry-run", "--non-interactive")
     assert result.returncode == 0, result.stdout + result.stderr
 
     planned = dict(
@@ -360,7 +364,7 @@ def test_install_dry_run_plans_the_vault_the_boundary_already_serves(config):
     )
 
 
-@pytest.mark.usefixtures("lifecycle_allowed")
+@pytest.mark.usefixtures("lifecycle_allowed", "installer")
 def test_install_dry_run_adopts_the_installed_vault_without_the_flag(config):
     """Since 0.19.1-sudo.17, an upgrade needs no `--adopt-existing`: the
     installed root-owned config names the vault this host serves from, so
@@ -371,10 +375,13 @@ def test_install_dry_run_adopts_the_installed_vault_without_the_flag(config):
     adopted by default but resolved somewhere else would satisfy a flag-only
     test while repointing the boundary.
 
+    Driven through the package broker, not the installed client: `install`
+    refuses to source itself from the boundary it would overwrite.
+
     Requires a boundary at 0.19.1-sudo.17 or newer; against .16 it fails with
     the fresh-install refusal, which is the correct signal for a post-install
     gate."""
-    result = run("install", "--dry-run", "--non-interactive")
+    result = run_installer("install", "--dry-run", "--non-interactive")
     assert result.returncode == 0, result.stdout + result.stderr
 
     planned = dict(

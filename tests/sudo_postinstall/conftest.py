@@ -25,6 +25,9 @@ CLIENT = Path(
 )
 CONFIG = Path("/usr/local/etc/sudo-secretspec.toml")
 
+#: Override for the package manager's copy of the broker; see `_package_broker`.
+INSTALLER_ENV = "SUDO_SECRETSPEC_INSTALLER"
+
 #: Opt-in for tests that write a *value* to the live vault. They use a scratch
 #: secret and delete it again.
 WRITE_GATE = "SUDO_SECRETSPEC_POSTINSTALL_WRITES"
@@ -64,6 +67,49 @@ def run(*argv: str, stdin: str | None = None, timeout: int = 60):
         timeout=timeout,
         # Non-zero is data here, not an error: most of this suite asserts on
         # refusals. Raising would turn every expected denial into a test error.
+        check=False,
+    )
+
+
+def _package_broker() -> Path | None:
+    """The package manager's copy of the broker, or None if it is not present.
+
+    `install` is the one verb `CLIENT` cannot drive. `resolve_media` refuses to
+    source an install from the installed boundary itself -- that would copy
+    every artifact onto itself and report success while upgrading nothing -- so
+    an install plan asked of `/usr/local/bin/sudo-secretspec` comes back as a
+    denial, not a plan. The real installer is the libexec copy Homebrew ships,
+    kept off PATH so it cannot shadow the installed client.
+    """
+    override = os.environ.get(INSTALLER_ENV)
+    if override:
+        path = Path(override)
+        return path if path.is_file() else None
+
+    brew = shutil.which("brew")
+    if brew is None:
+        return None
+    result = subprocess.run([brew, "--prefix"], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return None
+    path = Path(result.stdout.strip()) / "opt/sudo-secretspec/libexec/sudo-secretspec"
+    return path if path.is_file() else None
+
+
+def run_installer(*argv: str, timeout: int = 60):
+    """Invoke the package manager's broker copy -- the only one `install` runs from.
+
+    Same stdin discipline as `run`: never inherited, so an unexpected prompt
+    fails on EOF instead of consuming the runner's stdin.
+    """
+    broker = _package_broker()
+    assert broker is not None, "no package broker; the installer fixture should have skipped"
+    return subprocess.run(
+        [str(broker), *argv],
+        input="",
+        capture_output=True,
+        text=True,
+        timeout=timeout,
         check=False,
     )
 
@@ -131,6 +177,23 @@ def lifecycle_allowed():
             "timestamp_timeout=0 on install/uninstall/rollback. Only run this "
             "when you are at the keyboard and expecting to authenticate."
         )
+
+
+@pytest.fixture
+def installer() -> Path:
+    """The broker copy an install must be sourced from.
+
+    Skips rather than fails when it is absent: a host can carry a perfectly
+    good boundary installed from media that is no longer on disk, and that is
+    not a defect in the boundary this suite is vetting.
+    """
+    broker = _package_broker()
+    if broker is None:
+        pytest.skip(
+            "no package broker copy found; set "
+            f"{INSTALLER_ENV} to the libexec broker an install would be sourced from"
+        )
+    return broker
 
 
 @pytest.fixture
