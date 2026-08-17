@@ -32,10 +32,14 @@ INSTALLER_ENV = "SUDO_SECRETSPEC_INSTALLER"
 #: secret and delete it again.
 WRITE_GATE = "SUDO_SECRETSPEC_POSTINSTALL_WRITES"
 
-#: Separate, louder opt-in for `add`. Declaring is the one operation with no
-#: inverse: nothing removes a declaration from the runtime manifest, so an `add`
-#: here leaves drift that `template-check` will report until the declaration is
-#: mirrored into the tracked file or the manifest is restored by hand.
+#: Separate, louder opt-in for `add`. An `add` here moves the runtime manifest
+#: away from the tracked template, which `template-check` then reports as drift
+#: until the declaration is mirrored into the tracked file and released.
+#:
+#: `undeclare` is the inverse and reaches a scratch name -- it refuses only
+#: names present in the tracked template, and names still holding a value. The
+#: gate stays because clearing the drift is still a deliberate second step, not
+#: because the declaration is unremovable.
 DECLARE_GATE = "SUDO_SECRETSPEC_POSTINSTALL_DECLARE"
 
 #: Opt-in for the lifecycle dry-run plans. `install`, `uninstall`, and
@@ -162,8 +166,8 @@ def declares_allowed():
     if os.environ.get(DECLARE_GATE) != "1":
         pytest.skip(
             f"set {DECLARE_GATE}=1 to declare into the live runtime manifest. "
-            "This has no inverse: the declaration stays until it is mirrored "
-            "into the tracked declarations file or the manifest is restored."
+            "`undeclare` reverses it, but until then `template-check` reports "
+            "the drift, and clearing it is a deliberate second step."
         )
 
 
