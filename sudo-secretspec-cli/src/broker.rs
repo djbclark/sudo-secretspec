@@ -312,6 +312,44 @@ impl Mutation {
 }
 
 // ---------------------------------------------------------------------------
+// Operation classification
+// ---------------------------------------------------------------------------
+
+/// Every operation dispatched through the source funnel in [`run`].
+///
+/// A single list so [`mutates_vault`] can be checked against it. A new verb
+/// added here without a matching decision about whether it writes fails a test
+/// rather than silently joining the read-only majority — which is exactly how
+/// `source-undeclare` came to rewrite the runtime manifest with no rollback
+/// copy while its three siblings had one.
+pub const SOURCE_OPS: &[&str] = &[
+    "source-get",
+    "source-set",
+    "source-add",
+    "source-undeclare",
+    "source-delete",
+    "source-check",
+    "source-export",
+    "source-template-check",
+    "source-schema",
+];
+
+/// Whether an operation writes to the vault, and so needs a rollback copy.
+///
+/// Named and tested rather than left as a `matches!` inside [`run`], which only
+/// executes as root against a real vault and is therefore reachable by no test.
+/// Same reasoning that moved the adoption rule out of `main.rs`'s `run_install`
+/// into [`crate::install::adopts_without_flag`]: an untestable trust decision is
+/// where the last one hid.
+#[must_use]
+pub fn mutates_vault(operation: &str) -> bool {
+    matches!(
+        operation,
+        "source-set" | "source-add" | "source-undeclare" | "source-delete"
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Client resolution
 // ---------------------------------------------------------------------------
 
@@ -455,15 +493,7 @@ fn run(broker: &Broker) -> Result<(), i32> {
     purge_ambient_env();
     match broker.operation.as_str() {
         "audit-verify" => run_audit_verify(broker),
-        "source-get"
-        | "source-set"
-        | "source-add"
-        | "source-undeclare"
-        | "source-delete"
-        | "source-check"
-        | "source-export"
-        | "source-template-check"
-        | "source-schema" => {
+        op if SOURCE_OPS.contains(&op) => {
             require_root()?;
             let cfg = load_config()?;
             let service_uid = require_boundary(&cfg)?;
@@ -526,10 +556,7 @@ fn run(broker: &Broker) -> Result<(), i32> {
             // guarantee structural instead of something each new `?` has to
             // remember.
             let outcome = (|| -> Result<(u8, bool, Vec<String>), i32> {
-                let mutation = if matches!(
-                    broker.operation.as_str(),
-                    "source-set" | "source-add" | "source-delete"
-                ) {
+                let mutation = if mutates_vault(&broker.operation) {
                     Some(Mutation::begin(
                         &cfg,
                         transaction,
@@ -1168,6 +1195,61 @@ PROD_ONLY = { description = "production-only token", required = true }
         assert!(production["properties"]["API_KEY"].is_object());
 
         assert!(emit_schema(&spec, "staging").is_err());
+    }
+
+    #[test]
+    fn undeclare_mutates_because_it_rewrites_the_runtime_manifest() {
+        // Regression. `source-undeclare` performs `fs::write` on the runtime
+        // manifest in `execute`, but was left out of the mutation set, so a
+        // write that failed part way left the manifest corrupt with no rollback
+        // copy — while `set`, `add` and `delete` all had one.
+        assert!(mutates_vault("source-undeclare"));
+    }
+
+    #[test]
+    fn the_mutating_source_ops_are_exactly_these() {
+        // Pinned deliberately. A new verb in `SOURCE_OPS` breaks this test, and
+        // the only way to fix it is to state whether the verb writes — which is
+        // the decision that was missed for `undeclare`.
+        let mutating: Vec<&str> = SOURCE_OPS
+            .iter()
+            .copied()
+            .filter(|op| mutates_vault(op))
+            .collect();
+        assert_eq!(
+            mutating,
+            [
+                "source-set",
+                "source-add",
+                "source-undeclare",
+                "source-delete"
+            ]
+        );
+    }
+
+    #[test]
+    fn read_only_ops_take_no_rollback_copy() {
+        // The cost is not merely wasted work: `Mutation::begin` writes two files
+        // into the vault and refuses on collision, so classifying a read as a
+        // mutation would make concurrent reads fail each other.
+        for op in [
+            "source-get",
+            "source-check",
+            "source-export",
+            "source-template-check",
+            "source-schema",
+        ] {
+            assert!(!mutates_vault(op), "{op} must not take a rollback copy");
+        }
+    }
+
+    #[test]
+    fn an_operation_outside_the_list_does_not_reach_the_source_funnel() {
+        // `run` dispatches on `SOURCE_OPS.contains`, so this is what keeps an
+        // unknown verb on the "unknown operation" arm instead of running with a
+        // loaded `Secrets` and a root euid.
+        assert!(!SOURCE_OPS.contains(&"source-nonsense"));
+        assert!(!SOURCE_OPS.contains(&"audit-verify"));
     }
 
     /// A manifest with the shapes an edit is most likely to destroy: comments,
