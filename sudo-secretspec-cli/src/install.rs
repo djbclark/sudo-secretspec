@@ -853,6 +853,26 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     )?;
     let previous_version = installed_version(Path::new(CONFIG_PATH));
 
+    // Refuse a fresh install onto an existing boundary, on the LIVE path as well
+    // as the rehearsal. This guard used to sit inside the `req.dry_run` block
+    // below, so `--dry-run` refused exactly what the real run went on to do: the
+    // fresh-install branch at the end of this function truncates the vault's
+    // `.env` with `File::create`, destroying every stored secret value. A
+    // pre-flight that refuses what the live command performs is worse than no
+    // pre-flight, because it is read as permission to proceed.
+    if !req.adopt_existing
+        && (Path::new(&req.vault).exists()
+            || Command::new("/usr/bin/id")
+                .arg(&req.service_user)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false))
+    {
+        return Err(InstallError::Denied(
+            "fresh-install identity or vault already exists; use --adopt-existing".into(),
+        ));
+    }
+
     if req.dry_run {
         if req.adopt_existing {
             // Metadata-only validation of existing identity/vault.
@@ -903,16 +923,6 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
                     "vault resolves outside /private/var/db".into(),
                 ));
             }
-        } else if Path::new(&req.vault).exists()
-            || Command::new("/usr/bin/id")
-                .arg(&req.service_user)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        {
-            return Err(InstallError::Denied(
-                "fresh-install identity or vault already exists; use --adopt-existing".into(),
-            ));
         }
         println!(
             "would install sudo-secretspec {}",
@@ -1043,10 +1053,7 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
 
     // Runtime files for fresh install only.
     if !req.adopt_existing {
-        let manifest_rt = req.vault.join("secretspec.toml");
-        let env_rt = req.vault.join(".env");
-        fs::copy(&declarations_dst, &manifest_rt)?;
-        fs::File::create(&env_rt)?;
+        let (manifest_rt, env_rt) = create_fresh_runtime_files(&req.vault, &declarations_dst)?;
         for path in [&manifest_rt, &env_rt] {
             let mut p = fs::metadata(path)?.permissions();
             p.set_mode(0o600);
@@ -1146,6 +1153,39 @@ fn installed_identity(
     Some((vault, config.service_user, config.service_group))
 }
 
+/// Create the vault's runtime files for a fresh install, refusing to overwrite.
+///
+/// Split out of [`run`] so the refusal is reachable without root: the live
+/// install path is what truncated a populated vault, and the destructive call
+/// sat in the middle of a function no test can run.
+///
+/// Create-only-if-missing, independent of `adopt_existing`. [`run`] already
+/// refuses a fresh install onto an existing boundary, but these two writes are
+/// the ones that actually destroy data, so they refuse on their own rather than
+/// trusting a caller further up to have checked. The `File::create` this
+/// replaces truncated `.env` to zero bytes, losing every stored secret value.
+fn create_fresh_runtime_files(
+    vault: &Path,
+    declarations: &Path,
+) -> Result<(PathBuf, PathBuf), InstallError> {
+    let manifest_rt = vault.join("secretspec.toml");
+    let env_rt = vault.join(".env");
+    for path in [&manifest_rt, &env_rt] {
+        if path.symlink_metadata().is_ok() {
+            return Err(InstallError::Denied(format!(
+                "refusing to overwrite existing runtime file: {}",
+                path.display()
+            )));
+        }
+    }
+    fs::copy(declarations, &manifest_rt)?;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&env_rt)?;
+    Ok((manifest_rt, env_rt))
+}
+
 fn chrono_like_stamp() -> String {
     // UTC-ish timestamp without extra deps.
     let secs = std::time::SystemTime::now()
@@ -1173,6 +1213,84 @@ mod tests {
         )
         .unwrap();
         root
+    }
+
+    #[test]
+    fn installing_over_a_populated_vault_leaves_env_byte_identical() {
+        // The incident: a plain `install` (no --adopt-existing) over a populated
+        // vault truncated `.env` to 0 bytes with `File::create`, destroying every
+        // stored secret value. The bytes must survive the refusal untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        let declarations = tmp.path().join("secretspec.toml");
+        fs::write(&declarations, b"[project]\nname = \"fresh\"\n").unwrap();
+
+        let env_rt = vault.join(".env");
+        let secrets = b"DATABASE_URL=postgres://real\nAPI_KEY=sk-live\n";
+        fs::write(&env_rt, secrets).unwrap();
+        let manifest_rt = vault.join("secretspec.toml");
+        fs::write(&manifest_rt, b"[project]\nname = \"installed\"\n").unwrap();
+
+        let err = create_fresh_runtime_files(&vault, &declarations)
+            .expect_err("a fresh install over a populated vault must be refused");
+        assert!(
+            err.to_string()
+                .contains("refusing to overwrite existing runtime file"),
+            "{err}"
+        );
+
+        assert_eq!(
+            fs::read(&env_rt).unwrap(),
+            secrets,
+            ".env must be byte-identical after the refusal"
+        );
+        assert_eq!(
+            fs::read(&manifest_rt).unwrap(),
+            b"[project]\nname = \"installed\"\n",
+            "the vault's manifest must not be replaced by the distribution copy"
+        );
+    }
+
+    #[test]
+    fn a_dangling_env_symlink_is_refused_rather_than_written_through() {
+        // `Path::exists` follows symlinks and reports false for a dangling one,
+        // which would let `fs::copy`/`create_new` write through the link to a
+        // path outside the vault. The check is on `symlink_metadata`.
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        let declarations = tmp.path().join("secretspec.toml");
+        fs::write(&declarations, b"[project]\nname = \"fresh\"\n").unwrap();
+
+        let target = tmp.path().join("elsewhere/.env");
+        std::os::unix::fs::symlink(&target, vault.join(".env")).unwrap();
+        assert!(!vault.join(".env").exists(), "precondition: dangling");
+
+        let err = create_fresh_runtime_files(&vault, &declarations)
+            .expect_err("a dangling runtime symlink must be refused");
+        assert!(
+            err.to_string()
+                .contains("refusing to overwrite existing runtime file"),
+            "{err}"
+        );
+        assert!(!target.exists(), "nothing may be written through the link");
+    }
+
+    #[test]
+    fn a_fresh_vault_still_gets_both_runtime_files() {
+        // The refusal must not cost a real fresh install its runtime files.
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        let declarations = tmp.path().join("secretspec.toml");
+        let body = b"[project]\nname = \"fresh\"\n";
+        fs::write(&declarations, body).unwrap();
+
+        let (manifest_rt, env_rt) =
+            create_fresh_runtime_files(&vault, &declarations).expect("fresh install must succeed");
+        assert_eq!(fs::read(&manifest_rt).unwrap(), body);
+        assert_eq!(fs::read(&env_rt).unwrap(), b"", ".env starts empty");
     }
 
     #[test]

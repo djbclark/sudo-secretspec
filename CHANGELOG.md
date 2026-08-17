@@ -217,6 +217,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `sudo-secretspec install` no longer destroys a populated vault. Run without
+  `--adopt-existing` against a host that already had a boundary installed, it
+  recreated the vault's runtime files from scratch and truncated `.env` to zero
+  bytes, losing every stored secret value. The guard that refuses a fresh
+  install onto an existing identity or vault ran only under `--dry-run`, so the
+  rehearsal refused exactly what the real command went on to do. That guard now
+  applies to the live path as well, and the runtime files are created only when
+  missing — an existing `secretspec.toml` or `.env` (including a symlink, which
+  is no longer written through) is refused rather than overwritten.
+
 - `check` writes its report to stdout instead of stderr, so
   `secretspec check | grep ...` sees it. Previously the header, every ✓/○/✗
   line and the summary all went to stderr, leaving stdout empty — a pipeline
