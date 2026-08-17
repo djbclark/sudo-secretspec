@@ -141,6 +141,21 @@ pub struct Entry {
     pub entry_hash: String,
 }
 
+/// One archived entry as the read surface reports it.
+///
+/// Deliberately carries no value and no value digest: this is what an agent is
+/// allowed to see, and it must not become a way to enumerate secret material.
+#[derive(Debug, Clone)]
+pub struct EntrySummary {
+    pub sequence: i64,
+    pub timestamp_ns: i64,
+    pub transaction: uuid::Uuid,
+    pub operation: String,
+    pub names: Vec<String>,
+    /// How many of this entry's values have since been destroyed.
+    pub destroyed: usize,
+}
+
 /// Result of a successful chain verification.
 #[derive(Debug, Clone)]
 pub struct VerifyResult {
@@ -510,6 +525,84 @@ fn verify_with(
 
     match result {
         Ok(r) => Ok(r),
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", []);
+            Err(e)
+        }
+    }
+}
+
+/// Summarise archived entries, newest last.
+///
+/// Never returns a value or a digest of one — a listing is metadata, and the
+/// read surface an agent is allowed to reach must not become a way to
+/// enumerate secret material. `name`, when given, restricts the result to
+/// entries that captured that name.
+///
+/// The chain is verified in the same transaction as the read. Reporting from
+/// an unverified store would present tampered rows as fact, which is the one
+/// thing a history nobody can check is worse than useless for.
+pub fn list(
+    directory: &Path,
+    name: Option<&str>,
+    expected_uid: Option<u32>,
+) -> Result<Vec<EntrySummary>, HistoryError> {
+    if !directory.join(DB_NAME).exists() {
+        audit::require_protected_dir(directory, expected_uid)?;
+        return Ok(Vec::new());
+    }
+
+    let conn = audit::open_protected_db(directory, DB_NAME, expected_uid, VerifyMode::ReadOnly)?;
+    let result = (|| -> Result<Vec<EntrySummary>, HistoryError> {
+        conn.execute("BEGIN", [])?;
+        verify_rows(&conn)?;
+
+        let mut stmt = conn.prepare(
+            "SELECT sequence, timestamp_ns, transaction_id, operation \
+             FROM entries ORDER BY sequence",
+        )?;
+        let rows: Vec<(i64, i64, String, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<Result<_, _>>()?;
+
+        let mut names_stmt = conn.prepare(
+            "SELECT name, destroyed_by FROM captured_values \
+             WHERE sequence = ?1 ORDER BY name",
+        )?;
+
+        let mut out = Vec::new();
+        for (sequence, timestamp_ns, transaction_id, operation) in rows {
+            let captured: Vec<(String, Option<i64>)> = names_stmt
+                .query_map([sequence], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+
+            if let Some(wanted) = name
+                && !captured.iter().any(|(n, _)| n == wanted)
+            {
+                continue;
+            }
+
+            let transaction = uuid::Uuid::parse_str(&transaction_id).map_err(|e| {
+                HistoryError::Denied(format!("invalid transaction UUID in history: {e}"))
+            })?;
+            out.push(EntrySummary {
+                sequence,
+                timestamp_ns,
+                transaction,
+                operation,
+                destroyed: captured.iter().filter(|(_, d)| d.is_some()).count(),
+                names: captured.into_iter().map(|(n, _)| n).collect(),
+            });
+        }
+
+        conn.execute("COMMIT", [])?;
+        Ok(out)
+    })();
+
+    match result {
+        Ok(entries) => Ok(entries),
         Err(e) => {
             let _ = conn.execute("ROLLBACK", []);
             Err(e)
@@ -894,6 +987,87 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "history must not be readable beyond its owner");
+    }
+
+    #[test]
+    fn a_listing_reports_entries_oldest_first_with_the_names_they_captured() {
+        let dir = vault();
+        capture(dir.path(), request(uuid::Uuid::new_v4(), b"A=1\n")).unwrap();
+        capture(dir.path(), request(uuid::Uuid::new_v4(), b"A=1\nB=2\n")).unwrap();
+
+        let entries = list(dir.path(), None, None).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[0].names, ["A"]);
+        assert_eq!(entries[1].names, ["A", "B"]);
+        assert_eq!(entries[1].operation, "source-set");
+        assert_eq!(entries[1].destroyed, 0);
+    }
+
+    #[test]
+    fn a_listing_filtered_by_name_omits_entries_that_never_held_it() {
+        let dir = vault();
+        capture(dir.path(), request(uuid::Uuid::new_v4(), b"A=1\n")).unwrap();
+        capture(dir.path(), request(uuid::Uuid::new_v4(), b"A=1\nB=2\n")).unwrap();
+        capture(dir.path(), request(uuid::Uuid::new_v4(), b"A=2\n")).unwrap();
+
+        let entries = list(dir.path(), Some("B"), None).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sequence, 2);
+
+        assert!(
+            list(dir.path(), Some("NEVER_CAPTURED"), None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_listing_carries_no_value_and_no_value_digest() {
+        // The read surface an agent may reach must not become a way to
+        // enumerate secret material, so this is asserted on the type's own
+        // rendering rather than trusted to review.
+        let dir = vault();
+        let secret = "s3cr3t-not-in-any-listing";
+        let pairs: BTreeMap<String, String> = [("A".to_string(), secret.to_string())]
+            .into_iter()
+            .collect();
+        let env = render_dotenv(&pairs).unwrap();
+        capture(dir.path(), request(uuid::Uuid::new_v4(), &env)).unwrap();
+
+        let rendered = format!("{:?}", list(dir.path(), None, None).unwrap());
+        assert!(!rendered.contains(secret), "a listing leaked a value");
+        assert!(
+            !rendered.contains(&sha256_hex(secret.as_bytes())),
+            "a listing leaked a value digest"
+        );
+        assert!(rendered.contains('A'), "but it must still name the secret");
+    }
+
+    #[test]
+    fn a_listing_from_a_tampered_store_is_refused_rather_than_reported() {
+        // A listing read out of a broken chain would present tampered rows as
+        // fact — the one thing a history nobody can check is worse than
+        // useless for.
+        let dir = vault();
+        capture(dir.path(), request(uuid::Uuid::new_v4(), b"A=1\n")).unwrap();
+        capture(dir.path(), request(uuid::Uuid::new_v4(), b"A=2\n")).unwrap();
+
+        let conn = Connection::open(dir.path().join(DB_NAME)).unwrap();
+        conn.execute(
+            "UPDATE entries SET operation = 'forged' WHERE sequence = 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(list(dir.path(), None, None).is_err());
+    }
+
+    #[test]
+    fn an_absent_store_lists_as_empty() {
+        let dir = vault();
+        assert!(list(dir.path(), None, None).unwrap().is_empty());
     }
 
     #[test]

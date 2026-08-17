@@ -4,10 +4,11 @@
 //! arguments and validates the privilege boundary before running any operation.
 //! All provider operations are value-free audited.
 //!
-//! Mutation safety: before any set/add/delete, the manifest and dotenv are
-//! backed up to `.rollback.<transaction>` copies. On success the backups are
-//! removed; on failure they are restored atomically. A crash during mutation
-//! leaves the backups visible to `doctor` but the original state recoverable.
+//! Mutation safety: before any set/add/delete/undeclare, the manifest and
+//! dotenv are backed up to `.rollback.<transaction>` copies. On success the
+//! backups are archived into [`crate::history`] and then removed; on failure
+//! they are restored atomically. A crash during mutation leaves the backups
+//! visible to `doctor` but the original state recoverable.
 
 use std::ffi::OsString;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -237,10 +238,21 @@ struct Mutation {
     manifest: std::path::PathBuf,
     dotenv: std::path::PathBuf,
     transaction: uuid::Uuid,
+    /// The operation these copies precede, recorded with them in history.
+    operation: String,
+    /// The identity the vault's protected state must belong to, passed through
+    /// to the history store's own metadata checks.
+    service_uid: u32,
 }
 
 impl Mutation {
-    fn begin(cfg: &Config, transaction: uuid::Uuid, uid: u32, gid: u32) -> Result<Self, i32> {
+    fn begin(
+        cfg: &Config,
+        transaction: uuid::Uuid,
+        operation: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Self, i32> {
         let vault = cfg.vault.clone();
         let manifest = vault.join("secretspec.toml");
         let dotenv = vault.join(".env");
@@ -250,6 +262,8 @@ impl Mutation {
             manifest,
             dotenv,
             transaction,
+            operation: operation.to_string(),
+            service_uid: uid,
         };
 
         // Create rollback copies
@@ -286,6 +300,12 @@ impl Mutation {
         ))
     }
 
+    /// Put the pre-mutation bytes back, and discard the copies.
+    ///
+    /// Deliberately does **not** archive: a rolled-back mutation never took
+    /// effect, so there is no prior state to recover to that is not simply the
+    /// current one. Recording it would fill history with entries identical to
+    /// the state beside them.
     fn restore(&self) -> bool {
         let mut ok = true;
         for (dest, suffix) in [(&self.manifest, "toml"), (&self.dotenv, "env")] {
@@ -303,11 +323,51 @@ impl Mutation {
         ok
     }
 
+    /// Archive the pre-mutation copies, then remove them.
+    ///
+    /// This is where infinite history comes from: the bytes were already being
+    /// captured correctly before every mutation and then thrown away on
+    /// success. They are now kept.
+    ///
+    /// A failed archive does **not** fail the operation — the mutation has
+    /// already committed and cannot be undone, so reporting failure would
+    /// misdescribe what happened. Instead the rollback copies are deliberately
+    /// left on disk. That is not a silent swallow: the bytes survive, `drift`
+    /// already reports leftover copies as `PENDING_ROLLBACK`, and the warning
+    /// below names the transaction. The degraded state is exactly the
+    /// pre-history behaviour rather than a loss.
     fn commit(&self) {
-        for suffix in ["toml", "env"] {
-            let backup = self.rollback_path(suffix);
-            let _ = std::fs::remove_file(&backup);
+        match self.archive() {
+            Ok(()) => {
+                for suffix in ["toml", "env"] {
+                    let _ = std::fs::remove_file(self.rollback_path(suffix));
+                }
+            }
+            Err(e) => {
+                eprintln!("broker: could not archive pre-mutation state to history: {e}");
+                eprintln!(
+                    "broker: the operation succeeded; its rollback copies are kept in the \
+                     vault for transaction {} and `doctor` will report them",
+                    self.transaction
+                );
+            }
         }
+    }
+
+    fn archive(&self) -> Result<(), crate::history::HistoryError> {
+        let manifest = std::fs::read(self.rollback_path("toml"))?;
+        let dotenv = std::fs::read(self.rollback_path("env"))?;
+        crate::history::capture(
+            &self.vault,
+            crate::history::CaptureRequest {
+                transaction: self.transaction,
+                operation: self.operation.clone(),
+                manifest,
+                dotenv,
+                expected_uid: Some(self.service_uid),
+            },
+        )?;
+        Ok(())
     }
 }
 
@@ -560,6 +620,7 @@ fn run(broker: &Broker) -> Result<(), i32> {
                     Some(Mutation::begin(
                         &cfg,
                         transaction,
+                        &broker.operation,
                         service_uid,
                         service_gid,
                     )?)
@@ -1195,6 +1256,108 @@ PROD_ONLY = { description = "production-only token", required = true }
         assert!(production["properties"]["API_KEY"].is_object());
 
         assert!(emit_schema(&spec, "staging").is_err());
+    }
+
+    /// A `Mutation` over a temporary vault, with its rollback copies already
+    /// written — the state `commit` runs against.
+    ///
+    /// `Mutation::begin` needs root and a real boundary, so the struct is built
+    /// directly here. The thing under test is `commit`'s contract, not
+    /// `begin`'s copying, and that contract is otherwise reachable only on the
+    /// one path no test can enter.
+    fn staged_mutation(
+        vault: &std::path::Path,
+        manifest: &[u8],
+        dotenv: &[u8],
+    ) -> (Mutation, uuid::Uuid) {
+        use std::os::unix::fs::MetadataExt;
+        let transaction = uuid::Uuid::new_v4();
+        let mutation = Mutation {
+            vault: vault.to_path_buf(),
+            manifest: vault.join("secretspec.toml"),
+            dotenv: vault.join(".env"),
+            transaction,
+            operation: "source-set".into(),
+            service_uid: std::fs::metadata(vault).unwrap().uid(),
+        };
+        std::fs::write(mutation.rollback_path("toml"), manifest).unwrap();
+        std::fs::write(mutation.rollback_path("env"), dotenv).unwrap();
+        (mutation, transaction)
+    }
+
+    fn temp_vault() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_commit_archives_the_pre_mutation_state_and_then_clears_the_copies() {
+        // The whole feature in one assertion: the bytes that used to be deleted
+        // on success now land in history instead.
+        let vault = temp_vault();
+        let (mutation, transaction) =
+            staged_mutation(vault.path(), b"[project]\nname = \"f\"\n", b"A=1\n");
+
+        mutation.commit();
+
+        let result = crate::history::verify(vault.path(), None).unwrap();
+        assert_eq!(result.entries, 1, "the pre-mutation state must be archived");
+        assert!(
+            !mutation.rollback_path("toml").exists() && !mutation.rollback_path("env").exists(),
+            "archived copies must not be left behind as well"
+        );
+        // The history entry joins to the ledger on the transaction uuid, which
+        // is the only thing tying the two stores together.
+        let entries = crate::history::list(vault.path(), None, None).unwrap();
+        assert_eq!(entries[0].transaction, transaction);
+    }
+
+    #[test]
+    fn a_failed_archive_keeps_the_rollback_copies_rather_than_losing_them() {
+        // The mutation has already committed by this point and cannot be
+        // undone, so `commit` must not report failure. What it must not do
+        // either is delete the only surviving copy of the prior state: the
+        // degraded outcome is the pre-history behaviour, not a loss.
+        let vault = temp_vault();
+        // A dotenv with a comment does not round-trip through the renderer, so
+        // `history::capture` refuses it.
+        let (mutation, _) = staged_mutation(
+            vault.path(),
+            b"[project]\nname = \"f\"\n",
+            b"# comment\nA=1\n",
+        );
+
+        mutation.commit();
+
+        assert_eq!(
+            crate::history::verify(vault.path(), None).unwrap().entries,
+            0,
+            "a refused capture must store nothing"
+        );
+        assert!(
+            mutation.rollback_path("toml").exists() && mutation.rollback_path("env").exists(),
+            "the prior state must survive an archive failure"
+        );
+    }
+
+    #[test]
+    fn a_restored_mutation_is_not_archived() {
+        // A rolled-back mutation never took effect, so there is no prior state
+        // to recover to other than the current one. Archiving it would fill
+        // history with entries identical to the state beside them.
+        let vault = temp_vault();
+        std::fs::write(vault.path().join("secretspec.toml"), b"live").unwrap();
+        std::fs::write(vault.path().join(".env"), b"live").unwrap();
+        let (mutation, _) = staged_mutation(vault.path(), b"[project]\nname = \"f\"\n", b"A=1\n");
+
+        assert!(mutation.restore());
+
+        assert_eq!(
+            crate::history::verify(vault.path(), None).unwrap().entries,
+            0
+        );
     }
 
     #[test]
