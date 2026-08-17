@@ -243,6 +243,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The refusal `sudo-secretspec install` prints when it is run from the
+  installed boundary itself no longer tells the operator to re-run the command
+  with `--adopt-existing`. Upgrading an installed boundary has needed no flag
+  since the adoption rule started keying on provenance, so the suggested
+  command asked for a trust decision the upgrade path no longer requires.
+
 - `sudo-secretspec install` no longer destroys a populated vault. Run without
   `--adopt-existing` against a host that already had a boundary installed, it
   recreated the vault's runtime files from scratch and truncated `.env` to zero

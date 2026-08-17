@@ -721,8 +721,7 @@ fn resolve_media(source_root: &Path, broker_dst: &Path) -> Result<Media, Install
              nothing.\n\
              Run install from the copy your package manager ships, which is kept off PATH so \
              it cannot shadow the installed client:\n  \
-             $(brew --prefix)/opt/sudo-secretspec/libexec/sudo-secretspec install \
-             --adopt-existing",
+             $(brew --prefix)/opt/sudo-secretspec/libexec/sudo-secretspec install",
             media.broker.display()
         )));
     }
