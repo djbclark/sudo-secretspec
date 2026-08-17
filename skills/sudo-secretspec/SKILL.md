@@ -1,7 +1,7 @@
 ---
 name: sudo-secretspec
 description: Use managed credentials through the privilege-separated sudo-secretspec client instead of touching a secret store directly. Use when a task needs an API key, token, or password; when a credential must be declared, set, rotated, read, deleted, or injected into a child process; or when the boundary, drift checker, or audit ledger reports an error. Also covers what is deliberately NOT exposed and must be asked of the operator.
-version: 0.6.0
+version: 0.7.0
 author: Dan Clark (djbclark), Hermes Agent
 license: Apache-2.0
 platforms: [macos]
@@ -207,6 +207,18 @@ explicit `unknown` terminal state if restoration cannot be proven.
   (`0.19.1-sudo.13 -> 0.19.1-sudo.14`), so the output itself is the evidence
   the upgrade happened. A *correct* install is still an operator action — it
   authenticates interactively.
+- **`--adopt-existing` is mandatory on any host that already has a boundary.**
+  Never hand an operator a plain `install` on a machine with a populated vault.
+  Before 0.19.1-sudo.16 the fresh-install path recreated the vault's runtime
+  files and truncated `.env` to zero bytes, destroying every stored secret
+  value — and the guard that refused it ran only under `--dry-run`, so the
+  rehearsal refused exactly what the live command then performed. A green
+  `--dry-run` was therefore *not* evidence the real run was safe. Since .16
+  both paths refuse, and the runtime files are created only when missing. On a
+  host still running an older boundary, treat plain `install` as destructive.
+  A vault that has been truncated shows as `.env` at 0 bytes with `check`
+  reporting most secrets missing; recovery is from backup, not from the
+  rollback snapshot, which deliberately excludes the vault.
 - **`doctor` reports a staged upgrade** as the `UPGRADE_AVAILABLE` advisory
   (0.19.1-sudo.13+), naming the path to run. Advisory means `doctor` still
   exits 0; it is not a stop condition.
