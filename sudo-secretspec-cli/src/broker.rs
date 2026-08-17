@@ -624,6 +624,59 @@ fn run_audit_verify(_broker: &Broker) -> Result<(), i32> {
     }
 }
 
+/// The runtime manifest with one declaration added, revalidated as a whole.
+///
+/// Goes through [`secretspec::Spec`] rather than `manifest_edit` directly, so
+/// the edit is re-derived through the same validated path every other load
+/// takes: a declaration that would not load is refused here instead of being
+/// written into the vault and surfacing at the next `check`.
+///
+/// `Spec::from_toml` is the deliberate constructor. It never touches the
+/// filesystem and refuses `project.extends`, so this root process cannot be
+/// induced to read parent files while editing the manifest.
+///
+/// Extracted from `execute` for the same reason `install`'s guards were: the
+/// call site only runs as root against a real vault, and an edit to the
+/// operator's manifest is the last thing that should be reachable only there.
+fn manifest_with_declaration(
+    source: &str,
+    profile: &str,
+    name: &str,
+    secret: secretspec::Secret,
+) -> Result<String, String> {
+    let spec = secretspec::Spec::from_toml(source).map_err(|e| e.to_string())?;
+    let edited = spec
+        .add_secret_to_text(profile, name, secret)
+        .map_err(|e| e.to_string())?;
+    preserved(edited)
+}
+
+/// The runtime manifest with one declaration removed, revalidated as a whole.
+///
+/// The inverse of [`manifest_with_declaration`] and, because both go through
+/// the one implementation, byte-exact: adding a declaration and removing it
+/// again restores the original document exactly, which is the property
+/// `Mutation::restore` compares.
+fn manifest_without_declaration(source: &str, profile: &str, name: &str) -> Result<String, String> {
+    let spec = secretspec::Spec::from_toml(source).map_err(|e| e.to_string())?;
+    let edited = spec
+        .remove_secret_from_text(profile, name)
+        .map_err(|e| e.to_string())?;
+    preserved(edited)
+}
+
+/// The edited document's exact text.
+///
+/// An edited spec always carries its source, so `None` here means the API
+/// changed under us — reported rather than unwrapped, because the caller is
+/// about to overwrite the operator's manifest with whatever this returns.
+fn preserved(edited: secretspec::Spec) -> Result<String, String> {
+    edited
+        .preserved_text()
+        .map(str::to_string)
+        .ok_or_else(|| "edited manifest kept no source text".to_string())
+}
+
 fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>) {
     // The ambient environment was purged in `run` before dispatch; see
     // `purge_ambient_env`.
@@ -689,18 +742,17 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                     return (2, vec![name.into()]);
                 }
             };
-            let updated = match secretspec::manifest_edit::add_secret_to_manifest(
-                &source,
-                &cfg.profile,
-                name,
-                description,
-                match (broker.optional, broker.required) {
-                    (true, _) => Some(false),
-                    (_, true) => Some(true),
-                    _ => None,
-                },
-            ) {
-                Ok(updated) => updated,
+            // `Secret`'s three constructors are the tri-state this used to pass
+            // as `Option<bool>`: `new` leaves requiredness to the profile
+            // default, the other two pin it.
+            let declaration = match (broker.optional, broker.required) {
+                (true, _) => secretspec::Secret::optional(description),
+                (_, true) => secretspec::Secret::required(description),
+                _ => secretspec::Secret::new(description),
+            };
+            let updated = match manifest_with_declaration(&source, &cfg.profile, name, declaration)
+            {
+                Ok(text) => text,
                 Err(e) => {
                     eprintln!("broker: {e}");
                     return (1, vec![name.into()]);
@@ -757,6 +809,20 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
             // Fail closed: an unparseable template is not evidence that the
             // name is absent from it, and this guard exists to protect exactly
             // the names it might have failed to read.
+            //
+            // Stays on `manifest_edit` while the two edits above went through
+            // `Spec`, for two reasons that are specific to this guard:
+            //
+            // 1. `Spec::declares_secret_in_text` answers `bool`, treating an
+            //    unparseable document as "not declared" — the fail-*open*
+            //    answer this guard must never give.
+            // 2. Reaching it needs a `Spec`, and the only filesystem-free
+            //    constructor, `Spec::from_toml`, refuses `project.extends`.
+            //    The template is operator-controlled Git content; the day it
+            //    inherits, `undeclare` would start refusing every name.
+            //
+            // A question about text is answered by the function that takes
+            // text and returns `Result`.
             match secretspec::manifest_edit::declares_secret(&template, &cfg.profile, name) {
                 Ok(true) => {
                     eprintln!(
@@ -789,12 +855,8 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                     return (2, vec![name.into()]);
                 }
             };
-            let updated = match secretspec::manifest_edit::remove_secret_from_manifest(
-                &source,
-                &cfg.profile,
-                name,
-            ) {
-                Ok(updated) => updated,
+            let updated = match manifest_without_declaration(&source, &cfg.profile, name) {
+                Ok(text) => text,
                 Err(e) => {
                     eprintln!("broker: {e}");
                     return (1, vec![name.into()]);
@@ -1106,5 +1168,138 @@ PROD_ONLY = { description = "production-only token", required = true }
         assert!(production["properties"]["API_KEY"].is_object());
 
         assert!(emit_schema(&spec, "staging").is_err());
+    }
+
+    /// A manifest with the shapes an edit is most likely to destroy: comments,
+    /// a blank line, alignment, and a declaration written as an inline table.
+    const MANIFEST: &str = r#"[project]
+name = "fixture"
+revision = "1.0"
+
+# The comment below the header, which no semantic model represents.
+[profiles.default]
+API_KEY = { description = "An existing key", required = true }
+
+# A trailing comment, deliberately last.
+"#;
+
+    #[test]
+    fn adding_then_undeclaring_restores_the_document_byte_for_byte() {
+        // The property `Mutation::restore` depends on: undo compares bytes, so
+        // a round trip that merely preserves *meaning* would still fail it.
+        let added = manifest_with_declaration(
+            MANIFEST,
+            "default",
+            "NEW_TOKEN",
+            secretspec::Secret::required("A new token"),
+        )
+        .expect("add");
+        assert_ne!(added, MANIFEST, "the add must actually change the document");
+
+        let restored =
+            manifest_without_declaration(&added, "default", "NEW_TOKEN").expect("undeclare");
+        assert_eq!(restored, MANIFEST);
+    }
+
+    #[test]
+    fn an_edit_preserves_comments_and_the_declarations_it_did_not_touch() {
+        let added = manifest_with_declaration(
+            MANIFEST,
+            "default",
+            "NEW_TOKEN",
+            secretspec::Secret::required("A new token"),
+        )
+        .expect("add");
+
+        assert!(added.contains("# The comment below the header"));
+        assert!(added.contains("# A trailing comment, deliberately last."));
+        assert!(
+            added.contains(r#"API_KEY = { description = "An existing key", required = true }"#)
+        );
+    }
+
+    #[test]
+    fn the_three_secret_constructors_are_the_tri_state_the_cli_flags_select() {
+        // `--required` and `--optional` pin requiredness; neither leaves it to
+        // the profile default. Writing `required` when the caller asked for
+        // neither would silently override that default.
+        let required =
+            manifest_with_declaration(MANIFEST, "default", "T", secretspec::Secret::required("d"))
+                .expect("required");
+        assert!(required.contains("required = true"));
+
+        let optional =
+            manifest_with_declaration(MANIFEST, "default", "T", secretspec::Secret::optional("d"))
+                .expect("optional");
+        assert!(optional.contains("required = false"));
+
+        let inherited =
+            manifest_with_declaration(MANIFEST, "default", "T", secretspec::Secret::new("d"))
+                .expect("inherited");
+        let line = inherited
+            .lines()
+            .find(|l| l.starts_with("T ="))
+            .expect("the new declaration");
+        assert!(
+            !line.contains("required"),
+            "requiredness must be left to the profile default: {line}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_declaration_is_refused_rather_than_written_twice() {
+        let err = manifest_with_declaration(
+            MANIFEST,
+            "default",
+            "API_KEY",
+            secretspec::Secret::required("A second one"),
+        )
+        .expect_err("API_KEY is already declared");
+        assert!(err.contains("API_KEY"), "{err}");
+    }
+
+    #[test]
+    fn undeclaring_a_name_the_profile_does_not_declare_is_refused() {
+        // A silent no-op here would report success for an undo that never
+        // happened, which is worse than a refusal on a path that writes to the
+        // operator's vault.
+        let err = manifest_without_declaration(MANIFEST, "default", "NEVER_DECLARED")
+            .expect_err("not declared");
+        assert!(err.contains("NEVER_DECLARED"), "{err}");
+    }
+
+    #[test]
+    fn a_manifest_that_would_not_load_is_refused_before_anything_is_written() {
+        let err = manifest_with_declaration(
+            "this is not toml at all",
+            "default",
+            "T",
+            secretspec::Secret::required("d"),
+        )
+        .expect_err("unparseable manifest");
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn an_inheriting_manifest_is_refused_rather_than_resolved_from_disk() {
+        // The reason `Spec::from_toml` is the constructor here: this runs as
+        // root, and resolving `extends` would read whatever the parent path
+        // points at.
+        let inheriting = r#"[project]
+name = "fixture"
+revision = "1.0"
+extends = ["../parent"]
+
+[profiles.default]
+API_KEY = { description = "k", required = true }
+"#;
+        let err = manifest_with_declaration(
+            inheriting,
+            "default",
+            "T",
+            secretspec::Secret::required("d"),
+        )
+        .expect_err("extends must not be resolved here");
+        assert!(err.contains("extends"), "{err}");
     }
 }

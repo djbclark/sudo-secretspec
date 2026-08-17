@@ -241,6 +241,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ignored by sudo — its rules are live — even though `visudo -c` complains
   about it.
 
+### Changed
+
+- `sudo-secretspec add` and `undeclare` now edit the runtime manifest through
+  the public `Spec` text API, so each edit is revalidated as a whole document:
+  a declaration that would not load is refused before anything is written to
+  the vault, rather than surfacing at the next `check`. A manifest that
+  declares `project.extends` is refused rather than resolved, so the root
+  process never reads parent files while editing. Comments, key order, and
+  formatting are preserved exactly as before, and add-then-undeclare still
+  restores the document byte for byte.
+
 ### Fixed
 
 - The refusal `sudo-secretspec install` prints when it is run from the
