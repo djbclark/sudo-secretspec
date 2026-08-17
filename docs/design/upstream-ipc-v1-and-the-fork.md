@@ -132,9 +132,10 @@ Two risks worth naming rather than dismissing:
    `/`, rejects non-root ownership, group/world-writable mode, **any extended
    ACL**, and symlinked components, at every level — not just the parent.
    Offer the corrected points as review feedback plus conformance cases
-   (ancestor-writable-by-ACL, symlinked-component), not a demand. Draft at
-   `docs/design/pr362-comment.md` (write it there before posting, so the next
-   session inherits the exact wording rather than re-deriving it).
+   (ancestor-writable-by-ACL, symlinked-component), not a demand.
+   **POSTED 2026-08-17**: https://github.com/cachix/secretspec/pull/362#issuecomment-5316998149
+   (text preserved at `docs/design/pr362-comment.md`). Watch for a maintainer
+   reply.
 2. Prototype the provider endpoint against `feat/ipc-v1` in a scratch worktree.
    It is a small shim, and it proves the "no upstream patching" claim rather
    than asserting it.
