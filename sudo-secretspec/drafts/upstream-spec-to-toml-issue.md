@@ -1,6 +1,7 @@
-# DRAFT — upstream issue for cachix/secretspec
-# Status: NOT POSTED. Awaiting operator approval.
+# upstream issue for cachix/secretspec
+# Status: POSTED 2026-08-16 as https://github.com/cachix/secretspec/issues/370
 # Synthesis of two independent agent designs + verification against dfa4b10.
+# Retained as the record of what was sent; edit only to correct the record.
 
 **Title:** Format-preserving single-declaration edits on `Spec` — following up on your note in #356/#357
 
@@ -37,7 +38,7 @@ leave every other byte of the file exactly as it was.
 ### Technically
 
 `Spec { config, compiled, base_dir }` has no `to_toml`, no `Display`, and no
-`toml_edit` anywhere in `spec.rs`. `SpecBuilder::build()` ends at
+`toml_edit` anywhere in `spec.rs`. `SpecBuilder::build()` goes through
 `Spec::from_config_document(self.config)` — an in-memory `Config` that is never
 written anywhere. `Config.profiles` is a `HashMap`, so key order isn't preserved
 even in principle. There is currently no serialization path from `Spec` back to
@@ -104,7 +105,7 @@ both `toml_edit` and `cargo-add`.
 `add_secret_to_manifest(source, profile, name, description)` — `toml_edit`-backed,
 whose own doc comment says it "retains the user's comments, whitespace,
 ordering, and any syntax that is not represented by `Config`."
-`cli/mod.rs:479` is `generate_toml_with_comments(&Config)`, a complete
+`cli/mod.rs:480` is `generate_toml_with_comments(&Config)`, a complete
 deterministic writer used by `init`. And `toml_edit = "0.23"` is already a
 workspace dependency, just gated `cli = ["dep:toml_edit", ...]`. So this is
 mostly promotion and a feature-gate change (`manifest-edit = ["dep:toml_edit"]`,

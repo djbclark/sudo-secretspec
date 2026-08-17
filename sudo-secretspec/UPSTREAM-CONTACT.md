@@ -4,7 +4,8 @@ Every thread this fork has opened or spoken in upstream, and what state it was
 in when last checked. **Re-check this whole file at the start of every session**
 (`/baton` / `/resume`); upstream moves fast and closes stale work.
 
-Last verified: **2026-08-16** (upstream `main` at `dfa4b10`).
+Last verified: **2026-08-16** (upstream `main` at `dfa4b10`, merged into
+`sudo-main` at `92eee84`).
 
 ## How to re-check
 
@@ -31,7 +32,9 @@ changed state since "last verified" is the session's first order of business.
 
 | # | Kind | Title | Why it's live |
 |---|------|-------|----------------|
-| [64](https://github.com/cachix/secretspec/issues/64) | issue | Support out-of-tree providers via gRPC interface | **Our only open upstream thread.** We closed our own #345 as a duplicate of this one, so it now carries the fork's entire `exec://` / provider-plugin interest. Not ours; we're a commenter. Watch for a maintainer decision on plugin architecture — it determines whether the broker can ever ship a provider without patching upstream. |
+| [370](https://github.com/cachix/secretspec/issues/370) | issue | Format-preserving single-declaration edits on `Spec` | Filed 2026-08-16 at the maintainer's explicit invitation on #356 and #357. Lands the capability **on `Spec`** (`to_toml()` + `preserved_text()` + text-edit methods), not as a parallel free-function API — he declined that shape twice in one minute. Awaiting a maintainer response; we offered the PR. Reference implementation to build: [item 9 below]. |
+| [371](https://github.com/cachix/secretspec/issues/371) | issue | No supported path from `Spec` to a JSON Schema | Filed 2026-08-16, **deliberately separate from #370** so a focused ask is not diluted. Asks for `Spec::schema_json(profile)`. This is the thread that retires the `source-schema` shape debt below. |
+| [64](https://github.com/cachix/secretspec/issues/64) | issue | Support out-of-tree providers via gRPC interface | We closed our own #345 as a duplicate of this one, so it now carries the fork's entire `exec://` / provider-plugin interest. Not ours; we're a commenter. Watch for a maintainer decision on plugin architecture — it determines whether the broker can ever ship a provider without patching upstream. |
 
 ## Closed / merged — history
 
@@ -48,16 +51,19 @@ changed state since "last verified" is the session's first order of business.
 
 Not yet filed. Track here so they don't get lost.
 
-- **Issue: `Spec` has no path back to TOML.** Explicitly invited by the
-  maintainer on both #356 and #357. Must land the capability **on `Spec`**
-  (`to_toml()` + builder carrying the source document), not as a parallel
-  free-function API — he declined that shape twice in one minute. Draft and
-  design rationale: see session notes / `docs/design/`.
-- **Bug + PR: `check` writes its entire report to stderr.** Reproduces
-  identically on upstream `main` (`secretspec/src/secrets.rs`, `check()` and
-  both `display_validation_*` helpers, all `eprintln!`). `secrets.rs` is
+- **Bug + PR: `check` writes its entire report to stderr.** Fixed on
+  `sudo-main` in `8c177e4` (11 `eprintln!` → `println!`, plus
+  `secretspec/tests/check_report_stream.rs`, confirmed to fail without the
+  fix). Reproduces identically on upstream `main`; `secrets.rs` is
   upstream-owned — the fork has touched it once since the merge base, upstream
-  7 times — so a fork-local-only fix is a permanent conflict site.
+  7 times — so a fork-local-only fix is a permanent conflict site. Draft:
+  `sudo-secretspec/drafts/upstream-check-stdout-issue.md`. **Still to do:**
+  post the issue and open the PR.
+
+Filed 2026-08-16 and moved to the open table above: the `Spec::to_toml()` ask
+(#370) and the `Spec::schema_json()` ask (#371). Drafts retained at
+`sudo-secretspec/drafts/upstream-spec-to-toml-issue.md` and
+`sudo-secretspec/drafts/upstream-spec-schema-json-issue.md`.
 
 ## Deliberate stopgaps to revisit — not functionality debt, *shape* debt
 
@@ -66,11 +72,11 @@ the right shape depends on an upstream answer we have not received yet. Revisit
 each one when the corresponding thread moves, **even if there is no functional
 gain** — the point is to stop depending on surfaces upstream has disclaimed.
 
-### `source-schema` goes through `__private` (added 0.19.1-sudo.15)
+### `source-schema` goes through `__private` + a local feature (0.19.1-sudo.15)
 
 `sudo-secretspec-cli/src/broker.rs` `emit_schema` reaches codegen through
-`secretspec::__private::codegen::build_ir`. Upstream marks that module
-`#[doc(hidden)]` and says in its own doc comment:
+`secretspec::__private::codegen::{build_ir, schema}`. Upstream marks that
+module `#[doc(hidden)]` and says in its own doc comment:
 
 > These document types are not part of the supported Rust SDK. Use `Spec` and
 > its builder API instead.
@@ -78,21 +84,37 @@ gain** — the point is to stop depending on surfaces upstream has disclaimed.
 So we are knowingly building on a surface upstream disclaims, and it can change
 without notice in any release.
 
+There are **two** parts to this debt, and only the first is pure `__private`:
+
+1. `build_ir` is already exported from `__private::codegen` upstream, so using
+   it costs no patch — just a dependency on a disclaimed surface.
+2. `schema::emit` is `pub(crate)` **and** `#[cfg(feature = "cli")]` upstream,
+   so it is not reachable even through `__private`. We carry a fork-local patch
+   for it: a `codegen-schema` feature (`secretspec/Cargo.toml`) that widens
+   `codegen::schema` to `pub` and re-exports it from `__private::codegen`. It
+   mirrors the existing `manifest-edit` feature and, like it, exists so the
+   root-privileged broker never takes `clap`/`inquire`. `cli` implies it, so
+   nothing changes for upstream users.
+
 - **Why we did it:** the upstream merge moved `build_ir` to take `&Spec` and
-  left `codegen::schema` as `pub(crate)` + `#[cfg(feature = "cli")]`, so there
-  is no supported path to JSON Schema emission for a library consumer. The
-  alternative was blocking a release that also carries the `check` stdout fix.
-- **The clean shape:** a `Spec`-shaped method upstream, e.g.
-  `Spec::schema_json(profile) -> Result<String>`. That fits the maintainer's
-  stated consolidation ("the public api will be `Spec`") rather than fighting
-  it, and it is the second ask to raise alongside the `to_toml()` issue.
-- **Revisit when:** the `Spec::to_toml()` issue gets a maintainer response, or
-  any upstream release changes `__private`. Check whether `schema::emit` became
-  reachable; if it did, migrate off `__private` **even though nothing the user
-  can observe changes**.
-- **Canary:** if a future upstream merge breaks `emit_schema` compilation, that
-  is this debt coming due, not a new bug. Fix it by asking for the `Spec` method,
-  not by reaching deeper into internals.
+  left `codegen::schema` closed, so there is no supported path to JSON Schema
+  emission for a library consumer. The alternative was blocking a release that
+  also carries the `check` stdout fix.
+- **The clean shape:** `Spec::schema_json(profile) -> Result<String>` upstream.
+  **Now filed as issue #371** with the PR offered.
+- **Revisit when:** #371 gets a maintainer response, or any upstream release
+  changes `__private` or the `codegen` module layout. If `schema::emit` becomes
+  reachable, drop the `codegen-schema` feature and migrate **even though
+  nothing the user can observe changes** — the point is to stop patching
+  upstream internals.
+- **Canary:** if a future upstream merge breaks `emit_schema` compilation, or
+  the `codegen-schema` patch stops applying cleanly, that is this debt coming
+  due, not a new bug. Fix it by pressing #371, not by reaching deeper.
+
+Note the broker no longer uses `Secrets::config()`: it loads a `Spec` from the
+protected manifest path instead, which let `secretspec/src/secrets.rs` return to
+exact upstream parity and retired a conflict site on a file upstream edits
+often. Keep it that way.
 
 ## Standing rules
 
