@@ -1,5 +1,7 @@
 # DRAFT — upstream bug report for cachix/secretspec
-# Status: NOT POSTED. Gated on the 2-review process per operator.
+# Status: POSTED 2026-08-16 as https://github.com/cachix/secretspec/issues/372
+# PR opened against it: https://github.com/cachix/secretspec/pull/373
+# Retained as the record of what was sent. Edit the issue upstream, not this.
 
 ## Title
 
@@ -14,6 +16,10 @@ summary. It looks like normal program output. But all of it is going out the
 "error" pipe instead of the "normal" pipe.
 
 So if you try to do the obvious thing:
+
+```console
+$ secretspec check | grep DATABASE_URL
+```
 
 …you get nothing, and it looks like `check` found no secrets. It found them
 fine — the text just went somewhere `grep` wasn't looking.

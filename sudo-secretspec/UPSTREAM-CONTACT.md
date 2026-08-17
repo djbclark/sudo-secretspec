@@ -4,7 +4,7 @@ Every thread this fork has opened or spoken in upstream, and what state it was
 in when last checked. **Re-check this whole file at the start of every session**
 (`/baton` / `/resume`); upstream moves fast and closes stale work.
 
-Last verified: **2026-08-16** (upstream `main` at `dfa4b10`, merged into
+Last verified: **2026-08-16** (upstream `main` still at `dfa4b10`, merged into
 `sudo-main` at `92eee84`).
 
 ## How to re-check
@@ -34,7 +34,10 @@ changed state since "last verified" is the session's first order of business.
 |---|------|-------|----------------|
 | [370](https://github.com/cachix/secretspec/issues/370) | issue | Format-preserving single-declaration edits on `Spec` | Filed 2026-08-16 at the maintainer's explicit invitation on #356 and #357. Lands the capability **on `Spec`** (`to_toml()` + `preserved_text()` + text-edit methods), not as a parallel free-function API — he declined that shape twice in one minute. Awaiting a maintainer response; we offered the PR. Reference implementation to build: [item 9 below]. |
 | [371](https://github.com/cachix/secretspec/issues/371) | issue | No supported path from `Spec` to a JSON Schema | Filed 2026-08-16, **deliberately separate from #370** so a focused ask is not diluted. Asks for `Spec::schema_json(profile)`. This is the thread that retires the `source-schema` shape debt below. |
-| [64](https://github.com/cachix/secretspec/issues/64) | issue | Support out-of-tree providers via gRPC interface | We closed our own #345 as a duplicate of this one, so it now carries the fork's entire `exec://` / provider-plugin interest. Not ours; we're a commenter. Watch for a maintainer decision on plugin architecture — it determines whether the broker can ever ship a provider without patching upstream. |
+| [64](https://github.com/cachix/secretspec/issues/64) | issue | Support out-of-tree providers via gRPC interface | We closed our own #345 as a duplicate of this one, so it now carries the fork's entire `exec://` / provider-plugin interest. Not ours; we're a commenter. **Answered by #362** — see below; the maintainer's 2026-08-16 comment here is just a pointer to it. |
+| [372](https://github.com/cachix/secretspec/issues/372) | issue | `check` writes its entire report to stderr | Filed 2026-08-16 from `drafts/upstream-check-stdout-issue.md`. PR #373 opened against it the same session. |
+| [373](https://github.com/cachix/secretspec/pull/373) | PR | fix(check): write the report to stdout so it can be piped | Opened 2026-08-16 from branch `fix/check-report-to-stdout` (built on `upstream/main`, **not** on `sudo-main`). Carries only the `secrets.rs` + `check_report_stream.rs` hunks plus a hand-written `Changed` CHANGELOG entry. All 3 regression tests verified passing against a pure `dfa4b10` base, not merely against our merged tree. |
+| [362](https://github.com/cachix/secretspec/pull/362) | PR | feat: add versioned client and provider IPC | **Not ours — the most consequential upstream thread for this fork, and it went untracked for a session.** The maintainer's own PR introducing SecretSpec IPC v1 for 0.20+: `secretspec.client/1` and `secretspec.provider/1` over framed JSON-RPC, `secretspec broker --stdio`, broker-owned file leases, trusted external-provider discovery, a C11 client, and `secretspec-ffi` → `libsecretspec`. Analysis: `docs/design/upstream-ipc-v1-and-the-fork.md`. Short version: it is the `exec://` mechanism #345 asked for, and upstream's "broker" is an IPC endpoint **inside the caller's trust domain**, not a privilege boundary — so it complements this fork rather than subsuming it. |
 
 ## Closed / merged — history
 
@@ -51,19 +54,22 @@ changed state since "last verified" is the session's first order of business.
 
 Not yet filed. Track here so they don't get lost.
 
-- **Bug + PR: `check` writes its entire report to stderr.** Fixed on
-  `sudo-main` in `8c177e4` (11 `eprintln!` → `println!`, plus
-  `secretspec/tests/check_report_stream.rs`, confirmed to fail without the
-  fix). Reproduces identically on upstream `main`; `secrets.rs` is
-  upstream-owned — the fork has touched it once since the merge base, upstream
-  7 times — so a fork-local-only fix is a permanent conflict site. Draft:
-  `sudo-secretspec/drafts/upstream-check-stdout-issue.md`. **Still to do:**
-  post the issue and open the PR.
+- **Comment on #362** announcing intent to ship `sudo-secretspec` as the first
+  out-of-tree *privileged* `secretspec.provider/1` endpoint, closing the loop on
+  #345. One technical point is worth making from shipped experience: #362's
+  registration trust check validates only the **immediate parent** directory
+  (`external.rs:335-361`, via symlink-following `fs::metadata`), but on macOS
+  the system path's ancestor `/Library/Application Support` is admin-group
+  writable. This fork already walks the full ancestor chain with
+  `symlink_metadata` (`drift.rs` `check_ancestor_chain`) for exactly that
+  reason. Offer it as review feedback plus conformance cases, not a demand.
 
 Filed 2026-08-16 and moved to the open table above: the `Spec::to_toml()` ask
-(#370) and the `Spec::schema_json()` ask (#371). Drafts retained at
-`sudo-secretspec/drafts/upstream-spec-to-toml-issue.md` and
-`sudo-secretspec/drafts/upstream-spec-schema-json-issue.md`.
+(#370), the `Spec::schema_json()` ask (#371), and the `check` stdout bug (#372)
+with its PR (#373). Drafts retained at
+`sudo-secretspec/drafts/upstream-spec-to-toml-issue.md`,
+`sudo-secretspec/drafts/upstream-spec-schema-json-issue.md` and
+`sudo-secretspec/drafts/upstream-check-stdout-issue.md`.
 
 ## Deliberate stopgaps to revisit — not functionality debt, *shape* debt
 
@@ -102,6 +108,10 @@ There are **two** parts to this debt, and only the first is pure `__private`:
   also carries the `check` stdout fix.
 - **The clean shape:** `Spec::schema_json(profile) -> Result<String>` upstream.
   **Now filed as issue #371** with the PR offered.
+- **Checked against #362 (2026-08-16): it does NOT retire this.** The client
+  protocol is five methods with no manifest-shape reflection, and `provider.reflect`
+  describes the *endpoint*, not the manifest; no `spec.rs`/`codegen.rs` changes
+  in its 216 files. Do not assume the 0.20 IPC work supplies a schema path.
 - **Revisit when:** #371 gets a maintainer response, or any upstream release
   changes `__private` or the `codegen` module layout. If `schema::emit` becomes
   reachable, drop the `codegen-schema` feature and migrate **even though
