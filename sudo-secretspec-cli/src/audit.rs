@@ -399,8 +399,38 @@ pub enum VerifyMode {
     ReadOnly,
 }
 
+/// Open a protected database in the vault, with the ledger's own hardening.
+///
+/// Exposed so [`crate::history`] opens its store through exactly this code
+/// rather than a second copy of it. Every guarantee below — directory metadata,
+/// pre- and post-open ownership, `0600`, the pragmas, and the dev/ino re-check
+/// against a swap during open — is one a second store needs identically, and a
+/// duplicated version is one that drifts. `db_name` is the only difference
+/// between the two callers.
+pub(crate) fn open_protected_db(
+    directory: &Path,
+    db_name: &str,
+    expected_uid: Option<u32>,
+    mode: VerifyMode,
+) -> Result<Connection, AuditError> {
+    open_connection(directory, db_name, expected_uid, mode)
+}
+
+/// Assert the protected directory's metadata without opening anything.
+///
+/// Exposed for the same reason as [`open_protected_db`]: a store that does not
+/// exist yet still has to prove its directory is the real vault before
+/// reporting "no entries".
+pub(crate) fn require_protected_dir(
+    directory: &Path,
+    expected_uid: Option<u32>,
+) -> Result<(), AuditError> {
+    check_protected_dir(directory, expected_uid)
+}
+
 fn open_connection(
     directory: &Path,
+    db_name: &str,
     expected_uid: Option<u32>,
     mode: VerifyMode,
 ) -> Result<Connection, AuditError> {
@@ -413,7 +443,7 @@ fn open_connection(
     //    must be repairable rather than permanently fatal, and the post-open
     //    check enforces the final ownership. Under `ReadOnly` there is no such
     //    repair, so the expectation is asserted immediately.
-    let db_path = directory.join(DB_NAME);
+    let db_path = directory.join(db_name);
     let identity_before = std::fs::symlink_metadata(&db_path)
         .ok()
         .map(|m| (m.dev(), m.ino()));
@@ -766,7 +796,7 @@ fn verify_with(
         });
     }
 
-    let conn = open_connection(directory, expected_uid, mode)?;
+    let conn = open_connection(directory, DB_NAME, expected_uid, mode)?;
 
     let result = (|| -> Result<VerifyResult, AuditError> {
         // Creating the schema is a write. Under `ReadOnly` a ledger missing its
@@ -882,7 +912,12 @@ pub fn append_event(
     // ---- Database operations ----
 
     // Appending is a write by definition; there is no read-only variant here.
-    let conn = open_connection(directory, request.expected_uid, VerifyMode::ReadWrite)?;
+    let conn = open_connection(
+        directory,
+        DB_NAME,
+        request.expected_uid,
+        VerifyMode::ReadWrite,
+    )?;
 
     let result = (|| -> Result<AuditEvent, AuditError> {
         ensure_schema(&conn)?;

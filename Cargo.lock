@@ -5791,6 +5791,7 @@ name = "sudo-secretspec-cli"
 version = "0.19.1-sudo.18"
 dependencies = [
  "clap",
+ "dotenv-ng",
  "libc",
  "rusqlite",
  "secretspec",
