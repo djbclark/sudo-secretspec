@@ -3675,7 +3675,13 @@ impl Secrets {
         self.ensure_reason_for(AuditAction::Check, None)?;
         let profile_display = self.resolve_profile_name(None);
 
-        eprintln!(
+        // The report is the output the user asked for, so it belongs on stdout
+        // — `secretspec check | grep ...` otherwise sees nothing at all. This
+        // also makes the existing colour handling correct: `colored` decides
+        // whether to emit ANSI escapes by testing stdout's TTY, so writing the
+        // report to stderr leaked escapes into redirected logs and stripped
+        // them from terminals. `export` already writes to stdout.
+        println!(
             "Checking secrets in {} (profile: {})...\n",
             self.config.project.name.bold(),
             profile_display.cyan()
@@ -3712,17 +3718,17 @@ impl Secrets {
             let label = format_secret_label(name, config.description.as_deref());
             if missing_optional.contains(&name) {
                 optional_count += 1;
-                eprintln!("{} {} {}", "○".blue(), label, "(optional)".blue());
+                println!("{} {} {}", "○".blue(), label, "(optional)".blue());
             } else if config.default.is_some() && default_names.contains(&name) {
                 found_count += 1;
-                eprintln!("{} {} {}", "○".yellow(), label, "(has default)".yellow());
+                println!("{} {} {}", "○".yellow(), label, "(has default)".yellow());
             } else {
                 found_count += 1;
-                eprintln!("{} {}", "✓".green(), label);
+                println!("{} {}", "✓".green(), label);
             }
         }
 
-        eprintln!("\n{}", Self::format_summary(found_count, 0, optional_count));
+        println!("\n{}", Self::format_summary(found_count, 0, optional_count));
 
         Ok(())
     }
@@ -3742,26 +3748,26 @@ impl Secrets {
             let label = format_secret_label(name, config.description.as_deref());
             if errors.missing_required.contains(name) {
                 missing_count += 1;
-                eprintln!("{} {} {}", "✗".red(), label, "(required)".red());
+                println!("{} {} {}", "✗".red(), label, "(required)".red());
             } else if errors.missing_optional.contains(name) {
                 optional_count += 1;
-                eprintln!("{} {} {}", "○".blue(), label, "(optional)".blue());
+                println!("{} {} {}", "○".blue(), label, "(optional)".blue());
             } else {
                 found_count += 1;
                 if default_names.contains(name) {
-                    eprintln!("{} {} {}", "○".yellow(), label, "(has default)".yellow());
+                    println!("{} {} {}", "○".yellow(), label, "(has default)".yellow());
                 } else {
-                    eprintln!("{} {}", "✓".green(), label);
+                    println!("{} {}", "✓".green(), label);
                 }
             }
         }
 
-        eprintln!(
+        println!(
             "\n{}",
             Self::format_summary(found_count, missing_count, optional_count)
         );
         for violation in &errors.constraint_violations {
-            eprintln!("{} {}", "Constraint failed:".red().bold(), violation);
+            println!("{} {}", "Constraint failed:".red().bold(), violation);
         }
 
         Ok(())

@@ -217,6 +217,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `check` writes its report to stdout instead of stderr, so
+  `secretspec check | grep ...` sees it. Previously the header, every ✓/○/✗
+  line and the summary all went to stderr, leaving stdout empty — a pipeline
+  observed nothing while the report still appeared on the terminal, which made
+  the command look like it had found no secrets. This also corrects the
+  colouring: `colored` decides whether to emit ANSI escapes by testing
+  *stdout*, so a report written to stderr leaked raw escape bytes into
+  redirected log files and dropped colour from terminals reading stdout. Exit
+  codes are unchanged, and the error message for a missing required secret
+  stays on stderr where it belongs.
+
 - Bare `bws://<project-uuid>` provider URIs now target the Bitwarden US cloud
   vault instead of the public marketing site, restoring reads and writes while
   keeping the server pinned independently of ambient `bws` configuration.
