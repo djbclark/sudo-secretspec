@@ -79,6 +79,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   earlier installers parse unchanged; until the first install that writes it,
   `doctor` reports no upgrade rather than guessing at one.
 
+### Added
+
+- `Spec` can perform format-preserving single-declaration edits on the document
+  it was loaded from. `add_secret_to_text` and `remove_secret_from_text` return
+  a new fully revalidated `Spec` whose text differs only by that declaration,
+  leaving comments, key order, quoting, and unrepresented syntax byte for byte
+  intact; `declares_secret_in_text` reports whether a name is declared in this
+  document rather than inherited; `preserved_text` exposes the exact backing
+  text, and `to_toml` renders freshly formatted TOML for any spec, including one
+  built with `Spec::builder`, which has no backing text. Adding a declaration
+  and then removing it restores the original bytes, so tools that compare
+  manifests byte for byte can rely on the undo. A spec that inherits through
+  `project.extends` keeps its own root document as the preserved text and is
+  revalidated against its parents on every edit, so inherited declarations are
+  never inlined into the child file.
+
 ### Changed
 
 - `sudo-secretspec install` now adopts the vault named by the installed

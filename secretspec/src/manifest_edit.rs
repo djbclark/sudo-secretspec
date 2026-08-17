@@ -65,12 +65,81 @@ pub fn add_secret_to_manifest(
     description: &str,
     required: Option<bool>,
 ) -> Result<String> {
-    use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
+    use toml_edit::{InlineTable, Value};
 
+    // Name before description, matching the order this function has always
+    // reported these two: `insert_declaration` validates the name again, but
+    // only after the description check, which would silently reorder the
+    // diagnostics a caller sees for an input that is wrong in both ways.
     validate_add_secret_name(name)?;
     if description.trim().is_empty() {
         return Err(miette!("Secret description cannot be empty"));
     }
+
+    let mut secret = InlineTable::new();
+    secret.insert("description", Value::from(description));
+    if let Some(required) = required {
+        secret.insert("required", Value::from(required));
+    }
+    insert_declaration(source, profile, name, secret)
+}
+
+/// Insert a complete [`crate::config::Secret`] declaration into a manifest.
+///
+/// The general form of [`add_secret_to_manifest`], which covers only the two
+/// keys the CLI's `add` prompts for. Every other declared field — `default`,
+/// `composed`, `providers`, `ref`/`refs`, `as_path`, `encoding`, `extract`,
+/// `generate`, `prompt`, and the presence groups — is emitted by the same serde
+/// representation the parser reads, so the written keys and the accepted keys
+/// cannot drift apart as the schema grows.
+///
+/// Unset fields are omitted rather than written as explicit nulls, which is what
+/// keeps the emitted declaration a single readable line and keeps the round-trip
+/// with [`remove_secret_from_manifest`] byte-exact.
+pub fn add_secret_value_to_manifest(
+    source: &str,
+    profile: &str,
+    name: &str,
+    secret: &crate::config::Secret,
+) -> Result<String> {
+    use toml_edit::ser::to_document;
+
+    if secret
+        .description
+        .as_deref()
+        .is_none_or(|description| description.trim().is_empty())
+    {
+        return Err(miette!("Secret description cannot be empty"));
+    }
+
+    // Serialized through a document and then flattened to an inline table: the
+    // value serializer refuses a nested table, which `ref`, `refs`, `extract`,
+    // `generate`, and a presence group's `required` all produce.
+    let document = to_document(secret)
+        .into_diagnostic()
+        .wrap_err("Failed to render the secret declaration as TOML")?;
+    let mut inline = toml_edit::InlineTable::new();
+    for (key, item) in document.as_table().iter() {
+        let value = item
+            .clone()
+            .into_value()
+            .map_err(|_| miette!("Secret field '{}' has no inline TOML form", key))?;
+        inline.insert(key, value);
+    }
+
+    insert_declaration(source, profile, name, inline)
+}
+
+/// Place `declaration` at `profile.name`, creating the profile table if needed.
+fn insert_declaration(
+    source: &str,
+    profile: &str,
+    name: &str,
+    declaration: toml_edit::InlineTable,
+) -> Result<String> {
+    use toml_edit::{DocumentMut, Item, Table};
+
+    validate_add_secret_name(name)?;
 
     let mut doc = source
         .parse::<DocumentMut>()
@@ -97,13 +166,7 @@ pub fn add_secret_to_manifest(
         ));
     }
 
-    let mut secret = InlineTable::new();
-    secret.insert("description", Value::from(description));
-    if let Some(required) = required {
-        secret.insert("required", Value::from(required));
-    }
-    profile_table.insert(name, toml_edit::value(secret));
-
+    profile_table.insert(name, toml_edit::value(declaration));
     Ok(doc.to_string())
 }
 
@@ -343,6 +406,60 @@ OTHER = { description = "unrelated, mentions LOOKALIKE in prose" }
         // A guard built on this must fail closed, which it cannot do if a
         // broken file is indistinguishable from an absent name.
         assert!(declares_secret("this is not toml {{{", "default", "ANY").is_err());
+    }
+
+    #[test]
+    fn the_full_declaration_writer_emits_only_the_fields_that_were_set() {
+        // What keeps the emitted declaration a readable single line, and what
+        // makes the byte-exact undo possible at all: an unset field must be
+        // absent, not written as an explicit null or a default.
+        use crate::config::Secret as ConfigSecret;
+
+        let secret = ConfigSecret {
+            description: Some("temp".into()),
+            required: Some(true),
+            ..ConfigSecret::default()
+        };
+
+        let added = add_secret_value_to_manifest(MANIFEST, "default", "SCRATCH", &secret).unwrap();
+
+        assert!(added.contains("SCRATCH = { description = \"temp\", required = true }"));
+    }
+
+    #[test]
+    fn the_full_declaration_writer_round_trips_a_nested_field() {
+        // `ref` serializes as a nested table rather than a scalar, so a writer
+        // that only knew how to place scalars into an inline table would fail
+        // here -- and it has to undo just as exactly as a scalar-only one.
+        use crate::config::{NativeAddress, Secret as ConfigSecret};
+
+        let secret = ConfigSecret {
+            description: Some("temp".into()),
+            reference: Some(NativeAddress {
+                item: "db".into(),
+                field: Some("password".into()),
+                ..NativeAddress::default()
+            }),
+            ..ConfigSecret::default()
+        };
+
+        let added = add_secret_value_to_manifest(MANIFEST, "default", "SCRATCH", &secret).unwrap();
+        assert!(added.contains(r#"item = "db""#), "{added}");
+
+        let removed = remove_secret_from_manifest(&added, "default", "SCRATCH").unwrap();
+
+        assert_eq!(removed, MANIFEST);
+    }
+
+    #[test]
+    fn the_full_declaration_writer_still_requires_a_description() {
+        use crate::config::Secret as ConfigSecret;
+
+        let err =
+            add_secret_value_to_manifest(MANIFEST, "default", "SCRATCH", &ConfigSecret::default())
+                .unwrap_err();
+
+        assert!(err.to_string().contains("description"), "{err}");
     }
 
     #[test]
