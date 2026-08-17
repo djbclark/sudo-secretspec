@@ -2,12 +2,14 @@
 
 Written 2026-08-17, on operator request, with `sudo-main` at `b97abf1`.
 
-**Status: QUEUED, not designed, not started.** Explicitly sequenced *after* the
-work already in flight: the `0.19.1-sudo.16` release, the `Spec`-shaped
-manifest-edit reference implementation for upstream
-[#370](https://github.com/cachix/secretspec/issues/370), and the comment on
-upstream [PR #362](https://github.com/cachix/secretspec/pull/362). Do not start
-this before those are done.
+**Status: DESIGNED 2026-08-17, not implemented.** The work it was sequenced
+behind is done — `0.19.1-sudo.16` through `.18` are released, the `Spec`-shaped
+manifest-edit reference implementation is upstream as
+[PR #374](https://github.com/cachix/secretspec/pull/374), and the comment on
+upstream [PR #362](https://github.com/cachix/secretspec/pull/362) is posted.
+See [The design](#the-design-decided-2026-08-17-with-sudo-main-at-22e5178)
+below and its implementation plan; the open questions this document used to
+end with are answered there, not pending.
 
 ## What the operator asked for
 
@@ -121,29 +123,219 @@ keep none. Local candidates to evaluate at design time:
   write ourselves, but as trivial schema on a substrate the boundary already
   trusts, and it could share the ledger's integrity design.
 
-## Non-binding sketch (to be designed properly when the queue clears)
+## The design (decided 2026-08-17, with `sudo-main` at `22e5178`)
 
-- History lives **inside the privilege boundary** (root-owned, e.g.
-  `/var/db/sudo-secretspec/history/`), outside every caller's trust domain —
-  a compromised or careless caller can no more delete history than read the
-  vault.
-- Every mutating verb (`set`, `delete`, `import`, `install`, and `restore`
-  itself) preserves prior state before writing. The whole vault was 2852 bytes
-  at the last restore, so "infinite" retention is plausible at face value.
-- New verbs: list history, and restore a single key or the whole vault to a
-  chosen point.
-- Restores and history reads are audited in the protected ledger like any
-  other privileged action.
+Status of this section: **designed, not implemented.** The open questions
+below it are answered, not pending.
 
-## Open questions (decide at design time, not now)
+### The spine: the capture path already exists
 
-- Per-key value history vs whole-file snapshots (or both).
-- Whether restore requires operator authentication beyond existing sudoers
-  rules — a restore overwrites current values, so it is itself a destructive
-  write.
-- Scope: the dotenv vault only, or also provider-backed values (keyring) —
-  provider backends may not support enumeration.
-- Retention/compaction policy if "infinite" ever becomes a size problem
-  (secret *values* are tiny; audit-grade metadata may not be).
-- Upstream posture: fork-only, or is there a shape upstream would want
-  (relates to the provider `delete`/versioning surface from PR #354)?
+`broker.rs:235` `Mutation` already copies **both** `secretspec.toml` and
+`.env` before every `source-set` / `source-add` / `source-delete`, into
+`.secretspec.{toml,env}.rollback.<transaction>` inside the vault, chowned to
+the service identity and refused on collision. The transaction is the same
+`uuid::Uuid` the hash-chained audit ledger records for that operation
+(`broker.rs:492`).
+
+On success, `Mutation::commit` **deletes** those copies (`broker.rs:306`).
+
+So this feature is mostly *stop discarding a snapshot the boundary already
+takes correctly*. It is not a new capture mechanism, and it does not need
+one. What is genuinely new is durable storage, a read surface, and a restore
+path — plus closing two gaps the review found (below).
+
+Two gaps found while grounding this design, both worth fixing regardless:
+
+1. **`source-undeclare` is not wrapped in `Mutation`.** The `matches!` at
+   `broker.rs:529` lists only `set`/`add`/`delete`, but `source-undeclare`
+   performs a bare `std::fs::write(&manifest, updated)` at `broker.rs:866`.
+   A failed write there corrupts the manifest with no rollback copy, unlike
+   its three siblings. It is the largest file in the vault (9735 bytes live).
+2. **`install` has never had vault coverage.** `rollback.rs:4` states
+   *"Never touches vault secret values"* and `run` prints
+   `"runtime vault preserved"`. Artifact rollback and secret history are
+   disjoint by design — which is precisely the seam the 2026-08-17
+   truncation fell through.
+
+### Backend: SQLite beside the audit ledger
+
+`/var/db/sudo-secretspec/broker-history.sqlite3`, root-owned `0600`, beside
+`broker-audit.sqlite3`, hash-chained with the same design as `audit.rs`
+(`previous_hash` / `entry_hash`, verified end to end by a `history-verify`
+counterpart to `audit-verify`).
+
+*Chosen over a git-wrapped vault*, which was the favoured candidate above.
+Git gives history, diffs and `git fsck` for free, but it gets them by running
+`git` **from a root process**, which inherits `/etc/gitconfig`, hooks,
+`.gitattributes` filters and `core.fsmonitor` — every one a code-execution
+vector. The vault directory is service-user-writable (`_sudo_secretspec`,
+`0700`), so a repo placed there would be outright root RCE; a root-owned
+history directory elsewhere closes that specific hole but still makes a
+privilege boundary depend on an external binary's behaviour at uid 0. The
+operator's constraint was "no network dependency, ideally a backend that
+already implements versioning" — the *purpose* of that constraint is fewer
+bugs and no remote, and on this substrate the versioning we would write is a
+single table, while the surface git imports is not small. `rusqlite` is
+already a dependency of this crate for the ledger.
+
+*Rejected: `pass`/`gopass`* (GPG toolchain the boundary does not otherwise
+need) and *`kdbx`* (history depth capped, not infinite).
+
+### Storage shape: per-name values, whole-file manifest
+
+This **revises** the earlier working assumption that whole-file snapshots
+would be the stored truth for both files. Whole-file cannot support
+destroy-by-name: removing one name's value from a `.env` blob changes that
+blob's digest and breaks the hash chain, and NULLing the whole blob would
+destroy the other 45 names' history with it.
+
+- **`.env` → per-name value rows.** A dotenv is flat `KEY=VALUE`; decomposing
+  it loses nothing. Each captured transaction stores one row per name, plus
+  the digest of the whole original file.
+- **`secretspec.toml` → whole-file blob.** Structured TOML where formatting,
+  comment placement and ordering all matter, and which holds *declarations,
+  not values* — so destroying a value never needs to touch it.
+
+Consistency is preserved by storing `file_sha256` for the reconstructed
+`.env`: a restore reassembles the rows and must reproduce that digest exactly
+or it refuses. Capture applies the same guard in reverse — if reassembling
+what it just parsed does not reproduce the bytes on disk, capture fails
+closed rather than storing a snapshot that cannot be restored.
+
+```sql
+CREATE TABLE entries (            -- one row per captured transaction
+  sequence      INTEGER PRIMARY KEY AUTOINCREMENT,
+  transaction   TEXT NOT NULL,    -- the SAME uuid as the audit event
+  timestamp_ns  INTEGER NOT NULL,
+  operation     TEXT NOT NULL,    -- source-set | source-add | source-delete | ...
+  manifest_blob BLOB NOT NULL,    -- secretspec.toml, whole file
+  manifest_sha  TEXT NOT NULL,
+  env_file_sha  TEXT NOT NULL,    -- digest of the whole pre-mutation .env
+  previous_hash TEXT NOT NULL,
+  entry_hash    TEXT NOT NULL     -- covers the metadata above, incl. digests
+);
+
+CREATE TABLE values_ (            -- one row per name per entry
+  sequence      INTEGER NOT NULL REFERENCES entries(sequence),
+  name          TEXT NOT NULL,
+  value_blob    BLOB,             -- NULL once destroyed
+  value_sha256  TEXT NOT NULL,    -- RETAINED after destroy
+  destroyed_by  INTEGER REFERENCES entries(sequence),
+  PRIMARY KEY (sequence, name)
+);
+```
+
+`entry_hash` covers the *original* digests, never the mutable blob. That is
+what makes destruction auditable: a destroyed row still proves that bytes
+with digest X existed at that point and were destroyed by entry N, without
+retaining the value. Same property Vault KV v2's `destroy` needs, reached the
+same way — chain the metadata, not the data.
+
+### Verb surface and the authorisation model
+
+Restore is **agent-callable but forward-safe only**. Agents may recover state;
+they may not overwrite live state.
+
+| Verb | Who | Rule |
+|---|---|---|
+| `history [--name NAME]` | agent | Lists transactions, names touched, timestamps. **Never prints values.** |
+| `restore --name NAME --to <txn>` | agent | Permitted **only if `NAME` currently holds no value and carries no tombstone.** Otherwise refuses and names the operator-only form. |
+| `restore --name NAME --to <txn> --force` | operator | Overwrites a live value. Separate sudoers verb, excluded from the agent rule. |
+| `restore --all --to <txn>` | operator | Whole-vault rewind. Necessarily overwrites; never agent-callable. |
+| `destroy --name NAME` | operator | Deletes *and* tombstones every historical value for `NAME`. The rotation-safe path. |
+
+The dynamic half of that rule cannot live in sudoers, which knows nothing
+about whether a value currently exists — so sudoers separates
+`source-restore` from `source-restore-force`, and the broker enforces the
+"currently holds no value" condition at runtime. This is the same shape as
+the guard already at `broker.rs:841`, which refuses to undeclare a name that
+still holds a value and tells the caller to `delete` it first.
+
+### `delete` stays soft; `destroy` is the rotation-safe verb
+
+Forward-safe restore has one hole if `delete` is the only removal verb: a
+credential rotated *because it leaked* is deleted, and an agent may then
+restore it — reviving the leak. Closing it does not require making the agent
+path useless, because the prior art already recorded above solves exactly
+this:
+
+- **`delete` is soft.** Snapshots retained, agent-recoverable. This is the
+  ordinary case and stays ergonomic.
+- **`destroy` is permanent and operator-only.** It is what a leak response
+  uses. Mirrors Vault KV v2's `delete` vs `destroy` and AWS Secrets Manager's
+  recovery window vs force-delete-without-recovery.
+
+### Auditing, and the cache precondition
+
+Every one of `history`, `restore` and `destroy` is **its own operation name**
+in the protected ledger, following the `cache_refresh` precedent identified
+in the second prior-art pass: a rewind must never read back as an ordinary
+`set`. They go through the existing attempt/terminal funnel (`broker.rs:528`)
+with a mandatory `--reason` digest, like every other source verb.
+
+**Cache invalidation is a precondition, not a follow-up.** Verified again
+2026-08-17: the privileged CLI does not reference `secretspec/src/cache.rs`
+at all, so nothing is at risk today. The design's requirement is therefore
+enforced as a *guard against a future change*: restore must invalidate
+affected cache entries inside the same audited operation, and the
+implementation carries a test that fails if the privileged CLI gains a
+reference to the cache without restore handling it. Discovering this after
+caching is enabled inside the boundary is exactly when it is most expensive.
+
+### Retention: genuinely infinite, observed rather than assumed
+
+Live sizes, 2026-08-17: `.env` 2858 bytes, `secretspec.toml` 9735 bytes —
+~12.6 KB per full snapshot, and the manifest blob is identical across the
+long runs of transactions that do not touch declarations. The ledger holds
+1268 events to date across the fork's whole life, of which mutations are a
+fraction. No compaction, no retention window, no expiry.
+
+What the design adds instead is a `doctor` line reporting history entry count
+and file size, so growth is *observed*. If it ever becomes a problem, that is
+a decision made against real numbers rather than a policy guessed at now.
+
+### Scope, stated as a limit
+
+History covers **the vault dotenv and the runtime manifest only** — the
+boundary's own store. It does **not** cover provider-backed values (keyring
+and friends), which have no enumeration or history API; a partial guarantee
+that reads as complete is worse than a stated limit. The CLI help, the
+`history` output header, and `sudo-secretspec/README.md` all say so
+explicitly.
+
+### Upstream posture: fork-only
+
+Two independent prior-art passes (above) found no upstream thread on
+backup/restore/versioning across eight search terms. More decisively, the
+design's central property — history living inside a privilege boundary,
+outside every caller's trust domain — has no counterpart upstream, which has
+no privileged broker at all. There is no shape here to contribute without
+first contributing the boundary.
+
+Revisit only if upstream settles a provider `delete`/versioning surface
+(the PR #354 lineage), which would give the storage half somewhere to land.
+
+## Implementation plan
+
+Ordered so that each step is independently shippable and the two incidental
+gaps are closed early, where they are cheap.
+
+1. **Wrap `source-undeclare` in `Mutation`** (`broker.rs:529`). One-line
+   `matches!` change plus a test; independent of everything below.
+2. **`history.rs`**: schema, chained append, `history-verify`. Modelled
+   directly on `audit.rs`'s chain code, which is already tested against
+   tampering.
+3. **Divert `Mutation::commit`** from `remove_file` to an archiving append.
+   `restore()` keeps deleting, since a rolled-back mutation is state that
+   never took effect. This is the point at which history starts accruing.
+4. **`history` verb**, agent-callable, values never printed.
+5. **`restore`**, forward-safe path first, then `--force` and `--all` behind
+   the separate sudoers verb.
+6. **`destroy`**, with the tombstone write and the retained-digest property
+   verified by `history-verify` over destroyed rows.
+7. **`doctor`** history size/count line.
+8. **Docs**: `sudo-secretspec/README.md`, `AI-GUIDANCE.md`,
+   `skills/sudo-secretspec/SKILL.md`, and the stated scope limit in each.
+
+Steps 1–3 alone deliver the incident's actual lesson: after them, the bytes
+exist. Steps 4–6 are what make them reachable without a database client.
