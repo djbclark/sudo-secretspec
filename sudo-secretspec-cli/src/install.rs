@@ -649,7 +649,9 @@ fn config_toml(req: &InstallRequest, vault_real: &Path) -> String {
         adopted = req.adopt_existing,
     );
     if req.declarations.is_some() {
-        out.push_str(&format!("declarations = \"{PREFIX}/share/sudo-secretspec/secretspec.toml\"\n"));
+        out.push_str(&format!(
+            "declarations = \"{PREFIX}/share/sudo-secretspec/secretspec.toml\"\n"
+        ));
     }
     out
 }
@@ -1032,8 +1034,18 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     let root_owner = "root:wheel";
     let service_owner = format!("{}:{}", req.service_user, req.service_group);
 
-    install_file(&media.broker, &client_dst, require_mode(&client_dst)?, root_owner)?;
-    install_file(&media.broker, &broker_dst, require_mode(&broker_dst)?, &service_owner)?;
+    install_file(
+        &media.broker,
+        &client_dst,
+        require_mode(&client_dst)?,
+        root_owner,
+    )?;
+    install_file(
+        &media.broker,
+        &broker_dst,
+        require_mode(&broker_dst)?,
+        &service_owner,
+    )?;
     if let Some(decl) = &req.declarations {
         install_file(
             decl,
@@ -1042,8 +1054,18 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
             &service_owner,
         )?;
     }
-    install_file(&media.retired, &retired_dst, require_mode(&retired_dst)?, &service_owner)?;
-    install_file(&media.guidance, &guidance_dst, require_mode(&guidance_dst)?, &service_owner)?;
+    install_file(
+        &media.retired,
+        &retired_dst,
+        require_mode(&retired_dst)?,
+        &service_owner,
+    )?;
+    install_file(
+        &media.guidance,
+        &guidance_dst,
+        require_mode(&guidance_dst)?,
+        &service_owner,
+    )?;
     write_bytes(
         &config_dst,
         config_toml(&req, &vault_real).as_bytes(),

@@ -842,28 +842,27 @@ fn lifecycle(op: &str, name: &str, reason: &str) {
 fn lifecycle_restore(name: Option<String>, to: &str, force: bool, all: bool, reason: &str) {
     let mut cmd = Command::new(SUDO);
     cmd.arg("-u").arg(get_service_user());
-    
+
     // Non-forced specific restore is allowed for agents, others require operator sudo
     if !force && !all {
         cmd.arg("-n");
     }
-    
-    cmd.arg(privileged_broker())
-        .arg("__broker");
-        
+
+    cmd.arg(privileged_broker()).arg("__broker");
+
     if force {
         cmd.arg("source-restore-force");
     } else {
         cmd.arg("source-restore");
     }
-    
+
     cmd.arg("--client")
         .arg(detect_client())
         .arg("--reason-sha256")
         .arg(reason_digest_or_exit(reason))
         .arg("--to")
         .arg(to);
-        
+
     if let Some(n) = name {
         cmd.arg("--name").arg(n);
     }
@@ -873,7 +872,7 @@ fn lifecycle_restore(name: Option<String>, to: &str, force: bool, all: bool, rea
     if all {
         cmd.arg("--all");
     }
-    
+
     let status = cmd.status().unwrap_or_else(|e| {
         eprintln!("cannot invoke broker: {e}");
         std::process::exit(2);
@@ -896,7 +895,7 @@ fn lifecycle_destroy(name: &str, reason: &str) {
         .arg(reason_digest_or_exit(reason))
         .arg("--name")
         .arg(name);
-        
+
     let status = cmd.status().unwrap_or_else(|e| {
         eprintln!("cannot invoke broker: {e}");
         std::process::exit(2);

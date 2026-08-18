@@ -422,8 +422,13 @@ pub const SOURCE_OPS: &[&str] = &[
 pub fn mutates_vault(operation: &str) -> bool {
     matches!(
         operation,
-        "source-set" | "source-add" | "source-undeclare" | "source-delete"
-            | "source-restore" | "source-restore-force" | "source-destroy"
+        "source-set"
+            | "source-add"
+            | "source-undeclare"
+            | "source-delete"
+            | "source-restore"
+            | "source-restore-force"
+            | "source-destroy"
     )
 }
 
@@ -1005,7 +1010,7 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
         },
         "source-restore" | "source-restore-force" | "source-destroy" => {
             let op = broker.operation.as_str();
-            
+
             let db_path = cfg.vault.join("secrets.db");
             let conn = match rusqlite::Connection::open(&db_path) {
                 Ok(c) => c,
@@ -1014,7 +1019,7 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                     return (2, vec![]);
                 }
             };
-            
+
             if op == "source-destroy" {
                 let name = match broker.name.as_deref() {
                     Some(n) => n,
@@ -1023,16 +1028,18 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                         return (2, vec![]);
                     }
                 };
-                
+
                 // First delete from active secrets, which will capture a new history entry
                 if let Err(e) = secrets.delete(name) {
                     eprintln!("broker: {e}");
                     return (1, vec![name.into()]);
                 }
-                
+
                 // The new sequence just created by delete
-                let seq: i64 = conn.query_row("SELECT MAX(sequence) FROM entries", [], |row| row.get(0)).unwrap_or(0);
-                
+                let seq: i64 = conn
+                    .query_row("SELECT MAX(sequence) FROM entries", [], |row| row.get(0))
+                    .unwrap_or(0);
+
                 if let Err(e) = conn.execute(
                     "UPDATE captured_values SET value_blob = NULL, destroyed_by = ?1 WHERE item = ?2 AND value_blob IS NOT NULL",
                     rusqlite::params![seq, name],
@@ -1040,7 +1047,7 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                     eprintln!("broker: cannot update history tombstones: {e}");
                     return (2, vec![name.into()]);
                 }
-                
+
                 println!("destroyed {}", name);
                 (0, vec![name.into()])
             } else {
@@ -1058,7 +1065,7 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                         return (2, vec![]);
                     }
                 };
-                
+
                 let mut items_to_restore = Vec::new();
                 if broker.all {
                     let mut stmt = match conn.prepare("SELECT item, value_blob FROM captured_values WHERE sequence = ?1 AND value_blob IS NOT NULL") {
@@ -1068,7 +1075,10 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                             return (2, vec![]);
                         }
                     };
-                    let rows: Result<Vec<(String, Vec<u8>)>, _> = stmt.query_map(rusqlite::params![seq], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().collect();
+                    let rows: Result<Vec<(String, Vec<u8>)>, _> = stmt
+                        .query_map(rusqlite::params![seq], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .unwrap()
+                        .collect();
                     for (item, blob) in rows.unwrap_or_default() {
                         let val_str = String::from_utf8(blob).unwrap_or_default();
                         items_to_restore.push((item, val_str));
@@ -1081,35 +1091,51 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                             return (2, vec![n.into()]);
                         }
                     };
-                    let blob_opt: Option<Vec<u8>> = stmt.query_row(rusqlite::params![seq, n], |row| row.get(0)).ok();
+                    let blob_opt: Option<Vec<u8>> = stmt
+                        .query_row(rusqlite::params![seq, n], |row| row.get(0))
+                        .ok();
                     if let Some(blob) = blob_opt {
                         let val_str = String::from_utf8(blob).unwrap_or_default();
                         items_to_restore.push((n.to_string(), val_str));
                     } else {
-                        eprintln!("broker: sequence {} does not contain a value for {}", seq, n);
+                        eprintln!(
+                            "broker: sequence {} does not contain a value for {}",
+                            seq, n
+                        );
                         return (1, vec![n.into()]);
                     }
                 } else {
                     eprintln!("broker: restore requires either --name or --all");
                     return (2, vec![]);
                 }
-                
+
                 if items_to_restore.is_empty() {
                     eprintln!("broker: nothing to restore");
                     return (1, vec![]);
                 }
-                
+
                 if op == "source-restore" {
                     for (n, _) in &items_to_restore {
-                        if let Ok(secretspec::NamedResolution::Resolved(secret)) = secrets.resolve_named(n) {
+                        if let Ok(secretspec::NamedResolution::Resolved(secret)) =
+                            secrets.resolve_named(n)
+                        {
                             if secret.value.is_some() {
-                                eprintln!("broker: {} still holds a value; cannot restore without --force", n);
-                                return (1, items_to_restore.into_iter().map(|(name, _)| name.into()).collect());
+                                eprintln!(
+                                    "broker: {} still holds a value; cannot restore without --force",
+                                    n
+                                );
+                                return (
+                                    1,
+                                    items_to_restore
+                                        .into_iter()
+                                        .map(|(name, _)| name.into())
+                                        .collect(),
+                                );
                             }
                         }
                     }
                 }
-                
+
                 let mut restored_names = Vec::new();
                 for (n, val) in items_to_restore {
                     if let Err(e) = secrets.set(&n, Some(val)) {
@@ -1118,10 +1144,10 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                     }
                     restored_names.push(n.into());
                 }
-                
+
                 (0, restored_names)
             }
-        },
+        }
         // `no_prompt: true`. With prompting enabled this reports missing
         // secrets by dropping into the engine's interactive value-entry flow --
         // inside a root process that has no usable terminal, reading from
@@ -1475,11 +1501,7 @@ PROD_ONLY = { description = "production-only token", required = true }
         let vault = temp_vault();
         // A dotenv with a comment does not round-trip through the renderer, so
         // `history::capture` refuses it.
-        let mut mutation = staged_mutation(
-            vault.path(),
-            b"[project]\nname = \"f\"\n",
-            b"A=1\n",
-        ).0;
+        let mut mutation = staged_mutation(vault.path(), b"[project]\nname = \"f\"\n", b"A=1\n").0;
         mutation.operation = "invalid_op!".to_string();
 
         mutation.commit();

@@ -72,7 +72,9 @@ fn layout_holds_all_config_values() {
     assert_eq!(layout.service_group, "_sudo_secretspec");
     assert_eq!(
         layout.declarations,
-        Some(PathBuf::from("/usr/local/share/sudo-secretspec/secretspec.toml"))
+        Some(PathBuf::from(
+            "/usr/local/share/sudo-secretspec/secretspec.toml"
+        ))
     );
     assert_eq!(
         layout.audit,

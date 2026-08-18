@@ -801,10 +801,7 @@ pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
     check_ancestor_chain(&layout.config, &mut findings);
 
     // Installed binaries / shared assets.
-    let root_artifacts = vec![
-        (&layout.client, 0o755),
-        (&layout.sudoers, 0o440),
-    ];
+    let root_artifacts = vec![(&layout.client, 0o755), (&layout.sudoers, 0o440)];
     let mut service_artifacts = vec![
         (&layout.broker, 0o755),
         (&layout.engine, 0o755),

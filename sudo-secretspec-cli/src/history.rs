@@ -304,7 +304,7 @@ pub fn list(
     // Note: The `name` parameter is preserved for API compatibility,
     // but the backend no longer tracks value names.
     let _ = name;
-    
+
     if !directory.join(DB_NAME).exists() {
         audit::require_protected_dir(directory, expected_uid)?;
         return Ok(Vec::new());
