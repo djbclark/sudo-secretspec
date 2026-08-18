@@ -153,7 +153,7 @@ fn a_valid_policy_stages_without_touching_the_live_path() {
 fn the_shipped_policy_parses_and_gates_boundary_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
     let dst = dir.path().join("sudo-secretspec");
-    let policy = sudo_secretspec_cli::install::sudoers_text("someoperator");
+    let policy = sudo_secretspec_cli::install::sudoers_text("someoperator", "_sudo_secretspec");
 
     sudo_secretspec_cli::install::stage_sudoers(&dst, &policy, 0o440)
         .expect("visudo should accept the policy we ship");
