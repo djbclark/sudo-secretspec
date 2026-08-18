@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The privileged broker no longer requires `root` execution for mutation operations (`set`, `add`, `delete`, `undeclare`, etc.). These operations now execute securely as the dedicated `service_user` via `sudo -u`, dropping all incidental root privileges and strictly restricting the broker to the ownership bounds of its own vault directory.
+- `sudo-secretspec` sudoers policy generation updated to bind operator mutations exactly to `({service_user})` instead of `(root)`.
+
 ### Added
 
 - **SQLite provider** (`sqlite://`, 0.20+): stores each secret as one row in a
