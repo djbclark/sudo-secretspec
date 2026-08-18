@@ -855,6 +855,7 @@ entry declares neither, it inherits whichever form `[profiles.default]` uses.
 | [keyring](/providers/keyring/#use-existing-secrets) | Service | Account (defaults to the current system username) | Current user's entry | ✅ |
 | [dotenv](/providers/dotenv/#use-existing-secrets) | `.env` key | Rejected | Reads the key | ✅ |
 | [file (0.19+)](/providers/file/#use-existing-files) | Relative file path beneath the configured root | Rejected | Reads the complete UTF-8 file | ✅ |
+| [sqlite (0.20+)](/providers/sqlite/#use-existing-secrets) | Primary key in the `secrets` table | Rejected | Reads the value | ✅ |
 | [env](/providers/env/#use-existing-secrets) | Variable name | Rejected | Reads the variable | — (read-only) |
 | [systemd credentials (0.17+)](/providers/systemd-credential/#use-an-existing-credential-name) | Credential filename | Rejected | Reads the credential | — (read-only) |
 | [Fly.io secrets (0.20+)](/providers/fly/#use-existing-secrets) | Fly app secret name | Rejected | Error: Fly.io does not expose plaintext values | ✅ write-only via `flyctl secrets set` |
