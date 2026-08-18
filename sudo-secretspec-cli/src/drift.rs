@@ -37,7 +37,7 @@ pub struct Layout {
     pub vault_realpath: PathBuf,
     pub service_user: String,
     pub service_group: String,
-    pub declarations: PathBuf,
+    pub declarations: Option<PathBuf>,
     pub engine: PathBuf,
     pub audit: PathBuf,
     pub broker: PathBuf,
@@ -795,16 +795,19 @@ pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
     check_ancestor_chain(&layout.config, &mut findings);
 
     // Installed binaries / shared assets.
-    for (path, mode) in [
+    let mut artifacts = vec![
         (&layout.client, 0o755),
         (&layout.broker, 0o755),
         (&layout.engine, 0o755),
         (&layout.retired, 0o444),
         (&layout.guidance, 0o444),
-        (&layout.declarations, 0o444),
         (&layout.source_manifest, 0o444),
         (&layout.sudoers, 0o440),
-    ] {
+    ];
+    if let Some(decl) = &layout.declarations {
+        artifacts.push((decl, 0o444));
+    }
+    for (path, mode) in artifacts {
         check_protected_file(path, "root", "wheel", mode, &mut findings);
         check_ancestor_chain(path, &mut findings);
     }
@@ -1145,7 +1148,7 @@ service_group = "_sudo_secretspec"
             vault_realpath: vault.clone(),
             service_user: owner_name(unsafe { libc::getuid() }),
             service_group: group_name(unsafe { libc::getgid() }),
-            declarations: tmp.path().join("decl.toml"),
+            declarations: Some(tmp.path().join("decl.toml")),
             engine: tmp.path().join("engine"),
             audit: tmp.path().join("audit"),
             broker: tmp.path().join("broker"),
@@ -1178,7 +1181,7 @@ service_group = "_sudo_secretspec"
             vault_realpath: vault.to_path_buf(),
             service_user: owner_name(unsafe { libc::getuid() }),
             service_group: group_name(unsafe { libc::getgid() }),
-            declarations: tmp.join("decl.toml"),
+            declarations: Some(tmp.join("decl.toml")),
             engine: tmp.join("engine"),
             audit: tmp.join("audit"),
             broker: tmp.join("broker"),
@@ -1681,7 +1684,7 @@ service_group = "_sudo_secretspec"
             vault_realpath: root.join("vault"),
             service_user: owner_name(unsafe { libc::getuid() }),
             service_group: group_name(unsafe { libc::getgid() }),
-            declarations: root.join("decl.toml"),
+            declarations: Some(root.join("decl.toml")),
             engine: root.join("engine"),
             audit: root.join("audit"),
             broker: root.join("broker"),

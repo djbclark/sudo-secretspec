@@ -414,60 +414,52 @@ fn prompt_yes_no(label: &str, default_yes: bool) -> bool {
     }
 }
 
-fn declaration_candidates() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(env) = std::env::var("SUDO_SECRETSPEC_DECLARATIONS") {
-        out.push(PathBuf::from(env));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        out.push(PathBuf::from(home).join("ops/site-private/secretspec.toml.example"));
-    }
-    out.push(PathBuf::from(
-        "/usr/local/share/sudo-secretspec/secretspec.toml",
-    ));
-    // Common worktree layout relative to cwd.
-    out.push(PathBuf::from("site-private/secretspec.toml.example"));
-    out.push(PathBuf::from("../site-private/secretspec.toml.example"));
-    out
-}
-
 fn resolve_declarations(
-    explicit: Option<PathBuf>,
+    declarations: Option<PathBuf>,
     non_interactive: bool,
-) -> Result<PathBuf, String> {
-    if let Some(path) = explicit {
-        if path.is_file() && !path.is_symlink() {
-            return Ok(path);
+) -> Result<Option<PathBuf>, String> {
+    if let Some(p) = declarations {
+        if p.is_file() && !p.is_symlink() {
+            return Ok(Some(p));
+        } else {
+            return Err(format!("declarations not found: {}", p.display()));
         }
-        return Err(format!(
-            "declarations not found or not a regular file: {}",
-            path.display()
-        ));
     }
-    for cand in declaration_candidates() {
+    if let Ok(p) = std::env::var("SUDO_SECRETSPEC_DECLARATIONS") {
+        let p = PathBuf::from(p);
+        if p.is_file() && !p.is_symlink() {
+            return Ok(Some(p));
+        } else {
+            return Err(format!("declarations not found: {}", p.display()));
+        }
+    }
+    let pwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    for name in ["secretspec.toml", "secrets.toml"] {
+        let cand = pwd.join(name);
         if cand.is_file() && !cand.is_symlink() {
             if !non_interactive && is_tty() {
                 if prompt_yes_no(&format!("Use declarations at {}?", cand.display()), true) {
-                    return Ok(cand);
+                    return Ok(Some(cand));
                 }
             } else {
-                return Ok(cand);
+                return Ok(Some(cand));
             }
         }
     }
     if non_interactive || !is_tty() {
-        return Err(
-            "declarations required; pass --declarations PATH or set SUDO_SECRETSPEC_DECLARATIONS"
-                .into(),
-        );
+        return Ok(None);
     }
-    let typed = prompt_line("Path to declarations TOML", None)
-        .ok_or_else(|| "declarations path required".to_string())?;
-    let path = PathBuf::from(typed);
-    if path.is_file() && !path.is_symlink() {
-        Ok(path)
-    } else {
-        Err(format!("declarations not found: {}", path.display()))
+    let typed = prompt_line("Path to declarations TOML (leave blank to skip)", None);
+    match typed {
+        Some(t) if !t.trim().is_empty() => {
+            let path = PathBuf::from(t);
+            if path.is_file() && !path.is_symlink() {
+                Ok(Some(path))
+            } else {
+                Err(format!("declarations not found: {}", path.display()))
+            }
+        }
+        _ => Ok(None),
     }
 }
 
@@ -579,11 +571,12 @@ fn run_install(
 
     // Install itself needs interactive sudo/Touch ID, not NOPASSWD -n.
     if unsafe { libc::geteuid() } != 0 {
-        let status = Command::new(SUDO)
-            .arg(self_exe())
-            .arg("install")
-            .arg("--declarations")
-            .arg(&req.declarations)
+        let mut cmd = Command::new(SUDO);
+        cmd.arg(self_exe()).arg("install");
+        if let Some(decl) = &req.declarations {
+            cmd.arg("--declarations").arg(decl);
+        }
+        let status = cmd
             .args(if req.dry_run {
                 vec!["--dry-run"]
             } else {

@@ -885,7 +885,14 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
         //    a secret on disk that no longer appears in `check`. `delete`
         //    first, then undeclare; that mirrors `add` then `set`.
         "source-undeclare" => {
-            let template = match std::fs::read_to_string(&cfg.declarations) {
+            let declarations_path = match &cfg.declarations {
+                Some(p) => p,
+                None => {
+                    eprintln!("broker: config provides no declarations file");
+                    return (2, vec![name.into()]);
+                }
+            };
+            let template = match std::fs::read_to_string(declarations_path) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("broker: cannot read declaration template: {e}");
@@ -999,7 +1006,13 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
             }
         }
         "source-template-check" => {
-            let declarations = &cfg.declarations;
+            let declarations = match &cfg.declarations {
+                Some(p) => p,
+                None => {
+                    eprintln!("broker: config provides no declarations file");
+                    return (2, vec![]);
+                }
+            };
             if !declarations.is_file() || declarations.is_symlink() {
                 eprintln!("broker: declaration template missing or symlinked");
                 return (2, vec![]);

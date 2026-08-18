@@ -55,7 +55,7 @@ pub enum InstallError {
 
 #[derive(Debug, Clone)]
 pub struct InstallRequest {
-    pub declarations: PathBuf,
+    pub declarations: Option<PathBuf>,
     pub dry_run: bool,
     pub adopt_existing: bool,
     pub vault: PathBuf,
@@ -69,7 +69,7 @@ pub struct InstallRequest {
 }
 
 impl InstallRequest {
-    pub fn from_cli(declarations: PathBuf, dry_run: bool, adopt_existing: bool) -> Self {
+    pub fn from_cli(declarations: Option<PathBuf>, dry_run: bool, adopt_existing: bool) -> Self {
         let operator = std::env::var("SUDO_USER")
             .or_else(|_| std::env::var("USER"))
             .unwrap_or_else(|_| "root".into());
@@ -628,12 +628,11 @@ fn validate_protected_ancestors() -> Result<(), InstallError> {
 }
 
 fn config_toml(req: &InstallRequest, vault_real: &Path) -> String {
-    format!(
+    let mut out = format!(
         "engine = \"{prefix}/libexec/sudo-secretspec\"\n\
          audit_helper = \"{prefix}/libexec/sudo-secretspec\"\n\
          vault = \"{vault}\"\n\
          vault_realpath = \"{vault_real}\"\n\
-         declarations = \"{prefix}/share/sudo-secretspec/secretspec.toml\"\n\
          service_user = \"{user}\"\n\
          service_group = \"{group}\"\n\
          profile = \"{profile}\"\n\
@@ -647,7 +646,11 @@ fn config_toml(req: &InstallRequest, vault_real: &Path) -> String {
         profile = req.profile,
         version = VERSION,
         adopted = req.adopt_existing,
-    )
+    );
+    if req.declarations.is_some() {
+        out.push_str(&format!("declarations = \"{PREFIX}/share/sudo-secretspec/secretspec.toml\"\n"));
+    }
+    out
 }
 
 /// Files the installer copies from the distribution media.
@@ -832,10 +835,12 @@ pub fn sudoers_text(operator: &str) -> String {
 /// Run the installer. Returns Ok(()) on success.
 pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     require_root()?;
-    if !req.declarations.is_file() || req.declarations.is_symlink() {
-        return Err(InstallError::Denied(
-            "declarations must be a regular file".into(),
-        ));
+    if let Some(decl) = &req.declarations {
+        if !decl.is_file() || decl.is_symlink() {
+            return Err(InstallError::Denied(
+                "declarations must be a regular file".into(),
+            ));
+        }
     }
     validate_protected_ancestors()?;
 
@@ -852,6 +857,12 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     )?;
     let previous_version = installed_version(Path::new(CONFIG_PATH));
 
+    if !req.adopt_existing && req.declarations.is_none() {
+        return Err(InstallError::Denied(
+            "a declarations file is required for a fresh install".into(),
+        ));
+    }
+
     // Refuse a fresh install onto an existing boundary, on the LIVE path as well
     // as the rehearsal. This guard used to sit inside the `req.dry_run` block
     // below, so `--dry-run` refused exactly what the real run went on to do: the
@@ -867,7 +878,7 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
                 .map(|s| s.success())
                 .unwrap_or(false))
     {
-        return Err(fresh_install_refusal(&req.declarations));
+        return Err(fresh_install_refusal(req.declarations.as_deref()));
     }
 
     if req.dry_run {
@@ -1008,11 +1019,13 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
 
     install_file(&media.broker, &client_dst, require_mode(&client_dst)?)?;
     install_file(&media.broker, &broker_dst, require_mode(&broker_dst)?)?;
-    install_file(
-        &req.declarations,
-        &declarations_dst,
-        require_mode(&declarations_dst)?,
-    )?;
+    if let Some(decl) = &req.declarations {
+        install_file(
+            decl,
+            &declarations_dst,
+            require_mode(&declarations_dst)?,
+        )?;
+    }
     install_file(&media.retired, &retired_dst, require_mode(&retired_dst)?)?;
     install_file(&media.guidance, &guidance_dst, require_mode(&guidance_dst)?)?;
     write_bytes(
@@ -1031,15 +1044,18 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
 
     // Release manifest of installed artifacts.
     let mut manifest = String::new();
-    for path in [
+    let mut artifacts = vec![
         &client_dst,
         &broker_dst,
-        &declarations_dst,
         &retired_dst,
         &guidance_dst,
         &config_dst,
         &sudoers_dst,
-    ] {
+    ];
+    if req.declarations.is_some() {
+        artifacts.push(&declarations_dst);
+    }
+    for path in artifacts {
         manifest.push_str(&format!("{}  {}\n", sha256_file(path)?, path.display()));
     }
     write_bytes(
@@ -1133,12 +1149,21 @@ pub struct ExistingVault {
 /// It names the command that works rather than only the flag that is missing.
 /// The failure mode this guard invites is a script or an operator "fixing" the
 /// refusal by removing the obstacle -- deleting the vault so that a fresh
-/// install succeeds -- which is precisely the data loss it exists to prevent.
-fn fresh_install_refusal(declarations: &Path) -> InstallError {
+/// install succeeds.
+fn fresh_install_refusal(declarations: Option<&Path>) -> InstallError {
+    let decl_arg = match declarations {
+        Some(d) => format!(" --declarations {}", d.display()),
+        None => "".into(),
+    };
     InstallError::Denied(format!(
-        "fresh-install identity or vault already exists; to adopt it, run:\n  \
-         sudo-secretspec install --declarations {} --adopt-existing",
-        declarations.display(),
+        "refusing to install over existing service identity/vault\n\
+         \n\
+         The service identity or vault path already exists. A fresh install\n\
+         would destroy any stored secrets. If you intend to take over an\n\
+         existing installation, use `--adopt-existing`:\n\
+         \n\
+         sudo-secretspec install{} --adopt-existing",
+        decl_arg
     ))
 }
 
@@ -1483,7 +1508,7 @@ mod tests {
     fn the_installed_version_is_read_back_from_the_config_it_wrote() {
         let tmp = tempfile::tempdir().unwrap();
         let config = tmp.path().join("sudo-secretspec.toml");
-        let req = InstallRequest::from_cli(PathBuf::from("/dev/null"), false, false);
+        let req = InstallRequest::from_cli(Some(PathBuf::from("/dev/null")), false, false);
         fs::write(
             &config,
             config_toml(&req, Path::new("/private/var/db/sudo-secretspec")),
@@ -1698,7 +1723,7 @@ adopted_vault = true
         // obstacle go away" -- deleting the vault so a fresh install succeeds.
         // Handing back the command that works is what makes that unnecessary,
         // so the text is asserted rather than left to drift.
-        let text = fresh_install_refusal(Path::new("/tmp/decl.toml")).to_string();
+        let text = fresh_install_refusal(Some(Path::new("/tmp/decl.toml"))).to_string();
         assert!(text.contains("--adopt-existing"), "{text}");
         assert!(text.contains("/tmp/decl.toml"), "{text}");
         assert!(

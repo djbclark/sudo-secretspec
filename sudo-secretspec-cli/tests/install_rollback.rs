@@ -4,7 +4,7 @@ use sudo_secretspec_cli::install::InstallRequest;
 
 #[test]
 fn install_request_defaults_are_generic() {
-    let req = InstallRequest::from_cli(PathBuf::from("/tmp/decl.toml"), true, false);
+    let req = InstallRequest::from_cli(Some(PathBuf::from("/tmp/decl.toml")), true, false);
     assert_eq!(req.vault, PathBuf::from("/var/db/sudo-secretspec"));
     assert_eq!(req.service_user, "_sudo_secretspec");
     assert_eq!(req.service_group, "_sudo_secretspec");
