@@ -514,21 +514,25 @@ fn purge_ambient_env() {
     // Clearing `XDG_CONFIG_HOME` is not enough on its own: the engine resolves
     // its user-global config through etcetera's XDG strategy, which falls back
     // to `$HOME/.config`, and `sudo` on this platform hands the *caller's*
-    // `HOME` to the broker. Left alone, a root process reads a config file an
-    // unprivileged caller can write — one whose `[audit] path` aims a root
-    // writer at any absolute path, and whose `[defaults] profile` picks which
-    // profile of the protected manifest resolves. Root's own home is the only
-    // one inside the boundary.
+    // `HOME` to the broker. Left alone, the broker reads a config file an
+    // unprivileged caller can write — one whose `[audit] path` aims a
+    // privileged writer at any absolute path, and whose `[defaults] profile`
+    // picks which profile of the protected manifest resolves.
+    //
+    // Point HOME at the service user's passwd-entry home (`/var/empty`).
+    // `/var/empty` is world-readable (`0755 root:sys`) so the engine's
+    // `GlobalConfig::load()` can safely `try_exists()` on the derived config
+    // path without hitting Permission Denied. The previous `/var/root` was
+    // `0750 root:wheel`, which `_sudo_secretspec` cannot traverse.
     //
     // `set` rather than `remove`: with `HOME` unset, etcetera falls back to
-    // `getpwuid(0)`, which is `/var/root` here anyway — but if that directory
-    // lookup ever failed, `GlobalConfig::load()` would error and fail the
-    // broker closed on a healthy system. An explicit value makes the resolved
-    // path a constant rather than a directory-service round trip.
+    // `getpwuid(getuid())` — which is the correct `/var/empty` for the service
+    // user, but an explicit value avoids the directory-service round trip and
+    // keeps the resolved path a build-time constant.
     //
     // SAFETY: single-threaded broker process; no concurrent env readers.
     unsafe {
-        std::env::set_var("HOME", "/var/root");
+        std::env::set_var("HOME", "/var/empty");
     }
 }
 
