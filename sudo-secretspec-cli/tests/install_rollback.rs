@@ -167,7 +167,7 @@ fn the_shipped_policy_parses_and_gates_boundary_lifecycle() {
     // The broker stays NOPASSWD: mediated credential operations are the
     // autonomous path, and making them prompt would wedge every agent.
     assert!(
-        policy.contains("NOPASSWD: /usr/local/libexec/sudo-secretspec __broker *\n"),
+        policy.contains("NOPASSWD: /usr/local/libexec/sudo-secretspec __broker source-set --*\n"),
         "{policy}"
     );
     // Boundary lifecycle must never be granted without authentication. The
