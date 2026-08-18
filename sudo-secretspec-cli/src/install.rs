@@ -836,8 +836,8 @@ pub fn sudoers_text(operator: &str, service_user: &str) -> String {
          {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-schema --*\n\
          {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker audit-verify\n\
          {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-restore --*\n\
-         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec doctor\n\
-         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec doctor *\n",
+         {operator} ALL=(root) NOPASSWD: {prefix}/libexec/sudo-secretspec doctor\n\
+         {operator} ALL=(root) NOPASSWD: {prefix}/libexec/sudo-secretspec doctor *\n",
         prefix = PREFIX,
         operator = operator,
         service_user = service_user,

@@ -355,7 +355,7 @@ impl Mutation {
     fn commit(&self) {
         match self.archive() {
             Ok(()) => {
-                for suffix in ["toml", "env"] {
+                for suffix in ["toml", "db"] {
                     let _ = std::fs::remove_file(self.rollback_path(suffix));
                 }
             }
@@ -1423,13 +1423,13 @@ PROD_ONLY = { description = "production-only token", required = true }
         let mutation = Mutation {
             vault: vault.to_path_buf(),
             manifest: vault.join("secretspec.toml"),
-            dotenv: vault.join(".env"),
+            dotenv: vault.join("secrets.db"),
             transaction,
             operation: "source-set".into(),
             service_uid: std::fs::metadata(vault).unwrap().uid(),
         };
         std::fs::write(mutation.rollback_path("toml"), manifest).unwrap();
-        std::fs::write(mutation.rollback_path("env"), dotenv).unwrap();
+        std::fs::write(mutation.rollback_path("db"), dotenv).unwrap();
         (mutation, transaction)
     }
 
@@ -1453,7 +1453,7 @@ PROD_ONLY = { description = "production-only token", required = true }
         let result = crate::history::verify(vault.path(), None).unwrap();
         assert_eq!(result.entries, 1, "the pre-mutation state must be archived");
         assert!(
-            !mutation.rollback_path("toml").exists() && !mutation.rollback_path("env").exists(),
+            !mutation.rollback_path("toml").exists() && !mutation.rollback_path("db").exists(),
             "archived copies must not be left behind as well"
         );
         // The history entry joins to the ledger on the transaction uuid, which
@@ -1486,7 +1486,7 @@ PROD_ONLY = { description = "production-only token", required = true }
             "a refused capture must store nothing"
         );
         assert!(
-            mutation.rollback_path("toml").exists() && mutation.rollback_path("env").exists(),
+            mutation.rollback_path("toml").exists() && mutation.rollback_path("db").exists(),
             "the prior state must survive an archive failure"
         );
     }
@@ -1498,7 +1498,7 @@ PROD_ONLY = { description = "production-only token", required = true }
         // history with entries identical to the state beside them.
         let vault = temp_vault();
         std::fs::write(vault.path().join("secretspec.toml"), b"live").unwrap();
-        std::fs::write(vault.path().join(".env"), b"live").unwrap();
+        std::fs::write(vault.path().join("secrets.db"), b"live").unwrap();
         let (mutation, _) = staged_mutation(vault.path(), b"[project]\nname = \"f\"\n", b"A=1\n");
 
         assert!(mutation.restore());
@@ -1534,7 +1534,10 @@ PROD_ONLY = { description = "production-only token", required = true }
                 "source-set",
                 "source-add",
                 "source-undeclare",
-                "source-delete"
+                "source-delete",
+                "source-restore",
+                "source-restore-force",
+                "source-destroy",
             ]
         );
     }

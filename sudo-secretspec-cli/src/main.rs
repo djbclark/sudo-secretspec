@@ -1040,14 +1040,6 @@ fn doctor(
         let broker = privileged_broker();
         let elevated = |with_hints: bool| {
             let mut cmd = Command::new(SUDO);
-            let user = if let Some(cfg_path) = &config {
-                sudo_secretspec_cli::load_config(cfg_path)
-                    .map(|l| l.service_user)
-                    .unwrap_or_else(|_| "_sudo_secretspec".to_string())
-            } else {
-                get_service_user()
-            };
-            cmd.arg("-u").arg(user);
             cmd.arg("-n").arg(&broker).arg("doctor");
             if json {
                 cmd.arg("--json");
