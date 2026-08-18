@@ -949,6 +949,10 @@ pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
         "secrets.db-wal",
         "secrets.db-shm",
         "secrets.db-journal",
+        // The engine's JSONL audit sink, pointed here by the broker because the
+        // vault is the only directory the service user owns. See the
+        // `XDG_STATE_HOME` note in `broker::execute`.
+        ".state",
     ];
     if let Ok(entries) = fs::read_dir(&layout.vault) {
         for entry in entries.flatten() {

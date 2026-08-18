@@ -194,12 +194,34 @@ fn require_boundary(cfg: &Config) -> Result<u32, i32> {
         }
     }
 
-    for name in ["secretspec.toml", ".env"] {
+    // `secretspec.toml` is required: the boundary cannot resolve anything
+    // without a manifest. The value store and the retired dotenv are checked
+    // *if present* instead.
+    //
+    // `secrets.db` is created lazily by the provider on its first write, so a
+    // freshly installed vault legitimately has none — requiring it would refuse
+    // every operation on a new install, including the `set` that would create
+    // it. Its absence means "no values yet", which `check` reports on its own.
+    //
+    // `.env` is vestigial since values moved into `secrets.db`, but a leftover
+    // one is still worth refusing to run beside if it has been swapped for a
+    // symlink or re-owned. Listing it as required, as this loop did before the
+    // migration, meant deleting the file the boundary no longer reads would
+    // brick every broker call.
+    for (name, required) in [
+        ("secretspec.toml", true),
+        ("secrets.db", false),
+        (".env", false),
+    ] {
         let path = vault.join(name);
-        let meta = std::fs::symlink_metadata(&path).map_err(|e| {
-            eprintln!("broker: {name} unreadable: {e}");
-            2
-        })?;
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) if !required && e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                eprintln!("broker: {name} unreadable: {e}");
+                return Err(2);
+            }
+        };
         if meta.file_type().is_symlink() || !meta.is_file() {
             eprintln!("broker: {name} missing, symlinked, or not a regular file");
             return Err(2);
@@ -835,9 +857,33 @@ fn tracked_source_protects(
 fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>) {
     // The ambient environment was purged in `run` before dispatch; see
     // `purge_ambient_env`.
+
+    // The engine's JSONL audit sink defaults to the XDG state directory, which
+    // with `HOME=/var/empty` resolves under a directory nothing may write:
+    // every operation then warned "Operation not permitted" and dropped its
+    // event. The sink is not decorative here — it records the same reason
+    // digest as the SQLite ledger, which is what lets the two be joined.
+    //
+    // State it rather than deriving it. The vault is the only directory the
+    // service user owns, and the sink creates its own parent at 0700, so
+    // `<vault>/.state/secretspec/audit.log` needs no installer support. `drift`
+    // allows `.state` for exactly this reason; everything else in the vault
+    // stays on the strict allowlist.
+    //
+    // SAFETY: single-threaded broker process; no concurrent env readers.
+    unsafe {
+        std::env::set_var("XDG_STATE_HOME", cfg.vault.join(".state"));
+    }
+
     let manifest = cfg.vault.join("secretspec.toml");
     let db = cfg.vault.join("secrets.db");
-    let provider = format!("sqlite://{}", db.display());
+    // `?history=true` is not optional for the boundary, whatever it is for an
+    // ordinary user of the provider. `source-restore` reads `captured_values`
+    // and `source-destroy` tombstones it, so without retention the restore
+    // verbs have nothing to work from — and `destroy` in particular deletes the
+    // live value *before* it touches history, making an inert chain a silent
+    // path to irrecoverable loss rather than a missing feature.
+    let provider = format!("sqlite://{}?history=true", db.display());
     let secrets = match secretspec::Secrets::load_from(&manifest) {
         Ok(mut s) => {
             s.set_provider(provider);
@@ -1060,17 +1106,82 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                     return (1, vec![name.into()]);
                 }
 
-                // The new sequence just created by delete
-                let seq: i64 = conn
-                    .query_row("SELECT MAX(sequence) FROM entries", [], |row| row.get(0))
-                    .unwrap_or(0);
+                // The new sequence just created by delete. Not `unwrap_or(0)`:
+                // the value is already gone by this point, so failing to learn
+                // the sequence must be reported, not papered over with a
+                // sequence no entry has — which would write a tombstone
+                // pointing at nothing while reporting success.
+                let seq: i64 =
+                    match conn.query_row("SELECT MAX(sequence) FROM entries", [], |row| row.get(0))
+                    {
+                        Ok(seq) => seq,
+                        Err(e) => {
+                            eprintln!("broker: cannot determine the history sequence: {e}");
+                            return (2, vec![name.into()]);
+                        }
+                    };
 
-                if let Err(e) = conn.execute(
-                    "UPDATE captured_values SET value_blob = NULL, destroyed_by = ?1 WHERE item = ?2 AND value_blob IS NOT NULL",
-                    rusqlite::params![seq, name],
-                ) {
-                    eprintln!("broker: cannot update history tombstones: {e}");
-                    return (2, vec![name.into()]);
+                // `captured_values.item` holds the provider's full address
+                // (`{project}/{profile}/{key}`), not the bare secret name.
+                // Matching `item = name` therefore updated *zero* rows, so
+                // `destroy` reported success while every captured copy of the
+                // value stayed readable — the one outcome this verb exists to
+                // prevent. Resolve the addresses first, then tombstone each by
+                // its exact key.
+                let suffix = format!("/{name}");
+                let items: Vec<String> = {
+                    let mut stmt = match conn.prepare("SELECT DISTINCT item FROM captured_values") {
+                        Ok(stmt) => stmt,
+                        Err(e) => {
+                            eprintln!("broker: cannot enumerate history items: {e}");
+                            return (2, vec![name.into()]);
+                        }
+                    };
+                    let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            eprintln!("broker: cannot enumerate history items: {e}");
+                            return (2, vec![name.into()]);
+                        }
+                    };
+                    let mut items = Vec::new();
+                    for row in rows {
+                        match row {
+                            Ok(item) => items.push(item),
+                            Err(e) => {
+                                eprintln!("broker: cannot enumerate history items: {e}");
+                                return (2, vec![name.into()]);
+                            }
+                        }
+                    }
+                    items
+                };
+                let targets: Vec<&String> = items
+                    .iter()
+                    .filter(|item| item.as_str() == name || item.ends_with(&suffix))
+                    .collect();
+                if targets.is_empty() {
+                    eprintln!("broker: no captured history for {name}; nothing to tombstone");
+                    return (1, vec![name.into()]);
+                }
+
+                let mut tombstoned = 0usize;
+                for item in targets {
+                    match conn.execute(
+                        "UPDATE captured_values SET value_blob = NULL, destroyed_by = ?1 \
+                         WHERE item = ?2 AND value_blob IS NOT NULL",
+                        rusqlite::params![seq, item],
+                    ) {
+                        Ok(updated) => tombstoned += updated,
+                        Err(e) => {
+                            eprintln!("broker: cannot update history tombstones: {e}");
+                            return (2, vec![name.into()]);
+                        }
+                    }
+                }
+                if tombstoned == 0 {
+                    eprintln!("broker: no captured values remained to tombstone for {name}");
+                    return (1, vec![name.into()]);
                 }
 
                 println!("destroyed {}", name);
@@ -1100,13 +1211,38 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                             return (2, vec![]);
                         }
                     };
-                    let rows: Result<Vec<(String, Vec<u8>)>, _> = stmt
+                    let rows: Result<Vec<(String, Vec<u8>)>, _> = match stmt
                         .query_map(rusqlite::params![seq], |row| Ok((row.get(0)?, row.get(1)?)))
-                        .unwrap()
-                        .collect();
-                    for (item, blob) in rows.unwrap_or_default() {
-                        let val_str = String::from_utf8(blob).unwrap_or_default();
-                        items_to_restore.push((item, val_str));
+                    {
+                        Ok(rows) => rows.collect(),
+                        Err(e) => {
+                            eprintln!("broker: cannot read captured values: {e}");
+                            return (2, vec![]);
+                        }
+                    };
+                    let rows = match rows {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            eprintln!("broker: cannot read captured values: {e}");
+                            return (2, vec![]);
+                        }
+                    };
+                    for (item, blob) in rows {
+                        // Refused, not lossily replaced. `unwrap_or_default`
+                        // here turned an unreadable blob into the empty string,
+                        // so a restore would overwrite a live secret with "" and
+                        // report success — a silent value loss dressed as a
+                        // recovery.
+                        match String::from_utf8(blob) {
+                            Ok(val_str) => items_to_restore.push((item, val_str)),
+                            Err(_) => {
+                                eprintln!(
+                                    "broker: captured value for {item} at sequence {seq} is not \
+                                     valid UTF-8; refusing to restore it"
+                                );
+                                return (2, vec![item]);
+                            }
+                        }
                     }
                 } else if let Some(n) = broker.name.as_deref() {
                     let mut stmt = match conn.prepare("SELECT value_blob FROM captured_values WHERE sequence = ?1 AND item = ?2 AND value_blob IS NOT NULL") {
@@ -1120,8 +1256,18 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                         .query_row(rusqlite::params![seq, n], |row| row.get(0))
                         .ok();
                     if let Some(blob) = blob_opt {
-                        let val_str = String::from_utf8(blob).unwrap_or_default();
-                        items_to_restore.push((n.to_string(), val_str));
+                        // See the `--all` branch: an unreadable blob is refused
+                        // rather than silently restored as an empty value.
+                        match String::from_utf8(blob) {
+                            Ok(val_str) => items_to_restore.push((n.to_string(), val_str)),
+                            Err(_) => {
+                                eprintln!(
+                                    "broker: captured value for {n} at sequence {seq} is not \
+                                     valid UTF-8; refusing to restore it"
+                                );
+                                return (2, vec![n.into()]);
+                            }
+                        }
                     } else {
                         eprintln!(
                             "broker: sequence {} does not contain a value for {}",

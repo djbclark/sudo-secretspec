@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The privileged broker now enables the `sqlite://` provider's history
+  retention (`?history=true`). Without it the vault database held no history
+  tables at all, so `restore` could never return anything and `destroy` removed
+  the live value *before* failing on the missing tables — turning the absent
+  feature into a path to irrecoverable loss.
+- `destroy` now tombstones the captured history it was meant to. It matched the
+  bare secret name against `captured_values.item`, which holds the provider's
+  full `{project}/{profile}/{key}` address, so it updated no rows and reported
+  success while every captured copy of the value stayed readable.
+- `restore` no longer replaces a captured value that is not valid UTF-8 with an
+  empty string, which would have overwritten a live secret with `""` and
+  reported success. It refuses instead. Two query paths that could panic or
+  silently yield nothing now report the error.
+- The per-invocation vault integrity gate now checks `secrets.db`, the store
+  values actually live in, for symlinking, ownership, and mode `0600`. It
+  checked only `secretspec.toml` and the now-retired `.env`, so the value store
+  was unguarded. `secrets.db` and `.env` are checked when present rather than
+  required, so a fresh vault without a database, or one whose retired `.env`
+  has been removed, no longer refuses every operation.
+- The engine's JSONL audit log is written inside the vault instead of under a
+  home directory nothing may write. Every operation previously warned
+  "Operation not permitted" and dropped its audit event.
+
 - `template-check` now reports "no tracked declaration source configured" and
   succeeds when the root-owned config omits `declarations`, instead of failing
   with an error. This is the state the optional `declarations` field was
