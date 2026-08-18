@@ -410,13 +410,32 @@ fn search_dirs(caller_path: Option<&OsStr>) -> Vec<PathBuf> {
     dirs
 }
 
+/// Would a shell execute this path, or step over it and keep looking?
+///
+/// Existence is not the rule. A shell searching `PATH` skips an entry that is
+/// not a regular file it can execute — a directory of that name, or a
+/// non-executable file — and falls through to the next directory. Metadata is
+/// followed through symlinks, because that is what `execve` does.
+fn is_executable_file(path: &Path) -> bool {
+    match fs::metadata(path) {
+        Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
+}
+
 /// The first `name` the caller's `PATH` would execute, when that `PATH` is
 /// known. `None` when it was not supplied or resolves to nothing.
+///
+/// Treating mere existence as "this wins" made a stray non-executable file — or
+/// a directory — named `sudo-secretspec` anywhere on the caller's `PATH` raise
+/// `CLIENT_SHADOWED`, which is not advisory and so fails `doctor`. Agents are
+/// told to treat that as a hard stop, so a file the shell would have ignored
+/// could wedge every automated caller.
 fn path_winner(caller_path: Option<&OsStr>, name: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(caller_path?)
         .filter(|d| d.is_absolute())
         .map(|d| d.join(name))
-        .find(|c| c.symlink_metadata().is_ok())
+        .find(|c| is_executable_file(c))
 }
 
 /// Nearest ancestor of `dir` (inclusive) that root alone cannot control, or
@@ -1391,21 +1410,66 @@ service_group = "_sudo_secretspec"
         assert_eq!(search_dirs(None).len(), SEARCH_DIRS.len());
     }
 
+    /// Write `name` into `dir` and make it executable, as an installed client is.
+    fn executable(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, b"x").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
     #[test]
-    fn path_winner_picks_the_first_existing_entry() {
+    fn path_winner_picks_the_first_entry_a_shell_would_run() {
         let tmp = tempdir().unwrap();
         let empty = tmp.path().join("empty");
         let real = tmp.path().join("real");
         fs::create_dir_all(&empty).unwrap();
         fs::create_dir_all(&real).unwrap();
-        fs::write(real.join("sudo-secretspec"), b"x").unwrap();
+        let winner = executable(&real, "sudo-secretspec");
 
         let path = std::env::join_paths([&empty, &real]).unwrap();
         assert_eq!(
             path_winner(Some(&path), OsStr::new("sudo-secretspec")),
-            Some(real.join("sudo-secretspec"))
+            Some(winner)
         );
         assert_eq!(path_winner(None, OsStr::new("sudo-secretspec")), None);
+    }
+
+    #[test]
+    fn a_non_executable_file_is_stepped_over_the_way_a_shell_steps_over_it() {
+        // Existence is not the rule. Reporting this as the winner raised a
+        // non-advisory CLIENT_SHADOWED, and `doctor` failing is a hard stop for
+        // every agent -- over a file the shell would never have run.
+        let tmp = tempdir().unwrap();
+        let inert = tmp.path().join("inert");
+        let real = tmp.path().join("real");
+        fs::create_dir_all(&inert).unwrap();
+        fs::create_dir_all(&real).unwrap();
+        let unreadable = inert.join("sudo-secretspec");
+        fs::write(&unreadable, b"not executable").unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).unwrap();
+        let winner = executable(&real, "sudo-secretspec");
+
+        let path = std::env::join_paths([&inert, &real]).unwrap();
+        assert_eq!(
+            path_winner(Some(&path), OsStr::new("sudo-secretspec")),
+            Some(winner)
+        );
+    }
+
+    #[test]
+    fn a_directory_of_that_name_is_not_a_winner() {
+        // `mkdir ~/bin/sudo-secretspec` is enough to wedge the boundary when
+        // existence is the test: a directory is executable-bit-set by default.
+        let tmp = tempdir().unwrap();
+        let masked = tmp.path().join("masked");
+        fs::create_dir_all(masked.join("sudo-secretspec")).unwrap();
+
+        let path = std::env::join_paths([&masked]).unwrap();
+        assert_eq!(
+            path_winner(Some(&path), OsStr::new("sudo-secretspec")),
+            None
+        );
     }
 
     #[test]

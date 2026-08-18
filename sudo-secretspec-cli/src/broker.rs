@@ -274,6 +274,13 @@ struct Mutation {
     /// The identity the vault's protected state must belong to, passed through
     /// to the history store's own metadata checks.
     service_uid: u32,
+    /// Whether each rollback source existed when the mutation began, indexed in
+    /// the same order the copy loop visits them: `[manifest, dotenv]`.
+    ///
+    /// Without this, `restore` cannot tell "there was no backup because there
+    /// was nothing to copy" from "the backup went missing", and reported the
+    /// first mutating operation on a fresh install as an unknown outcome.
+    existed: [bool; 2],
 }
 
 impl Mutation {
@@ -288,46 +295,74 @@ impl Mutation {
         let manifest = vault.join("secretspec.toml");
         let dotenv = vault.join("secrets.db");
 
-        let m = Self {
+        let mut m = Self {
             vault,
             manifest,
             dotenv,
             transaction,
             operation: operation.to_string(),
             service_uid: uid,
+            // Filled in by the copy loop below.
+            existed: [true; 2],
         };
 
-        // Create rollback copies
-        for (src, suffix) in [(&m.manifest, "toml"), (&m.dotenv, "db")] {
-            let dst = m.rollback_path(suffix);
-            if dst.exists() {
-                eprintln!("broker: rollback path collision: {}", dst.display());
-                return Err(2);
-            }
-            match std::fs::copy(src, &dst) {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // File doesn't exist yet (e.g. first run for secrets.db), nothing to backup
-                    continue;
-                }
-                Err(e) => {
-                    eprintln!("broker: cannot create rollback copy: {e}");
+        // Create rollback copies.
+        //
+        // All-or-nothing. A failure part way through used to leave the earlier
+        // source's copy behind: `begin` returns `Err` *before* any Mutation
+        // exists, so there is no `commit`/`restore` left to clean up after it,
+        // and `drift` reports the leftover only as an advisory PENDING_ROLLBACK
+        // — so nothing on the host would ever remove it.
+        let mut created: Vec<std::path::PathBuf> = Vec::new();
+        let mut existed = [true; 2];
+        let staged = (|| -> Result<(), i32> {
+            for (index, (src, suffix)) in [(&m.manifest, "toml"), (&m.dotenv, "db")]
+                .into_iter()
+                .enumerate()
+            {
+                let dst = m.rollback_path(suffix);
+                if dst.exists() {
+                    eprintln!("broker: rollback path collision: {}", dst.display());
                     return Err(2);
                 }
+                match std::fs::copy(src, &dst) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // File doesn't exist yet (e.g. first run for secrets.db),
+                        // nothing to backup. Recorded so `restore` can tell this
+                        // apart from a backup that went missing.
+                        existed[index] = false;
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("broker: cannot create rollback copy: {e}");
+                        return Err(2);
+                    }
+                }
+                created.push(dst.clone());
+                // `fs::copy` carries the mode across but *not* the owner, so a copy
+                // made by this root process lands root-owned inside a vault owned by
+                // the service user. `drift` checks the vault entry by entry, and a
+                // root-owned entry there turns the deliberately-advisory
+                // PENDING_ROLLBACK into a hard METADATA_MISMATCH — which fails
+                // `doctor`, which every agent is told to treat as a stop. A crashed
+                // mutation would then wedge the host.
+                chown(&dst, uid, gid).map_err(|e| {
+                    eprintln!("broker: cannot set rollback copy ownership: {e}");
+                    2
+                })?;
             }
-            // `fs::copy` carries the mode across but *not* the owner, so a copy
-            // made by this root process lands root-owned inside a vault owned by
-            // the service user. `drift` checks the vault entry by entry, and a
-            // root-owned entry there turns the deliberately-advisory
-            // PENDING_ROLLBACK into a hard METADATA_MISMATCH — which fails
-            // `doctor`, which every agent is told to treat as a stop. A crashed
-            // mutation would then wedge the host.
-            chown(&dst, uid, gid).map_err(|e| {
-                eprintln!("broker: cannot set rollback copy ownership: {e}");
-                let _ = std::fs::remove_file(&dst);
-                2
-            })?;
+            Ok(())
+        })();
+
+        if let Err(code) = staged {
+            for path in &created {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(code);
         }
+
+        m.existed = existed;
         Ok(m)
     }
 
@@ -346,7 +381,10 @@ impl Mutation {
     /// the state beside them.
     fn restore(&self) -> bool {
         let mut ok = true;
-        for (dest, suffix) in [(&self.manifest, "toml"), (&self.dotenv, "db")] {
+        for (index, (dest, suffix)) in [(&self.manifest, "toml"), (&self.dotenv, "db")]
+            .into_iter()
+            .enumerate()
+        {
             let backup = self.rollback_path(suffix);
             if backup.is_file() {
                 if std::fs::copy(&backup, dest).is_err() {
@@ -354,8 +392,21 @@ impl Mutation {
                     continue;
                 }
                 let _ = std::fs::remove_file(&backup);
-            } else {
+            } else if self.existed[index] {
+                // There was something to back up and the copy is gone, so the
+                // pre-mutation state really is unrecoverable.
                 ok = false;
+            } else if dest.exists() {
+                // This source did not exist when the mutation began, so the
+                // pre-state is "absent" and restoring it means removing what the
+                // failed mutation created. Leaving the file while reporting a
+                // clean rollback would be the same misreport in the other
+                // direction. `restore` runs only on the failed-operation path,
+                // so the only thing that can have created this is the mutation
+                // being undone.
+                if std::fs::remove_file(dest).is_err() {
+                    ok = false;
+                }
             }
         }
         ok
@@ -1083,6 +1134,19 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
             let op = broker.operation.as_str();
 
             let db_path = cfg.vault.join("secrets.db");
+            // `Connection::open` defaults to SQLITE_OPEN_CREATE, so on a fresh
+            // vault these verbs used to *create* an empty, schema-less
+            // secrets.db and leave it behind on their way to failing rc 2. The
+            // provider guards every read with the same existence check for
+            // exactly this reason; a history verb must not be what brings the
+            // value store into being.
+            if !db_path.is_file() {
+                eprintln!(
+                    "broker: no secret store at {}; nothing to {op}",
+                    db_path.display()
+                );
+                return (2, vec![]);
+            }
             let conn = match rusqlite::Connection::open(&db_path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -1090,6 +1154,15 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                     return (2, vec![]);
                 }
             };
+            // Foreign keys are per-connection and default off. The provider
+            // enables them on its own connections; this one writes the
+            // `destroyed_by` tombstones that the REFERENCES clause exists to
+            // constrain, so it has to enable them too or the constraint does not
+            // apply to the write that matters most.
+            if let Err(e) = conn.execute_batch("PRAGMA foreign_keys=ON;") {
+                eprintln!("broker: cannot enable foreign key enforcement: {e}");
+                return (2, vec![]);
+            }
 
             if op == "source-destroy" {
                 let name = match broker.name.as_deref() {
@@ -1101,9 +1174,30 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                 };
 
                 // First delete from active secrets, which will capture a new history entry
-                if let Err(e) = secrets.delete(name) {
-                    eprintln!("broker: {e}");
-                    return (1, vec![name.into()]);
+                //
+                // The bool matters. The provider only captures an entry when it
+                // actually removed a row, so `Ok(false)` — a name already
+                // source-deleted — means no new sequence exists. `MAX(sequence)`
+                // below would then return whatever unrelated entry sits at the
+                // tip and stamp *that* as the destroyer. The value would still be
+                // destroyed, but the ledger would name the wrong event, and a
+                // wrong answer in the record this project exists to make
+                // trustworthy is worse than a refusal.
+                match secrets.delete(name) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        eprintln!(
+                            "broker: '{name}' has no live value, so there is no destroy event to \
+                             attribute its captured copies to. Its earlier deletion is already in \
+                             history; destroying copies of an already-deleted name needs a \
+                             history entry this verb cannot create."
+                        );
+                        return (2, vec![name.into()]);
+                    }
+                    Err(e) => {
+                        eprintln!("broker: {e}");
+                        return (1, vec![name.into()]);
+                    }
                 }
 
                 // The new sequence just created by delete. Not `unwrap_or(0)`:
@@ -1636,6 +1730,9 @@ PROD_ONLY = { description = "production-only token", required = true }
             transaction,
             operation: "source-set".into(),
             service_uid: std::fs::metadata(vault).unwrap().uid(),
+            // This helper writes both rollback copies below, which is the state
+            // `begin` leaves behind when both sources already existed.
+            existed: [true; 2],
         };
         std::fs::write(mutation.rollback_path("toml"), manifest).unwrap();
         std::fs::write(mutation.rollback_path("db"), dotenv).unwrap();
@@ -2356,5 +2453,137 @@ BETA = { description = "second", required = false }
         broker.to = Some("1".into());
 
         assert_ne!(execute(&broker, &cfg, &fixture_reason()).0, 0);
+        // And it must not have *created* the store on its way out. `Connection::open`
+        // defaults to SQLITE_OPEN_CREATE, so refusing while leaving an empty,
+        // schema-less secrets.db behind turned "never migrated" into "migrated to
+        // nothing" — a worse state than the one it refused.
+        assert!(
+            !cfg.vault.join("secrets.db").exists(),
+            "a refusing history verb must not bring the value store into being"
+        );
+    }
+
+    #[test]
+    fn destroying_an_already_deleted_name_refuses_rather_than_misattributing_it() {
+        // The provider captures a history entry only when it actually removed a
+        // row, so a name already source-deleted produces none. Taking
+        // MAX(sequence) anyway stamped whatever unrelated entry sat at the tip as
+        // the destroyer: the value is gone either way, but the ledger names the
+        // wrong event, and this ledger's whole purpose is to be believable.
+        let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_vault, cfg) = execute_fixture();
+
+        let secrets = fixture_secrets(&cfg);
+        secrets.set("ALPHA", Some("a1".to_string())).unwrap();
+        assert!(secrets.delete("ALPHA").unwrap(), "fixture must remove it");
+
+        let tip_before: i64 = {
+            let conn = rusqlite::Connection::open(cfg.vault.join("secrets.db")).unwrap();
+            conn.query_row("SELECT MAX(sequence) FROM entries", [], |row| row.get(0))
+                .unwrap()
+        };
+
+        let mut broker = broker_op("source-destroy");
+        broker.name = Some("ALPHA".into());
+        assert_eq!(
+            execute(&broker, &cfg, &fixture_reason()).0,
+            2,
+            "destroying a name with no live value must refuse"
+        );
+
+        let conn = rusqlite::Connection::open(cfg.vault.join("secrets.db")).unwrap();
+        let tip_after: i64 = conn
+            .query_row("SELECT MAX(sequence) FROM entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tip_before, tip_after, "the refusal must not append history");
+        let tombstoned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM captured_values WHERE destroyed_by IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            tombstoned, 0,
+            "nothing may be stamped destroyed_by an unrelated entry"
+        );
+    }
+
+    #[test]
+    fn a_begin_that_fails_part_way_leaves_no_orphan_rollback_copy() {
+        // `begin` returns Err before any Mutation exists, so there is no
+        // commit()/restore() left to clean up after it, and drift reports a
+        // leftover only as an advisory PENDING_ROLLBACK — nothing on the host
+        // would ever remove it.
+        use std::os::unix::fs::MetadataExt;
+        let (vault, cfg) = execute_fixture();
+        std::fs::write(vault.path().join("secrets.db"), b"db").unwrap();
+        let meta = std::fs::metadata(vault.path()).unwrap();
+        let transaction = uuid::Uuid::new_v4();
+
+        // Collide the *second* source's rollback path, so the first copy has
+        // already been made by the time begin fails.
+        let collision = vault
+            .path()
+            .join(format!(".secretspec.db.rollback.{transaction}"));
+        std::fs::write(&collision, b"a previous crash left this").unwrap();
+
+        assert!(
+            Mutation::begin(&cfg, transaction, "source-set", meta.uid(), meta.gid()).is_err(),
+            "a rollback path collision must abort the mutation"
+        );
+
+        let orphan = vault
+            .path()
+            .join(format!(".secretspec.toml.rollback.{transaction}"));
+        assert!(
+            !orphan.exists(),
+            "the manifest copy made before the failure must not be left behind"
+        );
+        assert!(
+            collision.exists(),
+            "the pre-existing file that caused the refusal is not ours to delete"
+        );
+    }
+
+    #[test]
+    fn a_first_mutation_rolls_back_cleanly_instead_of_reporting_unknown() {
+        // On a fresh install secrets.db does not exist, so begin has nothing to
+        // copy. Treating the absent backup as an unrecoverable pre-state exited
+        // 125 / Outcome::Unknown when the pre-state -- "no vault DB" -- was
+        // cleanly known, and rolling back means removing what the failed
+        // mutation created.
+        use std::os::unix::fs::MetadataExt;
+        let vault = temp_vault();
+        let manifest = vault.path().join("secretspec.toml");
+        let dotenv = vault.path().join("secrets.db");
+        std::fs::write(&manifest, b"[project]\nname = \"f\"\n").unwrap();
+        let transaction = uuid::Uuid::new_v4();
+        let mutation = Mutation {
+            vault: vault.path().to_path_buf(),
+            manifest: manifest.clone(),
+            dotenv: dotenv.clone(),
+            transaction,
+            operation: "source-set".into(),
+            service_uid: std::fs::metadata(vault.path()).unwrap().uid(),
+            // The manifest was there to back up; secrets.db was not.
+            existed: [true, false],
+        };
+        std::fs::write(mutation.rollback_path("toml"), b"[project]\nname = \"f\"\n").unwrap();
+        // What the failed mutation created.
+        std::fs::write(&dotenv, b"created by the mutation being undone").unwrap();
+
+        assert!(
+            mutation.restore(),
+            "a known pre-state of 'absent' is a clean rollback, not an unknown outcome"
+        );
+        assert!(
+            !dotenv.exists(),
+            "restoring an absent pre-state means removing what the mutation created"
+        );
+        assert!(
+            manifest.exists(),
+            "the manifest must be restored, not removed"
+        );
     }
 }

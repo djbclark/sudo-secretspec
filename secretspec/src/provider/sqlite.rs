@@ -16,11 +16,11 @@ use crate::{Result, SecretSpecError};
 use rusqlite::{Connection, OptionalExtension, params};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use sha2::{Sha256, Digest};
-use std::collections::BTreeMap;
 
 /// Configuration for the local SQLite provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,13 +162,20 @@ impl SqliteProvider {
             ))
         })?;
         let mut init_sql = String::from(
-            "PRAGMA journal_mode=DELETE;\
+            // `foreign_keys` is off by default and is a *per-connection* setting,
+            // so without this the REFERENCES clauses on `captured_values` below
+            // are documentation rather than a constraint: a tombstone could name
+            // a `destroyed_by` sequence no entry has. Every connection this
+            // provider hands out comes through here, which is what makes one
+            // line sufficient.
+            "PRAGMA foreign_keys=ON;\
+             PRAGMA journal_mode=DELETE;\
              PRAGMA synchronous=FULL;\
              PRAGMA trusted_schema=OFF;\
              CREATE TABLE IF NOT EXISTS secrets (\
                  item TEXT PRIMARY KEY,\
                  value TEXT NOT NULL\
-             ) STRICT;"
+             ) STRICT;",
         );
         if self.config.history {
             init_sql.push_str(
@@ -192,11 +199,10 @@ impl SqliteProvider {
                      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),\
                      sequence INTEGER NOT NULL,\
                      entry_hash TEXT NOT NULL\
-                 ) STRICT;"
+                 ) STRICT;",
             );
         }
-        conn.execute_batch(&init_sql)
-        .map_err(|error| {
+        conn.execute_batch(&init_sql).map_err(|error| {
             operation_error(format!(
                 "failed to prepare sqlite database '{}': {error}",
                 self.config.path.display()
@@ -354,7 +360,6 @@ fn operation_error(message: impl Into<String>) -> SecretSpecError {
     SecretSpecError::ProviderOperationFailed(message.into())
 }
 
-
 // ---------------------------------------------------------------------------
 // History Capture
 // ---------------------------------------------------------------------------
@@ -448,14 +453,14 @@ fn capture_history(conn: &Connection, operation: &str) -> Result<()> {
     let mut stmt = conn
         .prepare("SELECT item, value FROM secrets ORDER BY item")
         .map_err(|e| operation_error(e.to_string()))?;
-    
+
     let mut pairs = Vec::new();
     let rows = stmt
         .query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(|e| operation_error(e.to_string()))?;
-        
+
     for row in rows {
         pairs.push(row.map_err(|e| operation_error(e.to_string()))?);
     }
@@ -495,12 +500,7 @@ fn capture_history(conn: &Connection, operation: &str) -> Result<()> {
         conn.execute(
             "INSERT INTO captured_values (sequence, item, value_blob, value_sha256, destroyed_by) \
              VALUES (?1, ?2, ?3, ?4, NULL)",
-            params![
-                entry.sequence,
-                val.item,
-                plain.as_bytes(),
-                val.value_sha256,
-            ],
+            params![entry.sequence, val.item, plain.as_bytes(), val.value_sha256,],
         )
         .map_err(|e| operation_error(e.to_string()))?;
     }
@@ -528,7 +528,10 @@ mod tests {
     }
 
     fn provider(path: PathBuf) -> SqliteProvider {
-        SqliteProvider::new(SqliteConfig { path, history: false })
+        SqliteProvider::new(SqliteConfig {
+            path,
+            history: false,
+        })
     }
 
     fn convention<'a>(key: &'a str) -> Address<'a> {
@@ -766,6 +769,40 @@ mod tests {
     }
 
     #[test]
+    fn foreign_keys_are_enforced_on_every_connection_this_provider_hands_out() {
+        // `foreign_keys` is per-connection and off by default, so without the
+        // pragma the REFERENCES clauses on captured_values are documentation:
+        // a tombstone could name a `destroyed_by` sequence no entry has, and
+        // the store would accept it.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("secrets.db");
+        let provider = SqliteProvider::new(SqliteConfig {
+            path: db_path.clone(),
+            history: true,
+        });
+        provider
+            .set(convention("APP_SECRET"), &SecretString::new("v".into()))
+            .unwrap();
+
+        let conn = provider.connection().unwrap();
+        let enabled: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(enabled, 1, "foreign key enforcement must be on");
+
+        // And prove it actually bites, rather than merely being reported on.
+        let orphan = conn.execute(
+            "INSERT INTO captured_values (sequence, item, value_blob, value_sha256) \
+             VALUES (99999, 'x', X'00', 'd')",
+            [],
+        );
+        assert!(
+            orphan.is_err(),
+            "a captured value referencing no entry must be refused"
+        );
+    }
+
+    #[test]
     fn history_is_captured_when_enabled() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("secrets.db");
@@ -786,20 +823,17 @@ mod tests {
             .query_row("SELECT count(*) FROM entries", [], |row| row.get(0))
             .unwrap();
         assert_eq!(entries, 1);
-        
+
         let captured: i64 = conn
             .query_row("SELECT count(*) FROM captured_values", [], |row| row.get(0))
             .unwrap();
         assert_eq!(captured, 1);
-        
-        provider
-            .delete(convention("APP_SECRET"))
-            .unwrap();
-            
+
+        provider.delete(convention("APP_SECRET")).unwrap();
+
         let entries_after_delete: i64 = conn
             .query_row("SELECT count(*) FROM entries", [], |row| row.get(0))
             .unwrap();
         assert_eq!(entries_after_delete, 2);
     }
 }
-

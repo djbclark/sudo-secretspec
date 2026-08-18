@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `source-destroy` now refuses a name that has no live value instead of
+  tombstoning its captured copies against an unrelated history entry. The copies
+  were destroyed either way, but the ledger recorded the wrong event as having
+  destroyed them.
+- `source-restore`, `source-restore-force` and `source-destroy` no longer create
+  an empty `secrets.db` when the vault has none. They refuse as before, but on
+  the way out they used to leave a schema-less database behind.
+- `doctor` no longer fails because some unrelated file named `sudo-secretspec`
+  sits on the caller's `PATH`. Only an executable regular file can shadow the
+  installed client, which is what a shell would actually run; a non-executable
+  file or a directory of that name is now ignored rather than treated as a hard
+  stop.
+- A mutating operation that fails on a freshly installed boundary now reports a
+  clean rollback rather than an unknown outcome. Its pre-state — no vault
+  database yet — is known, and rolling back removes what the failed operation
+  created.
+- A mutation that fails while taking its rollback copies no longer leaves the
+  copy it had already made behind for the operator to find and judge.
+- The `sqlite` provider now enforces foreign keys, so a captured value can no
+  longer reference a history entry that does not exist.
 - `undeclare` now takes the same rollback copy of the runtime manifest that
   every other mutating broker operation takes. It wrote the file directly, so an
   interrupted or failing write could leave the manifest truncated with no copy
