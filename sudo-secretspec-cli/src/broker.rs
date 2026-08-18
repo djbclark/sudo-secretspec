@@ -1667,7 +1667,7 @@ PROD_ONLY = { description = "production-only token", required = true }
         );
         // The history entry joins to the ledger on the transaction uuid, which
         // is the only thing tying the two stores together.
-        let entries = crate::history::list(vault.path(), None, None).unwrap();
+        let entries = crate::history::list(vault.path(), None).unwrap();
         assert_eq!(entries[0].transaction, transaction);
     }
 
