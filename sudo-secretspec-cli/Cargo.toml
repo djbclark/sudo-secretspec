@@ -18,7 +18,13 @@ dotenv.workspace = true
 rusqlite = { version = "0.31" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-secretspec = { path = "../secretspec", version = "0.19.1-sudo.19", default-features = false, features = ["manifest-edit", "codegen-schema"] }
+# `sqlite` is not optional for the broker: `broker::execute` builds its provider
+# URI as `sqlite://<vault>/secrets.db?history=true`, so a build without the
+# feature registers no backend for it and every operation fails with "Provider
+# backend 'sqlite' not found" — after the vault has already been migrated onto
+# it. The rest stay off deliberately: a root-adjacent process has no business
+# linking cloud SDKs, `clap`, or `inquire`.
+secretspec = { path = "../secretspec", version = "0.19.1-sudo.19", default-features = false, features = ["manifest-edit", "codegen-schema", "sqlite"] }
 sha2.workspace = true
 thiserror.workspace = true
 toml.workspace = true

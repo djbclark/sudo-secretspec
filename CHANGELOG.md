@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bare secret name against `captured_values.item`, which holds the provider's
   full `{project}/{profile}/{key}` address, so it updated no rows and reported
   success while every captured copy of the value stayed readable.
+- `restore` now finds the values it is asked for. `captured_values.item` holds
+  the provider's full `{project}/{profile}/{key}` address while `--name` and the
+  write-back both speak bare secret names, so `restore --name` matched nothing
+  and `restore --all` fed full addresses back in as if they were names. The
+  translation now happens in one place.
+- The privileged broker links the `sqlite` provider feature. Its provider URI is
+  a `sqlite://` one, so a build without the feature registered no backend and
+  every operation failed with "Provider backend 'sqlite' not found".
 - `restore` no longer replaces a captured value that is not valid UTF-8 with an
   empty string, which would have overwritten a live secret with `""` and
   reported success. It refuses instead. Two query paths that could panic or

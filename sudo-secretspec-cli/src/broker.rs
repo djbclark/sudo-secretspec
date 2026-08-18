@@ -1202,84 +1202,90 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                     }
                 };
 
-                let mut items_to_restore = Vec::new();
-                if broker.all {
-                    let mut stmt = match conn.prepare("SELECT item, value_blob FROM captured_values WHERE sequence = ?1 AND value_blob IS NOT NULL") {
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("broker: {e}");
-                            return (2, vec![]);
-                        }
-                    };
-                    let rows: Result<Vec<(String, Vec<u8>)>, _> = match stmt
-                        .query_map(rusqlite::params![seq], |row| Ok((row.get(0)?, row.get(1)?)))
-                    {
-                        Ok(rows) => rows.collect(),
+                // `captured_values.item` holds the provider's full address
+                // (`{project}/{profile}/{key}`), while `secrets.set` and the
+                // caller's `--name` both speak bare secret names. Reading the
+                // sequence once and translating here keeps that mismatch in a
+                // single place: `--name` used to compare a bare name against a
+                // full address and so never matched, while `--all` fed full
+                // addresses back into `set` as if they were names.
+                let captured: Vec<(String, Vec<u8>)> = {
+                    let mut stmt = match conn.prepare(
+                        "SELECT item, value_blob FROM captured_values \
+                         WHERE sequence = ?1 AND value_blob IS NOT NULL",
+                    ) {
+                        Ok(stmt) => stmt,
                         Err(e) => {
                             eprintln!("broker: cannot read captured values: {e}");
                             return (2, vec![]);
                         }
                     };
-                    let rows = match rows {
+                    let rows = match stmt
+                        .query_map(rusqlite::params![seq], |row| Ok((row.get(0)?, row.get(1)?)))
+                    {
                         Ok(rows) => rows,
                         Err(e) => {
                             eprintln!("broker: cannot read captured values: {e}");
                             return (2, vec![]);
                         }
                     };
-                    for (item, blob) in rows {
-                        // Refused, not lossily replaced. `unwrap_or_default`
-                        // here turned an unreadable blob into the empty string,
-                        // so a restore would overwrite a live secret with "" and
-                        // report success — a silent value loss dressed as a
-                        // recovery.
-                        match String::from_utf8(blob) {
-                            Ok(val_str) => items_to_restore.push((item, val_str)),
-                            Err(_) => {
-                                eprintln!(
-                                    "broker: captured value for {item} at sequence {seq} is not \
-                                     valid UTF-8; refusing to restore it"
-                                );
-                                return (2, vec![item]);
+                    let mut captured = Vec::new();
+                    for row in rows {
+                        match row {
+                            Ok(pair) => captured.push(pair),
+                            Err(e) => {
+                                eprintln!("broker: cannot read captured values: {e}");
+                                return (2, vec![]);
                             }
                         }
                     }
+                    captured
+                };
+
+                // The bare name is the last address segment; an address with no
+                // separator is already one.
+                let bare =
+                    |item: &str| -> String { item.rsplit('/').next().unwrap_or(item).to_string() };
+
+                let mut items_to_restore = Vec::new();
+                let wanted = if broker.all {
+                    None
                 } else if let Some(n) = broker.name.as_deref() {
-                    let mut stmt = match conn.prepare("SELECT value_blob FROM captured_values WHERE sequence = ?1 AND item = ?2 AND value_blob IS NOT NULL") {
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("broker: {e}");
-                            return (2, vec![n.into()]);
-                        }
-                    };
-                    let blob_opt: Option<Vec<u8>> = stmt
-                        .query_row(rusqlite::params![seq, n], |row| row.get(0))
-                        .ok();
-                    if let Some(blob) = blob_opt {
-                        // See the `--all` branch: an unreadable blob is refused
-                        // rather than silently restored as an empty value.
-                        match String::from_utf8(blob) {
-                            Ok(val_str) => items_to_restore.push((n.to_string(), val_str)),
-                            Err(_) => {
-                                eprintln!(
-                                    "broker: captured value for {n} at sequence {seq} is not \
-                                     valid UTF-8; refusing to restore it"
-                                );
-                                return (2, vec![n.into()]);
-                            }
-                        }
-                    } else {
-                        eprintln!(
-                            "broker: sequence {} does not contain a value for {}",
-                            seq, n
-                        );
-                        return (1, vec![n.into()]);
-                    }
+                    Some(n.to_string())
                 } else {
                     eprintln!("broker: restore requires either --name or --all");
                     return (2, vec![]);
+                };
+
+                for (item, blob) in captured {
+                    let name = bare(&item);
+                    if let Some(wanted) = &wanted
+                        && &name != wanted
+                    {
+                        continue;
+                    }
+                    // Refused, not lossily replaced. `unwrap_or_default` here
+                    // turned an unreadable capture into the empty string, so a
+                    // restore would overwrite a live secret with "" and report
+                    // success -- a silent value loss dressed as a recovery.
+                    match String::from_utf8(blob) {
+                        Ok(value) => items_to_restore.push((name, value)),
+                        Err(_) => {
+                            eprintln!(
+                                "broker: captured value for {item} at sequence {seq} is not \
+                                 valid UTF-8; refusing to restore it"
+                            );
+                            return (2, vec![name]);
+                        }
+                    }
                 }
 
+                if let Some(wanted) = &wanted
+                    && items_to_restore.is_empty()
+                {
+                    eprintln!("broker: sequence {seq} does not contain a value for {wanted}");
+                    return (1, vec![wanted.clone()]);
+                }
                 if items_to_restore.is_empty() {
                     eprintln!("broker: nothing to restore");
                     return (1, vec![]);
