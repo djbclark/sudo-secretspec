@@ -196,7 +196,7 @@ impl SqliteProvider {
             ))
         })?;
         if self.config.history {
-            migrate_history(&conn)?;
+            check_history_version(&conn)?;
             conn.execute_batch(HISTORY_POST_MIGRATION)
                 .map_err(|error| {
                     operation_error(format!(
@@ -458,23 +458,19 @@ fn history_schema() -> String {
 }
 
 /// Everything that can only be built once `captured_values` is known to be in
-/// its current shape. Applied after [`migrate_history`], never as part of
-/// [`history_schema`].
+/// its current shape. Applied after [`check_history_version`], never as part
+/// of [`history_schema`].
 ///
 /// The index is here rather than in the schema because the schema runs first,
 /// against a table `CREATE TABLE IF NOT EXISTS` silently leaves in whatever
-/// shape it already had — so on an unmigrated database, indexing `blob_id`
-/// fails with `no such column`. This ordering is exactly what the version
-/// branch in `migrate_history` exists to respect.
+/// shape it already had — so on a database from an older version, indexing
+/// `blob_id` fails with `no such column` instead of reporting the real
+/// problem. Running after the version check means the guard's error is what
+/// the caller sees.
 ///
 /// `CREATE TRIGGER IF NOT EXISTS` matches on name alone, so it would keep an
 /// old body forever once one existed — a stale invariant that still looks
 /// present. Dropping first is what makes the definition here authoritative.
-///
-/// The triggers must also come after migration, because a migration rebuilds
-/// `captured_values` and a no-`DELETE` trigger on the old table would block
-/// copying rows out of it. `DROP TABLE` does not fire `BEFORE DELETE`
-/// triggers, so the rebuild itself stays legal either way.
 const HISTORY_POST_MIGRATION: &str = "\
      CREATE INDEX IF NOT EXISTS captured_values_blob_id \
          ON captured_values(item, blob_id);\
@@ -497,37 +493,51 @@ fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
 }
 
-/// Brings an existing history database up to [`SCHEMA_VERSION`].
+/// Refuses to open a history database that is not already at
+/// [`SCHEMA_VERSION`].
 ///
-/// The schema above is created with `CREATE TABLE IF NOT EXISTS`, which is
-/// silent about tables that already exist in an older shape — so without this
-/// an upgraded binary would keep writing against a v0 layout and never say so.
-fn migrate_history(conn: &Connection) -> Result<()> {
+/// There is deliberately no migration path. The tables are created with
+/// `CREATE TABLE IF NOT EXISTS`, which is silent about a table that already
+/// exists in an older shape, so without this check an upgraded binary would
+/// keep writing against a layout that no longer matches the code and never say
+/// so. Refusing is the whole job.
+///
+/// Databases predating the current version were rebuilt rather than migrated —
+/// exported and re-imported into a fresh file — so the migration code that
+/// used to live here has no remaining input. If a future version needs one,
+/// it belongs here, branching on `user_version` *before* the schema is
+/// created.
+fn check_history_version(conn: &Connection) -> Result<()> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|e| operation_error(e.to_string()))?;
 
-    if version >= SCHEMA_VERSION {
-        return Ok(());
+    // A freshly created database reports 0 until it is stamped below, and is
+    // already in the current shape because `history_schema()` just built it.
+    // An old database also reports 0, and the difference between the two is
+    // whether the current columns are there.
+    if version == 0 && !has_current_shape(conn)? {
+        return Err(operation_error(
+            "this history database predates the current schema and cannot be \
+             upgraded in place. Export its secrets with a build that matches it \
+             and re-import them into a new database.",
+        ));
     }
-
-    // A v0 database is only distinguishable from a freshly created one by
-    // whether the legacy column is still there: both report user_version 0,
-    // because the tables above were created before this function stamped
-    // anything. A fresh database needs no migration — `history_schema()`
-    // already built it in the current shape — so it falls through to the
-    // stamp alone.
-    if version == 0 && has_legacy_value_blob(conn)? {
-        migrate_v0_to_v2(conn)?;
-    } else if version == 1 {
-        migrate_v1_to_v2(conn)?;
+    if version > SCHEMA_VERSION {
+        return Err(operation_error(format!(
+            "this history database was written by a newer version (schema \
+             {version}, this build understands {SCHEMA_VERSION})"
+        )));
     }
-
-    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
-        .map_err(|e| operation_error(e.to_string()))
+    if version < SCHEMA_VERSION {
+        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
+            .map_err(|e| operation_error(e.to_string()))?;
+    }
+    Ok(())
 }
 
-fn has_legacy_value_blob(conn: &Connection) -> Result<bool> {
+/// Whether `captured_values` carries the column the current schema depends on.
+fn has_current_shape(conn: &Connection) -> Result<bool> {
     let mut stmt = conn
         .prepare("SELECT name FROM pragma_table_info('captured_values')")
         .map_err(|e| operation_error(e.to_string()))?;
@@ -535,233 +545,11 @@ fn has_legacy_value_blob(conn: &Connection) -> Result<bool> {
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(|e| operation_error(e.to_string()))?;
     while let Some(row) = rows.next() {
-        if row.map_err(|e| operation_error(e.to_string()))? == "value_blob" {
+        if row.map_err(|e| operation_error(e.to_string()))? == "blob_id" {
             return Ok(true);
         }
     }
     Ok(false)
-}
-
-/// Rows a migration refuses to interpret, as `(sequence, item)` pairs.
-///
-/// Capped, because the point is to name the problem rather than to print an
-/// entire corrupt table into an error message.
-fn offending_rows(conn: &Connection, sql: &str) -> Result<Vec<String>> {
-    let mut stmt = conn
-        .prepare(sql)
-        .map_err(|e| operation_error(e.to_string()))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(format!(
-                "(sequence {}, item {})",
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?
-            ))
-        })
-        .map_err(|e| operation_error(e.to_string()))?;
-
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row.map_err(|e| operation_error(e.to_string()))?);
-        if out.len() == 20 {
-            break;
-        }
-    }
-    Ok(out)
-}
-
-/// Runs a table rebuild with the pragma handling and verification every
-/// migration needs, so each one only has to state its own SQL.
-///
-/// SQLite's documented recipe for rebuilding a table wants foreign keys off
-/// for the duration, since the renames would otherwise be seen against a
-/// half-built table. `foreign_keys` is a no-op inside a transaction, so it has
-/// to be set on either side of one.
-fn rebuild_history(conn: &Connection, sql: &str) -> Result<()> {
-    conn.execute_batch("PRAGMA foreign_keys=OFF;")
-        .map_err(|e| operation_error(e.to_string()))?;
-
-    let mut outcome = conn
-        .execute_batch(sql)
-        .map_err(|e| operation_error(format!("history migration failed: {e}")))
-        .and_then(|()| {
-            // Verifying inside the migration, not in a test only: a rebuild
-            // that silently dropped a reference would leave the ledger
-            // unprovable. `foreign_key_check` now also covers the generated
-            // `live_blob_id`, so this proves every live snapshot still points
-            // at bytes that exist.
-            let violations: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM pragma_foreign_key_check('captured_values')",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|e| operation_error(e.to_string()))?;
-            if violations > 0 {
-                return Err(operation_error(format!(
-                    "history migration left {violations} dangling reference(s); \
-                     refusing to continue"
-                )));
-            }
-            let integrity: String = conn
-                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-                .map_err(|e| operation_error(e.to_string()))?;
-            if integrity != "ok" {
-                return Err(operation_error(format!(
-                    "history migration left the database inconsistent: {integrity}"
-                )));
-            }
-            Ok(())
-        });
-
-    if outcome.is_err() {
-        // `execute_batch` stops at the first failing statement, so a failure
-        // anywhere after `BEGIN` leaves the transaction open on a connection
-        // this provider is about to hand out.
-        if let Err(rollback) = conn.execute_batch("ROLLBACK;")
-            && !rollback.to_string().contains("no transaction is active")
-        {
-            outcome = outcome.and(Err(operation_error(format!(
-                "history migration failed and could not be rolled back: {rollback}"
-            ))));
-        }
-    }
-
-    conn.execute_batch("PRAGMA foreign_keys=ON;")
-        .map_err(|e| operation_error(e.to_string()))?;
-
-    outcome
-}
-
-/// Lifts per-row plaintext into `value_blobs` and rebuilds `captured_values`
-/// around a surrogate `blob_id`.
-///
-/// Destroyed rows are deliberately skipped by the `value_blob IS NOT NULL`
-/// filter: their bytes are already gone and must stay gone. They keep their
-/// `value_sha256`, which is what makes a tombstone auditable, and they are
-/// given a NULL `blob_id` even when a live row happens to hold the same value
-/// under the same name. Pointing them at that live blob would be technically
-/// consistent and would quietly recreate the resurrection hole this version
-/// exists to close.
-///
-/// `value_blobs` is not created here. `connection()` executes the schema
-/// before it calls `migrate_history`, so on a v0 database the table already
-/// exists — empty, and in the current shape, because v0 never had one.
-fn migrate_v0_to_v2(conn: &Connection) -> Result<()> {
-    // Fail closed. A destroyed row that kept its bytes means `destroy` did not
-    // do what the ledger says it did; a live row with no bytes means one was
-    // lost. Both corrupt the exact property this history exists to prove, and
-    // neither has a repair that is obviously right, so refuse and name them.
-    let bad = offending_rows(
-        conn,
-        "SELECT sequence, item FROM captured_values \
-         WHERE (destroyed_by IS NULL) = (value_blob IS NULL) \
-         ORDER BY sequence, item",
-    )?;
-    if !bad.is_empty() {
-        return Err(operation_error(format!(
-            "history migration refused: {} row(s) where the tombstone and the stored \
-             bytes disagree — a destroyed row that kept its plaintext, or a live row \
-             with none: {}",
-            bad.len(),
-            bad.join(", ")
-        )));
-    }
-
-    // Real newlines rather than `\` continuations: a continuation also eats the
-    // next line's indentation, which silently welded `captured_values` onto
-    // `WHERE` here and produced a syntax error a long way from its cause.
-    rebuild_history(
-        conn,
-        &format!(
-            r#"
-BEGIN IMMEDIATE;
-
-INSERT OR IGNORE INTO value_blobs (item, value_sha256, value_blob)
-    SELECT item, value_sha256, value_blob FROM captured_values
-    WHERE value_blob IS NOT NULL;
-
-CREATE TABLE captured_values_new ({CAPTURED_VALUES_BODY}) STRICT;
-
-INSERT INTO captured_values_new
-        (sequence, item, value_sha256, blob_id, destroyed_by)
-    SELECT cv.sequence, cv.item, cv.value_sha256,
-           CASE WHEN cv.destroyed_by IS NULL
-                THEN (SELECT b.blob_id FROM value_blobs b
-                       WHERE b.item = cv.item
-                         AND b.value_sha256 = cv.value_sha256)
-           END,
-           cv.destroyed_by
-      FROM captured_values cv;
-
-DROP TABLE captured_values;
-ALTER TABLE captured_values_new RENAME TO captured_values;
-
-COMMIT;
-"#
-        ),
-    )
-}
-
-/// Rebuilds both history tables around `blob_id`.
-///
-/// v1 addressed a blob by `(item, value_sha256)` from `captured_values`, which
-/// made a tombstone restorable again as soon as the same value was re-set
-/// under the same name — the recreated row matched the old digest. Identity
-/// replaces content here, and `AUTOINCREMENT` guarantees the identity is never
-/// reissued.
-fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
-    let bad = offending_rows(
-        conn,
-        "SELECT cv.sequence, cv.item FROM captured_values cv \
-         WHERE cv.destroyed_by IS NULL \
-           AND NOT EXISTS (SELECT 1 FROM value_blobs b \
-                            WHERE b.item = cv.item \
-                              AND b.value_sha256 = cv.value_sha256) \
-         ORDER BY cv.sequence, cv.item",
-    )?;
-    if !bad.is_empty() {
-        return Err(operation_error(format!(
-            "history migration refused: {} live row(s) whose captured bytes are \
-             missing from value_blobs: {}",
-            bad.len(),
-            bad.join(", ")
-        )));
-    }
-
-    rebuild_history(
-        conn,
-        &format!(
-            r#"
-BEGIN IMMEDIATE;
-
-CREATE TABLE value_blobs_new ({VALUE_BLOBS_BODY}) STRICT;
-
-INSERT INTO value_blobs_new (item, value_sha256, value_blob)
-    SELECT item, value_sha256, value_blob FROM value_blobs;
-
-CREATE TABLE captured_values_new ({CAPTURED_VALUES_BODY}) STRICT;
-
-INSERT INTO captured_values_new
-        (sequence, item, value_sha256, blob_id, destroyed_by)
-    SELECT cv.sequence, cv.item, cv.value_sha256,
-           CASE WHEN cv.destroyed_by IS NULL
-                THEN (SELECT b.blob_id FROM value_blobs_new b
-                       WHERE b.item = cv.item
-                         AND b.value_sha256 = cv.value_sha256)
-           END,
-           cv.destroyed_by
-      FROM captured_values cv;
-
-DROP TABLE captured_values;
-DROP TABLE value_blobs;
-ALTER TABLE value_blobs_new RENAME TO value_blobs;
-ALTER TABLE captured_values_new RENAME TO captured_values;
-
-COMMIT;
-"#
-        ),
-    )
 }
 
 #[derive(Debug)]
@@ -1335,312 +1123,6 @@ mod tests {
         assert_eq!(entries_after_delete, 2);
     }
 
-    /// The v0 schema, verbatim, so the migration is exercised against the
-    /// shape that is actually on disk rather than a paraphrase of it.
-    const LEGACY_SCHEMA_V0: &str = "CREATE TABLE entries (\
-             sequence INTEGER PRIMARY KEY AUTOINCREMENT,\
-             timestamp_ns INTEGER NOT NULL,\
-             operation TEXT NOT NULL,\
-             previous_hash TEXT NOT NULL,\
-             entry_hash TEXT NOT NULL UNIQUE\
-         ) STRICT;\
-         CREATE TABLE captured_values (\
-             sequence INTEGER NOT NULL REFERENCES entries(sequence),\
-             item TEXT NOT NULL,\
-             value_blob BLOB,\
-             value_sha256 TEXT NOT NULL,\
-             destroyed_by INTEGER REFERENCES entries(sequence),\
-             PRIMARY KEY (sequence, item),\
-             CHECK ((value_blob IS NULL) = (destroyed_by IS NOT NULL))\
-         ) STRICT;\
-         CREATE TABLE head (\
-             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),\
-             sequence INTEGER NOT NULL,\
-             entry_hash TEXT NOT NULL\
-         ) STRICT;";
-
-    /// The v1 schema, verbatim. v1 shipped in no release, but any working
-    /// tree that ran the previous revision has databases in this shape, and a
-    /// migration that only understood v0 would leave them permanently wrong
-    /// while reporting nothing.
-    const LEGACY_SCHEMA_V1: &str = "CREATE TABLE entries (\
-             sequence INTEGER PRIMARY KEY AUTOINCREMENT,\
-             timestamp_ns INTEGER NOT NULL,\
-             operation TEXT NOT NULL,\
-             previous_hash TEXT NOT NULL,\
-             entry_hash TEXT NOT NULL UNIQUE\
-         ) STRICT;\
-         CREATE TABLE value_blobs (\
-             item TEXT NOT NULL,\
-             value_sha256 TEXT NOT NULL,\
-             value_blob BLOB NOT NULL,\
-             PRIMARY KEY (item, value_sha256)\
-         ) STRICT;\
-         CREATE TABLE captured_values (\
-             sequence INTEGER NOT NULL REFERENCES entries(sequence),\
-             item TEXT NOT NULL,\
-             value_sha256 TEXT NOT NULL,\
-             destroyed_by INTEGER REFERENCES entries(sequence),\
-             PRIMARY KEY (sequence, item)\
-         ) STRICT;\
-         CREATE TABLE head (\
-             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),\
-             sequence INTEGER NOT NULL,\
-             entry_hash TEXT NOT NULL\
-         ) STRICT;\
-         PRAGMA user_version = 1;";
-
-    #[test]
-    fn a_v1_database_migrates_and_stops_matching_tombstones_by_digest() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("secrets.db");
-
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(LEGACY_SCHEMA_V1).unwrap();
-            for seq in 1..=3 {
-                conn.execute(
-                    "INSERT INTO entries (sequence, timestamp_ns, operation, previous_hash, entry_hash) \
-                     VALUES (?1, ?2, 'source-set', 'prev', ?3)",
-                    params![seq, seq * 1000, format!("hash{seq}")],
-                )
-                .unwrap();
-            }
-            let value = b"recurring";
-            let digest = sha256_hex(value);
-            conn.execute(
-                "INSERT INTO value_blobs (item, value_sha256, value_blob) VALUES ('p/prod/A', ?1, ?2)",
-                params![digest, value],
-            )
-            .unwrap();
-            // Sequence 1 was destroyed; sequence 3 later captured the same
-            // value again under the same name, which is what recreated the
-            // blob. Under v1 those two rows are indistinguishable to a join on
-            // `(item, value_sha256)` — the bug this version removes.
-            conn.execute(
-                "INSERT INTO captured_values (sequence, item, value_sha256, destroyed_by) \
-                 VALUES (1, 'p/prod/A', ?1, 2)",
-                params![digest],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO captured_values (sequence, item, value_sha256, destroyed_by) \
-                 VALUES (3, 'p/prod/A', ?1, NULL)",
-                params![digest],
-            )
-            .unwrap();
-        }
-
-        let conn = open_migrated(&db_path);
-
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-
-        // Anti-vacuity: both rows still carry the same digest, so a digest
-        // match would still conflate them. The test below has to be excluding
-        // the tombstone some other way.
-        let same_digest: i64 = conn
-            .query_row(
-                "SELECT count(DISTINCT value_sha256) FROM captured_values WHERE item = 'p/prod/A'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(same_digest, 1, "precondition: both rows share one digest");
-
-        // The live row resolves to bytes; the tombstone resolves to nothing.
-        let live: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM captured_values cv \
-                 JOIN value_blobs b ON b.blob_id = cv.live_blob_id",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            live, 1,
-            "only the undestroyed snapshot may resolve to bytes"
-        );
-
-        let tombstone_blob: Option<i64> = conn
-            .query_row(
-                "SELECT blob_id FROM captured_values WHERE sequence = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            tombstone_blob, None,
-            "a migrated tombstone must not be given the recreated blob"
-        );
-    }
-
-    #[test]
-    fn a_migration_refuses_a_database_whose_tombstones_contradict_its_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("secrets.db");
-
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            // The v0 CHECK constraint encodes the very invariant being
-            // violated here, so the row has to be inserted without it.
-            conn.execute_batch(&LEGACY_SCHEMA_V0.replace(
-                "CHECK ((value_blob IS NULL) = (destroyed_by IS NOT NULL))",
-                "CHECK (1)",
-            ))
-            .unwrap();
-            conn.execute(
-                "INSERT INTO entries (sequence, timestamp_ns, operation, previous_hash, entry_hash) \
-                 VALUES (1, 1, 'source-set', 'prev', 'h1')",
-                [],
-            )
-            .unwrap();
-            // Destroyed, yet still holding its plaintext: `destroy` did not do
-            // what the ledger says it did.
-            conn.execute(
-                "INSERT INTO captured_values (sequence, item, value_blob, value_sha256, destroyed_by) \
-                 VALUES (1, 'p/prod/LIAR', x'0102', 'digest', 1)",
-                [],
-            )
-            .unwrap();
-        }
-
-        let provider = SqliteProvider::new(SqliteConfig {
-            path: db_path.clone(),
-            history: true,
-        });
-        let error = provider
-            .connection()
-            .expect_err("a contradictory database must not be migrated");
-        let message = error.to_string();
-        assert!(
-            message.contains("refused") && message.contains("p/prod/LIAR"),
-            "the refusal must name the offending row, got: {message}"
-        );
-
-        // And it must refuse rather than half-apply: the database is still v0.
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, 0, "a refused migration must not stamp a version");
-    }
-
-    /// Builds a v0 database holding the interesting cases at once: one value
-    /// repeated across snapshots (the dedup win), two *different* names
-    /// sharing one value (the reason blobs are keyed per item), and a
-    /// destroyed row whose bytes are already gone.
-    fn legacy_v0_database(path: &std::path::Path) -> rusqlite::Connection {
-        let conn = rusqlite::Connection::open(path).unwrap();
-        conn.execute_batch(LEGACY_SCHEMA_V0).unwrap();
-        for seq in 1..=3 {
-            conn.execute(
-                "INSERT INTO entries (sequence, timestamp_ns, operation, previous_hash, entry_hash) \
-                 VALUES (?1, ?2, 'source-set', 'prev', ?3)",
-                params![seq, seq * 1000, format!("hash{seq}")],
-            )
-            .unwrap();
-        }
-
-        let repeated = b"same-every-time";
-        let repeated_digest = sha256_hex(repeated);
-        for seq in 1..=3 {
-            conn.execute(
-                "INSERT INTO captured_values (sequence, item, value_blob, value_sha256, destroyed_by) \
-                 VALUES (?1, 'p/prod/STABLE', ?2, ?3, NULL)",
-                params![seq, repeated, repeated_digest],
-            )
-            .unwrap();
-        }
-
-        // Two names, one value — global content-addressing would collapse
-        // these into a single blob and make destroy-by-name unanswerable.
-        let shared = b"shared-between-two-names";
-        let shared_digest = sha256_hex(shared);
-        for item in ["p/prod/ALPHA", "p/prod/BETA"] {
-            conn.execute(
-                "INSERT INTO captured_values (sequence, item, value_blob, value_sha256, destroyed_by) \
-                 VALUES (1, ?1, ?2, ?3, NULL)",
-                params![item, shared, shared_digest],
-            )
-            .unwrap();
-        }
-
-        // Already destroyed under v0: blob NULL, digest retained.
-        conn.execute(
-            "INSERT INTO captured_values (sequence, item, value_blob, value_sha256, destroyed_by) \
-             VALUES (2, 'p/prod/GONE', NULL, 'deadbeef', 3)",
-            [],
-        )
-        .unwrap();
-
-        conn
-    }
-
-    fn open_migrated(path: &std::path::Path) -> rusqlite::Connection {
-        let provider = SqliteProvider::new(SqliteConfig {
-            path: path.to_path_buf(),
-            history: true,
-        });
-        provider.connection().unwrap()
-    }
-
-    #[test]
-    fn migration_dedups_blobs_without_resurrecting_destroyed_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("secrets.db");
-        drop(legacy_v0_database(&db_path));
-
-        let conn = open_migrated(&db_path);
-
-        // Every row survives — the migration moves bytes, it does not drop
-        // history.
-        let rows: i64 = conn
-            .query_row("SELECT count(*) FROM captured_values", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(rows, 6, "all captured rows must survive the migration");
-
-        // 3 snapshots of one value collapse to 1 blob; the shared value is
-        // stored once per name, not once globally; the destroyed row
-        // contributes nothing.
-        let blobs: i64 = conn
-            .query_row("SELECT count(*) FROM value_blobs", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(blobs, 3, "expected STABLE + ALPHA + BETA, deduped");
-
-        let destroyed_blob: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM value_blobs WHERE item = 'p/prod/GONE'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            destroyed_blob, 0,
-            "destroyed bytes must not come back from the dead"
-        );
-
-        // The tombstone itself is untouched: digest retained, destroyer named.
-        let (digest, destroyed_by): (String, i64) = conn
-            .query_row(
-                "SELECT value_sha256, destroyed_by FROM captured_values WHERE item = 'p/prod/GONE'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(digest, "deadbeef");
-        assert_eq!(destroyed_by, 3);
-
-        // The legacy column is gone and the version is stamped.
-        assert!(!has_legacy_value_blob(&conn).unwrap());
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-    }
-
     /// A provider with history on, holding one captured value, plus the id of
     /// the blob that value lives in.
     fn history_with_one_capture(path: &std::path::Path) -> (SqliteProvider, Connection, i64) {
@@ -1801,64 +1283,6 @@ mod tests {
     }
 
     #[test]
-    fn migration_keeps_identical_values_separate_per_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("secrets.db");
-        drop(legacy_v0_database(&db_path));
-
-        let conn = open_migrated(&db_path);
-
-        // Same bytes, same digest, two names: two blob rows. Collapsing these
-        // is what would leave `destroy ALPHA` unable to remove ALPHA's
-        // plaintext without also erasing BETA's live history.
-        let shared: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM value_blobs WHERE item IN ('p/prod/ALPHA', 'p/prod/BETA')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(shared, 2, "a blob must never be shared across names");
-
-        let distinct_digests: i64 = conn
-            .query_row(
-                "SELECT count(DISTINCT value_sha256) FROM value_blobs \
-                 WHERE item IN ('p/prod/ALPHA', 'p/prod/BETA')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(distinct_digests, 1, "and they are genuinely the same value");
-    }
-
-    #[test]
-    fn migration_is_idempotent_and_preserves_readability() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("secrets.db");
-        drop(legacy_v0_database(&db_path));
-
-        drop(open_migrated(&db_path));
-        let conn = open_migrated(&db_path);
-
-        let blobs: i64 = conn
-            .query_row("SELECT count(*) FROM value_blobs", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(blobs, 3, "a second open must not re-run the migration");
-
-        // The bytes are still reachable by the join the restore path uses.
-        let value: Vec<u8> = conn
-            .query_row(
-                "SELECT b.value_blob FROM captured_values cv \
-                 JOIN value_blobs b ON b.item = cv.item AND b.value_sha256 = cv.value_sha256 \
-                 WHERE cv.sequence = 1 AND cv.item = 'p/prod/STABLE'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(value, b"same-every-time");
-    }
-
-    #[test]
     fn a_fresh_database_is_created_already_at_the_current_version() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("secrets.db");
@@ -1875,7 +1299,73 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert!(!has_legacy_value_blob(&conn).unwrap());
+        assert!(has_current_shape(&conn).unwrap());
+    }
+
+    #[test]
+    fn a_database_from_an_older_version_is_refused_rather_than_written_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("secrets.db");
+
+        // A pre-v2 `captured_values`: no `blob_id`, and `user_version` still 0,
+        // which is exactly what an old database on disk looks like.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE captured_values (\
+                     sequence INTEGER NOT NULL,\
+                     item TEXT NOT NULL,\
+                     value_sha256 TEXT NOT NULL,\
+                     destroyed_by INTEGER,\
+                     PRIMARY KEY (sequence, item)\
+                 ) STRICT;",
+            )
+            .unwrap();
+        }
+
+        let provider = SqliteProvider::new(SqliteConfig {
+            path: db_path.clone(),
+            history: true,
+        });
+        let error = provider
+            .connection()
+            .expect_err("an older database must be refused, not written to");
+        let message = error.to_string();
+        assert!(
+            message.contains("predates the current schema"),
+            "the refusal must say what is wrong and what to do, got: {message}"
+        );
+
+        // And it must refuse without leaving a version behind that would make
+        // the next open believe the database is current.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 0, "a refused open must not stamp a version");
+    }
+
+    #[test]
+    fn a_database_from_a_newer_version_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("secrets.db");
+        let provider = SqliteProvider::new(SqliteConfig {
+            path: db_path.clone(),
+            history: true,
+        });
+        provider
+            .set(convention("APP_SECRET"), &SecretString::new("v".into()))
+            .unwrap();
+
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION + 1))
+            .unwrap();
+
+        let error = provider
+            .connection()
+            .expect_err("a database from a newer build must be refused");
+        assert!(error.to_string().contains("newer version"), "got: {error}");
     }
 
     #[test]

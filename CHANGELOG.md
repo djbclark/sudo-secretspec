@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A vault written by an older version is now refused with an explanation
+  instead of being upgraded in place. In-place upgrades have been removed: the
+  only vault that needed one has been rebuilt, and silently rewriting a secret
+  store is a large risk to carry for a path nothing takes. A vault written by a
+  *newer* version is refused too, rather than being written to by a build that
+  does not understand it.
 - A destroyed history snapshot can no longer become restorable again. Setting a
   secret back to a value it previously held recreated the exact stored copy
   `destroy` had removed, and because snapshots referred to their bytes by
