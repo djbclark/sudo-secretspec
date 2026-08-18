@@ -539,7 +539,7 @@ def test_interruption_cleanup_removes_only_created_tag_and_formula_change(
     ]
 
 
-def test_interruption_cleanup_never_deletes_pushed_tag(monkeypatch, release):
+def test_interruption_cleanup_never_deletes_pushed_tag(monkeypatch, release, cut):
     calls = []
     monkeypatch.setattr(
         release, "run", lambda argv, **kwargs: calls.append(argv) or completed(argv)
@@ -549,3 +549,112 @@ def test_interruption_cleanup_never_deletes_pushed_tag(monkeypatch, release):
         release.CleanupState(tag_created=True, tag_pushed=True, formula_changed=False),
     )
     assert calls == []
+
+
+class FakeResponse:
+    """Minimal stand-in for the object `urlopen` returns as a context manager."""
+
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def read(self, _size):
+        payload, self._payload = self._payload, b""
+        return payload
+
+
+def test_the_archive_fetch_survives_a_tarball_that_is_not_ready_yet(
+    monkeypatch, release, cut
+):
+    # GitHub builds the source tarball on first request, and this fetch happens
+    # after the tag and Release are published. Giving up on the first 404 sends
+    # the operator down the by-hand resume path for a wait.
+    import hashlib
+
+    attempts = []
+    slept = []
+
+    def flaky(_request, timeout=None):
+        attempts.append(timeout)
+        if len(attempts) < 3:
+            raise release.urllib.error.URLError("not found")
+        return FakeResponse(b"tarball")
+
+    monkeypatch.setattr(release.urllib.request, "urlopen", flaky)
+    monkeypatch.setattr(release.time, "sleep", slept.append)
+
+    assert release.archive_sha256(cut, dry_run=False) == hashlib.sha256(
+        b"tarball"
+    ).hexdigest()
+    assert len(attempts) == 3
+    # Backoff doubles rather than hammering a tag that is still being packed.
+    assert slept == [release.ARCHIVE_BACKOFF_SECONDS, release.ARCHIVE_BACKOFF_SECONDS * 2]
+
+
+def test_a_tarball_that_never_appears_names_the_by_hand_resume_path(
+    monkeypatch, release, cut
+):
+    monkeypatch.setattr(
+        release.urllib.request,
+        "urlopen",
+        lambda *_a, **_k: (_ for _ in ()).throw(release.urllib.error.URLError("gone")),
+    )
+    monkeypatch.setattr(release.time, "sleep", lambda _s: None)
+
+    with pytest.raises(release.ReleaseError) as caught:
+        release.archive_sha256(cut, dry_run=False)
+    # The tag is already public at this point, so the message has to say so.
+    assert "do not re-run" in str(caught.value)
+
+
+def test_a_partial_download_does_not_poison_the_retry(monkeypatch, release, cut):
+    # The hasher is rebuilt per attempt; a stream that dies mid-body has already
+    # fed bytes to it, and reusing it would return a digest of retry + retry.
+    import hashlib
+
+    class HalfThenFail(FakeResponse):
+        """Delivers a chunk, then dies -- the case that poisons a shared hasher."""
+
+        def __init__(self):
+            super().__init__(b"")
+            self._served = False
+
+        def read(self, _size):
+            if not self._served:
+                self._served = True
+                return b"partial-"
+            raise OSError("connection reset")
+
+    responses = [HalfThenFail(), FakeResponse(b"tarball")]
+    monkeypatch.setattr(
+        release.urllib.request, "urlopen", lambda *_a, **_k: responses.pop(0)
+    )
+    monkeypatch.setattr(release.time, "sleep", lambda _s: None)
+
+    assert release.archive_sha256(cut, dry_run=False) == hashlib.sha256(
+        b"tarball"
+    ).hexdigest()
+
+
+def test_a_failed_command_reports_what_it_printed(release):
+    # Every command runs captured, so `str(error)` alone gives the exit status
+    # and no reason -- which is what the operator sees when a release dies.
+    error = subprocess.CalledProcessError(
+        1, ["git", "push", "origin", "HEAD"], output="", stderr="remote: rejected\n"
+    )
+    described = release.describe(error)
+    assert "git push origin HEAD" in described
+    assert "remote: rejected" in described
+    assert "exit 1" in described
+
+
+def test_a_failed_command_with_only_stdout_still_explains_itself(release):
+    error = subprocess.CalledProcessError(
+        2, ["brew", "test", "x"], output="Error: no such keg\n", stderr=""
+    )
+    assert "no such keg" in release.describe(error)

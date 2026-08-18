@@ -28,6 +28,8 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import time
+import urllib.error
 import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -67,6 +69,14 @@ ANY_VERSION_RE = re.compile(
 # adding a fifth site fails this script loudly instead of shipping a formula
 # that is only half restamped.
 FORMULA_VERSION_SITES = 4
+# GitHub generates the source tarball for a tag on first request, so the fetch
+# in `archive_sha256` can 404 or time out for a few seconds after the Release is
+# created. That fetch happens *after* the tag and Release are published, which
+# are the irreversible steps -- a transient failure there drops the operator
+# into the justfile's "do NOT re-run, finish by hand" path for no reason. Retry
+# instead. Delays double from the first: 3s, 6s, 12s, 24s.
+ARCHIVE_ATTEMPTS = 5
+ARCHIVE_BACKOFF_SECONDS = 3
 
 
 class ReleaseError(RuntimeError):
@@ -300,14 +310,36 @@ def archive_sha256(release: Release, *, dry_run: bool) -> str:
     if dry_run:
         log(f"[dry-run] hash {release.archive_url}")
         return "0" * 64
-    digest = hashlib.sha256()
     request = urllib.request.Request(
         release.archive_url, headers={"User-Agent": "sudo-secretspec-release"}
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        while chunk := response.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+    delay = ARCHIVE_BACKOFF_SECONDS
+    last_error: Exception | None = None
+    for attempt in range(1, ARCHIVE_ATTEMPTS + 1):
+        # Fresh digest per attempt: a stream that failed part way through has
+        # already fed bytes to the hasher, and reusing it would hash the partial
+        # body and the retry together.
+        digest = hashlib.sha256()
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                while chunk := response.read(1024 * 1024):
+                    digest.update(chunk)
+            return digest.hexdigest()
+        except (urllib.error.URLError, OSError) as error:
+            last_error = error
+            if attempt == ARCHIVE_ATTEMPTS:
+                break
+            log(
+                f"archive not ready ({error}); attempt {attempt}/{ARCHIVE_ATTEMPTS}, "
+                f"retrying in {delay}s"
+            )
+            time.sleep(delay)
+            delay *= 2
+    raise ReleaseError(
+        f"could not fetch {release.archive_url} after {ARCHIVE_ATTEMPTS} attempts: "
+        f"{last_error}. The tag and Release are already published -- do not re-run "
+        "`just release`; finish by hand per the justfile RESUME RULES."
+    )
 
 
 def create_tag_and_release(
@@ -543,8 +575,25 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def describe(error: subprocess.CalledProcessError) -> str:
+    """Render a failed command with the output it actually produced.
+
+    Every command here runs with `capture=True`, so `str(error)` alone reports
+    the exit status and nothing else -- the reason git, gh or brew refused is
+    captured and then discarded. A release that dies mid-flight is expensive and
+    often has to be finished by hand, so the operator needs the message.
+    """
+    command = " ".join(str(value) for value in error.cmd)
+    detail = (error.stderr or "").strip() or (error.stdout or "").strip()
+    return f"command failed (exit {error.returncode}): {command}" + (
+        f"\n{detail}" if detail else ""
+    )
+
+
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (ReleaseError, subprocess.CalledProcessError) as error:
+    except ReleaseError as error:
         raise SystemExit(str(error)) from error
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(describe(error)) from error
