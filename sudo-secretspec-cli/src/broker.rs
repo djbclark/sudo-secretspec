@@ -792,6 +792,46 @@ fn preserved(edited: secretspec::Spec) -> Result<String, String> {
         .ok_or_else(|| "edited manifest kept no source text".to_string())
 }
 
+/// Guard 1 of `source-undeclare`, as a decision over text rather than files.
+///
+/// `None` is the installer stating there is no tracked declaration source at
+/// all. A name cannot be Git content of a file that does not exist, so nothing
+/// is protected and `undeclare` proceeds. That is a positive fact about the
+/// configuration, and deliberately *not* the same as a configured template that
+/// will not parse — which stays fail-closed in the `Err` arm, because an
+/// unparseable template is not evidence that the name is absent from it, and
+/// this guard exists to protect exactly the names it might have failed to read.
+///
+/// Distinguishing the two at the type level is the only reason relaxing a
+/// deliberately fail-closed guard is sound here. Were `None` refused instead,
+/// `add` could dirty the runtime manifest on the cheap NOPASSWD path while
+/// nothing could ever move it back — the exact asymmetry this verb exists to
+/// fix.
+///
+/// Stays on `manifest_edit` while the sibling edits go through `Spec`, for two
+/// reasons specific to this guard:
+///
+/// 1. `Spec::declares_secret_in_text` answers `bool`, treating an unparseable
+///    document as "not declared" — the fail-*open* answer this must never give.
+/// 2. Reaching it needs a `Spec`, and the only filesystem-free constructor,
+///    `Spec::from_toml`, refuses `project.extends`. The template is
+///    operator-controlled Git content; the day it inherits, `undeclare` would
+///    start refusing every name.
+///
+/// A question about text is answered by the function that takes text and
+/// returns `Result`.
+fn tracked_source_protects(
+    template: Option<&str>,
+    profile: &str,
+    name: &str,
+) -> Result<bool, String> {
+    match template {
+        None => Ok(false),
+        Some(text) => secretspec::manifest_edit::declares_secret(text, profile, name)
+            .map_err(|e| e.to_string()),
+    }
+}
+
 fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>) {
     // The ambient environment was purged in `run` before dispatch; see
     // `purge_ambient_env`.
@@ -912,38 +952,23 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
         //    a secret on disk that no longer appears in `check`. `delete`
         //    first, then undeclare; that mirrors `add` then `set`.
         "source-undeclare" => {
-            let declarations_path = match &cfg.declarations {
-                Some(p) => p,
-                None => {
-                    eprintln!("broker: config provides no declarations file");
-                    return (2, vec![name.into()]);
-                }
+            // Reading is the only part of guard 1 that touches the filesystem;
+            // the decision itself is `tracked_source_protects`, over text.
+            //
+            // A *configured* path that will not open stays fail-closed: that is
+            // equally consistent with a broken install. An absent key is not —
+            // see `tracked_source_protects`.
+            let template = match &cfg.declarations {
+                Some(path) => match std::fs::read_to_string(path) {
+                    Ok(text) => Some(text),
+                    Err(e) => {
+                        eprintln!("broker: cannot read declaration template: {e}");
+                        return (2, vec![name.into()]);
+                    }
+                },
+                None => None,
             };
-            let template = match std::fs::read_to_string(declarations_path) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("broker: cannot read declaration template: {e}");
-                    return (2, vec![name.into()]);
-                }
-            };
-            // Fail closed: an unparseable template is not evidence that the
-            // name is absent from it, and this guard exists to protect exactly
-            // the names it might have failed to read.
-            //
-            // Stays on `manifest_edit` while the two edits above went through
-            // `Spec`, for two reasons that are specific to this guard:
-            //
-            // 1. `Spec::declares_secret_in_text` answers `bool`, treating an
-            //    unparseable document as "not declared" — the fail-*open*
-            //    answer this guard must never give.
-            // 2. Reaching it needs a `Spec`, and the only filesystem-free
-            //    constructor, `Spec::from_toml`, refuses `project.extends`.
-            //    The template is operator-controlled Git content; the day it
-            //    inherits, `undeclare` would start refusing every name.
-            //
-            // A question about text is answered by the function that takes
-            // text and returns `Result`.
-            match secretspec::manifest_edit::declares_secret(&template, &cfg.profile, name) {
+            match tracked_source_protects(template.as_deref(), &cfg.profile, name) {
                 Ok(true) => {
                     eprintln!(
                         "broker: {name} is in the tracked declaration template; remove it \
@@ -1173,12 +1198,19 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
             }
         }
         "source-template-check" => {
-            let declarations = match &cfg.declarations {
-                Some(p) => p,
-                None => {
-                    eprintln!("broker: config provides no declarations file");
-                    return (2, vec![]);
-                }
+            // Retirement is a statement the installer makes, not a condition
+            // inferred from a failed read. `None` means no tracked declaration
+            // source is configured, which is a reportable steady state, not a
+            // failure — a check that can never pass teaches operators to ignore
+            // `doctor`, which is the convention every agent here is told to
+            // treat as a stop.
+            //
+            // A *configured* path that is missing or symlinked stays rc 2
+            // below: that is equally consistent with a broken install, which is
+            // exactly what this check exists to catch.
+            let Some(declarations) = &cfg.declarations else {
+                println!("no tracked declaration source configured");
+                return (0, vec![]);
             };
             if !declarations.is_file() || declarations.is_symlink() {
                 eprintln!("broker: declaration template missing or symlinked");
@@ -1689,6 +1721,47 @@ API_KEY = { description = "An existing key", required = true }
         let err = manifest_without_declaration(MANIFEST, "default", "NEVER_DECLARED")
             .expect_err("not declared");
         assert!(err.contains("NEVER_DECLARED"), "{err}");
+    }
+
+    /// The retirement decision: an absent tracked source is a positive fact,
+    /// so guard 1 has nothing to protect and `undeclare` proceeds. Refusing
+    /// here is what left the runtime manifest un-cleanable on a host whose
+    /// tracked declarations file was deliberately deleted.
+    #[test]
+    fn no_tracked_source_protects_nothing_so_undeclare_proceeds() {
+        assert_eq!(
+            tracked_source_protects(None, "default", "ANY_NAME"),
+            Ok(false)
+        );
+    }
+
+    /// The other half of the same decision, and the reason `None` may relax the
+    /// guard at all: a *configured* template that will not parse is still not
+    /// evidence the name is absent from it.
+    #[test]
+    fn an_unparseable_tracked_source_still_fails_closed() {
+        let err = tracked_source_protects(Some("this is not toml at all"), "default", "ANY_NAME")
+            .expect_err("unparseable template must not answer 'not declared'");
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn a_configured_tracked_source_still_protects_the_names_it_declares() {
+        let template = r#"[project]
+name = "fixture"
+revision = "1.0"
+
+[profiles.default]
+TRACKED_NAME = { description = "git content", required = true }
+"#;
+        assert_eq!(
+            tracked_source_protects(Some(template), "default", "TRACKED_NAME"),
+            Ok(true)
+        );
+        assert_eq!(
+            tracked_source_protects(Some(template), "default", "RUNTIME_ONLY_NAME"),
+            Ok(false)
+        );
     }
 
     #[test]

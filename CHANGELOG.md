@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `template-check` now reports "no tracked declaration source configured" and
+  succeeds when the root-owned config omits `declarations`, instead of failing
+  with an error. This is the state the optional `declarations` field was
+  introduced for: on a host whose tracked declarations file has been retired,
+  the check previously could never pass, which left `doctor` permanently red.
+- `undeclare` now proceeds when the root-owned config omits `declarations`,
+  instead of refusing. A name cannot belong to a tracked template that does not
+  exist, so nothing was being protected; refusing left the runtime manifest
+  un-cleanable, since `add` could still add declarations that nothing could
+  remove. A `declarations` path that *is* configured but cannot be read or
+  parsed still fails closed, unchanged.
+
 ### Changed
 
 - The privileged broker no longer requires `root` execution for mutation operations (`set`, `add`, `delete`, `undeclare`, etc.). These operations now execute securely as the dedicated `service_user` via `sudo -u`, dropping all incidental root privileges and strictly restricting the broker to the ownership bounds of its own vault directory.
