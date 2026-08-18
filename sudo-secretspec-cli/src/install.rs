@@ -161,6 +161,7 @@ fn capture_snapshot(snapshot: &Path) -> Result<usize, InstallError> {
             &snapshot.join(format!("{index}.path")),
             dest.display().to_string().as_bytes(),
             0o600,
+            "root:wheel",
         )?;
         manifest.push_str(&format!("{}  {}\n", sha256_file(&prior)?, dest.display()));
         captured += 1;
@@ -169,6 +170,7 @@ fn capture_snapshot(snapshot: &Path) -> Result<usize, InstallError> {
         &snapshot.join("MANIFEST.sha256"),
         manifest.as_bytes(),
         0o600,
+        "root:wheel",
     )?;
     Ok(captured)
 }
@@ -292,7 +294,7 @@ fn sha256_file(path: &Path) -> Result<String, InstallError> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
-fn install_file(src: &Path, dst: &Path, mode: u32) -> Result<(), InstallError> {
+fn install_file(src: &Path, dst: &Path, mode: u32, owner: &str) -> Result<(), InstallError> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -301,16 +303,15 @@ fn install_file(src: &Path, dst: &Path, mode: u32) -> Result<(), InstallError> {
     let mut perms = fs::metadata(&tmp)?.permissions();
     perms.set_mode(mode);
     fs::set_permissions(&tmp, perms)?;
-    // Best-effort ownership; already root when installer is root.
     let _ = Command::new("/usr/sbin/chown")
-        .args(["root:wheel"])
+        .arg(owner)
         .arg(&tmp)
         .status();
     fs::rename(&tmp, dst)?;
     Ok(())
 }
 
-fn write_bytes(dst: &Path, bytes: &[u8], mode: u32) -> Result<(), InstallError> {
+fn write_bytes(dst: &Path, bytes: &[u8], mode: u32, owner: &str) -> Result<(), InstallError> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -323,7 +324,7 @@ fn write_bytes(dst: &Path, bytes: &[u8], mode: u32) -> Result<(), InstallError> 
     perms.set_mode(mode);
     fs::set_permissions(&tmp, perms)?;
     let _ = Command::new("/usr/sbin/chown")
-        .args(["root:wheel"])
+        .arg(owner)
         .arg(&tmp)
         .status();
     fs::rename(&tmp, dst)?;
@@ -820,15 +821,26 @@ fn version_transition(previous: Option<&str>) -> String {
 /// load-bearing depends on a platform default this project does not own; the
 /// broker also pins `HOME` in-process (`broker::purge_ambient_env`), so the
 /// guarantee does not rest on the policy alone.
-pub fn sudoers_text(operator: &str) -> String {
+pub fn sudoers_text(operator: &str, service_user: &str) -> String {
     format!(
         "Defaults!{prefix}/libexec/sudo-secretspec env_reset,env_keep-=\"HOME\",secure_path=/usr/bin:/bin:/usr/sbin:/sbin,umask=0077,always_set_home\n\
          Defaults!{prefix}/bin/sudo-secretspec timestamp_timeout=0\n\
-         {operator} ALL=(root) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker *\n\
-         {operator} ALL=(root) NOPASSWD: {prefix}/libexec/sudo-secretspec doctor\n\
-         {operator} ALL=(root) NOPASSWD: {prefix}/libexec/sudo-secretspec doctor *\n",
+         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-add --*\n\
+         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-set --*\n\
+         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-delete --*\n\
+         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-undeclare --*\n\
+         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-get --*\n\
+         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-check --*\n\
+         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-export --*\n\
+         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-template-check --*\n\
+         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-schema --*\n\
+         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker audit-verify\n\
+         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec __broker source-restore --*\n\
+         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec doctor\n\
+         {operator} ALL=({service_user}) NOPASSWD: {prefix}/libexec/sudo-secretspec doctor *\n",
         prefix = PREFIX,
         operator = operator,
+        service_user = service_user,
     )
 }
 
@@ -1017,28 +1029,33 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
     let rollback = libexec.join(format!("{SNAPSHOT_PREFIX}{stamp}"));
     let captured = capture_snapshot(&rollback)?;
 
-    install_file(&media.broker, &client_dst, require_mode(&client_dst)?)?;
-    install_file(&media.broker, &broker_dst, require_mode(&broker_dst)?)?;
+    let root_owner = "root:wheel";
+    let service_owner = format!("{}:{}", req.service_user, req.service_group);
+
+    install_file(&media.broker, &client_dst, require_mode(&client_dst)?, root_owner)?;
+    install_file(&media.broker, &broker_dst, require_mode(&broker_dst)?, &service_owner)?;
     if let Some(decl) = &req.declarations {
         install_file(
             decl,
             &declarations_dst,
             require_mode(&declarations_dst)?,
+            &service_owner,
         )?;
     }
-    install_file(&media.retired, &retired_dst, require_mode(&retired_dst)?)?;
-    install_file(&media.guidance, &guidance_dst, require_mode(&guidance_dst)?)?;
+    install_file(&media.retired, &retired_dst, require_mode(&retired_dst)?, &service_owner)?;
+    install_file(&media.guidance, &guidance_dst, require_mode(&guidance_dst)?, &service_owner)?;
     write_bytes(
         &config_dst,
         config_toml(&req, &vault_real).as_bytes(),
         require_mode(&config_dst)?,
+        &service_owner,
     )?;
     // Validated before it can take effect, and rolled back if the combined
     // configuration is rejected — a broken sudoers.d file would leave the
     // operator unable to elevate at all.
     install_sudoers(
         &sudoers_dst,
-        &sudoers_text(&req.operator),
+        &sudoers_text(&req.operator, &req.service_user),
         require_mode(&sudoers_dst)?,
     )?;
 
@@ -1062,6 +1079,7 @@ pub fn run(req: InstallRequest) -> Result<(), InstallError> {
         &manifest_dst,
         manifest.as_bytes(),
         require_mode(&manifest_dst)?,
+        &service_owner,
     )?;
 
     // Runtime files for fresh install only.

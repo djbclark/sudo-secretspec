@@ -18,7 +18,8 @@ pub struct Config {
     pub audit_helper: PathBuf,
     pub vault: PathBuf,
     pub vault_realpath: PathBuf,
-    pub declarations: PathBuf,
+    #[serde(default)]
+    pub declarations: Option<PathBuf>,
     pub service_user: String,
     pub service_group: String,
     /// Manifest profile the broker resolves secrets from.
@@ -65,7 +66,11 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        for path in [&self.engine, &self.audit_helper, &self.declarations] {
+        let mut managed_paths = vec![&self.engine, &self.audit_helper];
+        if let Some(decl) = &self.declarations {
+            managed_paths.push(decl);
+        }
+        for path in managed_paths {
             if !path.is_absolute() {
                 return Err(ConfigError::Invalid("managed paths must be absolute"));
             }
