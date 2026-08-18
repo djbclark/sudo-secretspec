@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Deleting or destroying a secret now erases its plaintext from the database
+  file instead of leaving it readable on a freed page. SQLite's
+  `secure_delete` is a per-connection setting that is off by default in the
+  library this build links, so removing a value only unlinked it from the
+  index while its bytes stayed on disk until something happened to overwrite
+  them — meaning `destroy`, whose purpose is to make a value unrecoverable,
+  did not. Every connection the vault and the broker open now enables it.
+  Note this applies to values removed from now on: plaintext already left
+  behind by an earlier delete stays until the database is compacted with
+  `VACUUM`.
 - The installed sudoers policy no longer lets an unattended `restore --all`
   bypass authentication. Its NOPASSWD grant for `source-restore` used a `--*`
   wildcard that also matched `--all`, so a whole-vault restore ran with no

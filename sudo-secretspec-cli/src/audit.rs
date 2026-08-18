@@ -476,9 +476,14 @@ fn open_connection(
     if mode == VerifyMode::ReadWrite {
         conn.execute_batch("PRAGMA journal_mode=DELETE;")?;
     }
+    // `secure_delete` is defense-in-depth here rather than a fix: both ledgers
+    // this helper opens are append-only and hold no secret values, only digests
+    // and the declaration manifest. It costs one pragma to keep that true if
+    // either ever learns to prune or rotate.
     conn.execute_batch(
         "PRAGMA synchronous=FULL;\
          PRAGMA foreign_keys=ON;\
+         PRAGMA secure_delete=ON;\
          PRAGMA trusted_schema=OFF;",
     )?;
 

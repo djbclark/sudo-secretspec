@@ -1159,8 +1159,12 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
             // `destroyed_by` tombstones that the REFERENCES clause exists to
             // constrain, so it has to enable them too or the constraint does not
             // apply to the write that matters most.
-            if let Err(e) = conn.execute_batch("PRAGMA foreign_keys=ON;") {
-                eprintln!("broker: cannot enable foreign key enforcement: {e}");
+            // `secure_delete` is per-connection too, and off by default in the
+            // linked library. This connection is the one that runs `destroy`,
+            // so without it the verb whose entire purpose is to make a value
+            // unrecoverable left the plaintext sitting on a freed page.
+            if let Err(e) = conn.execute_batch("PRAGMA foreign_keys=ON;PRAGMA secure_delete=ON;") {
+                eprintln!("broker: cannot configure secret store connection: {e}");
                 return (2, vec![]);
             }
 

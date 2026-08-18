@@ -168,7 +168,16 @@ impl SqliteProvider {
             // a `destroyed_by` sequence no entry has. Every connection this
             // provider hands out comes through here, which is what makes one
             // line sufficient.
+            // `secure_delete` is also per-connection, and it is *off* in the
+            // library this crate links (Homebrew SQLite 3.53.4 reports 0).
+            // Without it SQLite unlinks a deleted row from the b-tree but
+            // leaves its bytes on the freed page, so `delete` — and the
+            // tombstoning `destroy` builds on it — left every plaintext value
+            // recoverable by reading the file. Setting it here makes freed
+            // content zeroed on the way out. It is not retroactive: residue
+            // already on freelist pages needs a `VACUUM`.
             "PRAGMA foreign_keys=ON;\
+             PRAGMA secure_delete=ON;\
              PRAGMA journal_mode=DELETE;\
              PRAGMA synchronous=FULL;\
              PRAGMA trusted_schema=OFF;\
@@ -813,6 +822,46 @@ mod tests {
         assert!(provider.delete(convention("KEY")).unwrap());
         assert!(!provider.delete(convention("KEY")).unwrap());
         assert!(provider.get(convention("KEY")).unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_leaves_no_plaintext_in_the_database_file() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("secrets.db");
+        let provider = provider(path.clone());
+        // Distinctive enough that a hit in the raw file cannot be coincidence,
+        // and long enough to occupy a cell rather than fit in a header.
+        let plaintext = "PLAINTEXT-CANARY-eb4c1f9a".repeat(8);
+
+        provider
+            .set(
+                convention("KEY"),
+                &SecretString::new(plaintext.clone().into()),
+            )
+            .unwrap();
+
+        // Anti-vacuity: prove the scan can find the value at all. Without this
+        // the test passes for free if the value never reached the file, or if
+        // the needle is simply wrong.
+        assert!(
+            file_contains(&path, plaintext.as_bytes()),
+            "precondition failed: plaintext is not in the file even before delete, \
+             so its later absence would prove nothing"
+        );
+
+        assert!(provider.delete(convention("KEY")).unwrap());
+
+        assert!(
+            !file_contains(&path, plaintext.as_bytes()),
+            "deleted plaintext is still readable in {}: PRAGMA secure_delete is \
+             not in effect on the provider's connections",
+            path.display()
+        );
+    }
+
+    fn file_contains(path: &Path, needle: &[u8]) -> bool {
+        let bytes = std::fs::read(path).unwrap();
+        bytes.windows(needle.len()).any(|window| window == needle)
     }
 
     #[test]
