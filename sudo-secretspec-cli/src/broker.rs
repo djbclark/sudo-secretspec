@@ -1945,4 +1945,416 @@ API_KEY = { description = "k", required = true }
         .expect_err("extends must not be resolved here");
         assert!(err.contains("extends"), "{err}");
     }
+
+    // -----------------------------------------------------------------------
+    // source-restore / source-restore-force / source-destroy
+    // -----------------------------------------------------------------------
+    //
+    // These verbs shipped with no coverage at all, and every one of the four
+    // defects found in them was found by hand against the live vault while the
+    // rest of this suite passed green. The fixture below therefore drives the
+    // real `execute` against a real `sqlite://…?history=true` vault rather than
+    // hand-seeding `captured_values`: three of those defects were mismatches
+    // between the bare name the caller passes and the full
+    // `{project}/{profile}/{key}` address the provider actually stores, which a
+    // hand-seeded table would have reproduced wrongly and so still missed.
+
+    /// `execute` sets `XDG_STATE_HOME` process-wide, so its tests cannot run
+    /// concurrently with each other.
+    static EXECUTE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const FIXTURE_MANIFEST: &str = r#"[project]
+name = "fixture"
+revision = "1.0"
+
+[profiles.default]
+ALPHA = { description = "first", required = true }
+BETA = { description = "second", required = false }
+"#;
+
+    /// A temp vault with the fixture manifest in place, plus the `Config` that
+    /// points `execute` at it.
+    ///
+    /// Built as a struct literal rather than through `Config::parse`: the
+    /// parser requires the vault to be a direct child of `/var/db`, which no
+    /// test may create. That validation is `config.rs`'s to cover, and these
+    /// tests are about what `execute` does once it holds a config.
+    fn execute_fixture() -> (tempfile::TempDir, Config) {
+        let vault = temp_vault();
+        std::fs::write(vault.path().join("secretspec.toml"), FIXTURE_MANIFEST).unwrap();
+        let cfg = Config {
+            engine: "/usr/local/libexec/secretspec".into(),
+            audit_helper: "/usr/local/libexec/sudo-secretspec-audit".into(),
+            vault: vault.path().to_path_buf(),
+            vault_realpath: vault.path().to_path_buf(),
+            declarations: None,
+            service_user: "_sudosecretspec".into(),
+            service_group: "_sudosecretspec".into(),
+            profile: "default".into(),
+            version: None,
+            adopted_vault: false,
+        };
+        (vault, cfg)
+    }
+
+    /// A stand-in for the digest the client computes. Not `EMPTY_REASON_SHA256`:
+    /// that constant is specifically the one the gate refuses, so using it here
+    /// would read as testing the refusal rather than the verb.
+    fn fixture_reason() -> String {
+        reason_sha256("restore fixture").unwrap()
+    }
+
+    /// The engine handle `execute` builds, reproduced so a fixture can seed the
+    /// vault through the same provider — including its history capture.
+    fn fixture_secrets(cfg: &Config) -> secretspec::Secrets {
+        let mut secrets =
+            secretspec::Secrets::load_from(&cfg.vault.join("secretspec.toml")).unwrap();
+        secrets.set_provider(format!(
+            "sqlite://{}?history=true",
+            cfg.vault.join("secrets.db").display()
+        ));
+        secrets.set_profile(cfg.profile.clone());
+        secrets.with_reason(fixture_reason())
+    }
+
+    fn broker_op(operation: &str) -> Broker {
+        Broker {
+            operation: operation.into(),
+            client: "test".into(),
+            reason_sha256: String::new(),
+            name: None,
+            command_basename: None,
+            description: None,
+            optional: false,
+            required: false,
+            to: None,
+            force: false,
+            all: false,
+        }
+    }
+
+    fn live_value(cfg: &Config, name: &str) -> Option<String> {
+        match fixture_secrets(cfg).resolve_named(name) {
+            Ok(secretspec::NamedResolution::Resolved(secret)) => secret.value,
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn restore_matches_a_bare_name_against_the_full_provider_address() {
+        // The defect this pins: `captured_values.item` holds
+        // `{project}/{profile}/{key}`, and `--name` is a bare key. Comparing the
+        // two directly matched nothing, so restore could never find a value —
+        // and reported "sequence N does not contain a value" for a sequence that
+        // did.
+        let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_vault, cfg) = execute_fixture();
+        let secrets = fixture_secrets(&cfg);
+
+        secrets.set("ALPHA", Some("original".into())).unwrap(); // sequence 1
+        secrets.delete("ALPHA").unwrap(); // sequence 2, ALPHA already gone
+        assert_eq!(
+            live_value(&cfg, "ALPHA"),
+            None,
+            "delete must clear the value"
+        );
+
+        // Sequence 1 is the last entry that still held ALPHA: `delete` captures
+        // *after* removing the row, so the deleted value lives only in the
+        // preceding entry.
+        let mut broker = broker_op("source-restore");
+        broker.name = Some("ALPHA".into());
+        broker.to = Some("1".into());
+
+        let (code, names) = execute(&broker, &cfg, &fixture_reason());
+
+        assert_eq!(code, 0, "restore must find ALPHA at sequence 1");
+        assert_eq!(names, vec!["ALPHA".to_string()]);
+        assert_eq!(live_value(&cfg, "ALPHA").as_deref(), Some("original"));
+    }
+
+    #[test]
+    fn restore_refuses_to_overwrite_a_name_that_still_holds_a_value() {
+        // Forward-safe by default: without `--force`, restoring over a live
+        // secret is refused rather than silently rewinding it.
+        let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_vault, cfg) = execute_fixture();
+        let secrets = fixture_secrets(&cfg);
+
+        secrets.set("ALPHA", Some("original".into())).unwrap(); // sequence 1
+        secrets.set("ALPHA", Some("current".into())).unwrap(); // sequence 2
+
+        let mut broker = broker_op("source-restore");
+        broker.name = Some("ALPHA".into());
+        broker.to = Some("1".into());
+
+        let (code, names) = execute(&broker, &cfg, &fixture_reason());
+
+        assert_eq!(code, 1, "a live value must block an unforced restore");
+        assert_eq!(names, vec!["ALPHA".to_string()]);
+        assert_eq!(
+            live_value(&cfg, "ALPHA").as_deref(),
+            Some("current"),
+            "the refused restore must not have written anything"
+        );
+
+        // …and the force verb is what gets past it.
+        let mut forced = broker_op("source-restore-force");
+        forced.name = Some("ALPHA".into());
+        forced.to = Some("1".into());
+
+        let (code, _) = execute(&forced, &cfg, &fixture_reason());
+
+        assert_eq!(code, 0);
+        assert_eq!(live_value(&cfg, "ALPHA").as_deref(), Some("original"));
+    }
+
+    #[test]
+    fn restore_all_feeds_bare_names_back_to_the_engine_not_addresses() {
+        // The mirror of the first defect: `--all` used to hand the full
+        // `{project}/{profile}/{key}` address straight to `set`, which speaks
+        // bare names, so every restore failed on an undeclared name.
+        let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_vault, cfg) = execute_fixture();
+        let secrets = fixture_secrets(&cfg);
+
+        secrets.set("ALPHA", Some("a1".into())).unwrap(); // sequence 1
+        secrets.set("BETA", Some("b1".into())).unwrap(); // sequence 2: both present
+        secrets.delete("ALPHA").unwrap();
+        secrets.delete("BETA").unwrap();
+
+        let mut broker = broker_op("source-restore");
+        broker.all = true;
+        broker.to = Some("2".into());
+
+        let (code, mut names) = execute(&broker, &cfg, &fixture_reason());
+        names.sort();
+
+        assert_eq!(code, 0);
+        assert_eq!(names, vec!["ALPHA".to_string(), "BETA".to_string()]);
+        assert_eq!(live_value(&cfg, "ALPHA").as_deref(), Some("a1"));
+        assert_eq!(live_value(&cfg, "BETA").as_deref(), Some("b1"));
+    }
+
+    #[test]
+    fn restore_requires_a_target_and_a_selector() {
+        let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_vault, cfg) = execute_fixture();
+        fixture_secrets(&cfg)
+            .set("ALPHA", Some("a1".into()))
+            .unwrap();
+
+        // No `--to` at all.
+        let mut broker = broker_op("source-restore");
+        broker.name = Some("ALPHA".into());
+        assert_eq!(execute(&broker, &cfg, &fixture_reason()).0, 2);
+
+        // A `--to` that is not a sequence integer.
+        broker.to = Some("yesterday".into());
+        assert_eq!(execute(&broker, &cfg, &fixture_reason()).0, 2);
+
+        // Neither `--name` nor `--all`.
+        let mut unselective = broker_op("source-restore");
+        unselective.to = Some("1".into());
+        assert_eq!(execute(&unselective, &cfg, &fixture_reason()).0, 2);
+    }
+
+    #[test]
+    fn restoring_a_name_absent_from_that_sequence_reports_not_found() {
+        // rc 1, not rc 0: the name is real and the sequence is real, but that
+        // sequence never held it. Reporting success here is what let the
+        // address-mismatch defect hide.
+        let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_vault, cfg) = execute_fixture();
+        fixture_secrets(&cfg)
+            .set("ALPHA", Some("a1".into()))
+            .unwrap(); // sequence 1: ALPHA only
+
+        let mut broker = broker_op("source-restore");
+        broker.name = Some("BETA".into());
+        broker.to = Some("1".into());
+
+        let (code, names) = execute(&broker, &cfg, &fixture_reason());
+
+        assert_eq!(code, 1);
+        assert_eq!(names, vec!["BETA".to_string()]);
+        assert_eq!(live_value(&cfg, "BETA"), None);
+    }
+
+    #[test]
+    fn a_non_utf8_capture_is_refused_rather_than_restored_as_an_empty_string() {
+        // `unwrap_or_default` here turned an unreadable capture into "", so the
+        // restore overwrote a live secret with nothing and reported success — a
+        // value loss dressed as a recovery. The blob is written directly because
+        // the engine's own `set` only accepts a `String`.
+        let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_vault, cfg) = execute_fixture();
+        let secrets = fixture_secrets(&cfg);
+        secrets.set("ALPHA", Some("original".into())).unwrap(); // sequence 1
+
+        let conn = rusqlite::Connection::open(cfg.vault.join("secrets.db")).unwrap();
+        conn.execute(
+            "UPDATE captured_values SET value_blob = ?1 WHERE sequence = 1",
+            rusqlite::params![&[0xff_u8, 0xfe][..]],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut broker = broker_op("source-restore-force");
+        broker.name = Some("ALPHA".into());
+        broker.to = Some("1".into());
+
+        let (code, _) = execute(&broker, &cfg, &fixture_reason());
+
+        assert_eq!(code, 2, "an unreadable capture must not restore");
+        assert_eq!(
+            live_value(&cfg, "ALPHA").as_deref(),
+            Some("original"),
+            "the live value must survive a refused restore untouched"
+        );
+    }
+
+    #[test]
+    fn destroy_tombstones_every_captured_copy_of_the_name() {
+        // The defect: `UPDATE … WHERE item = <bare name>` matched zero rows, so
+        // `destroy` reported success while every captured copy stayed readable —
+        // the single outcome this verb exists to prevent. Asserting "the value
+        // is gone from history" is therefore the whole test; a rc-0 assertion
+        // alone would have passed throughout.
+        let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_vault, cfg) = execute_fixture();
+        let secrets = fixture_secrets(&cfg);
+        secrets.set("ALPHA", Some("leaked".into())).unwrap(); // sequence 1
+        secrets.set("BETA", Some("keep-me".into())).unwrap(); // sequence 2: both captured
+
+        let mut broker = broker_op("source-destroy");
+        broker.name = Some("ALPHA".into());
+
+        let (code, names) = execute(&broker, &cfg, &fixture_reason());
+
+        assert_eq!(code, 0);
+        assert_eq!(names, vec!["ALPHA".to_string()]);
+        assert_eq!(live_value(&cfg, "ALPHA"), None, "destroy also deletes");
+
+        let conn = rusqlite::Connection::open(cfg.vault.join("secrets.db")).unwrap();
+        let readable: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM captured_values \
+                 WHERE item LIKE '%/ALPHA' AND value_blob IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(readable, 0, "no captured copy of ALPHA may remain readable");
+
+        // Tombstoning is per-name, and the entry still proves what was
+        // destroyed: the digest and `destroyed_by` survive the nulled blob.
+        let (with_digest, destroyed_by): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT count(*), max(destroyed_by) FROM captured_values \
+                 WHERE item LIKE '%/ALPHA' AND value_sha256 IS NOT NULL",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            with_digest > 0,
+            "the proof of what was destroyed must remain"
+        );
+        assert!(destroyed_by.is_some(), "destroyed_by must record the entry");
+
+        let beta_readable: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM captured_values \
+                 WHERE item LIKE '%/BETA' AND value_blob IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(beta_readable > 0, "destroy must not touch other names");
+    }
+
+    #[test]
+    fn destroy_requires_a_name_and_refuses_one_with_no_history() {
+        let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_vault, cfg) = execute_fixture();
+        fixture_secrets(&cfg)
+            .set("ALPHA", Some("a1".into()))
+            .unwrap();
+
+        // `--all` is not a destroy selector; destroy is one name at a time.
+        assert_eq!(
+            execute(&broker_op("source-destroy"), &cfg, &fixture_reason()).0,
+            2,
+            "destroy without --name must not proceed"
+        );
+
+        // BETA is declared but was never set, so `delete` finds nothing and the
+        // verb stops before it can claim to have tombstoned anything.
+        let mut broker = broker_op("source-destroy");
+        broker.name = Some("BETA".into());
+        assert_ne!(
+            execute(&broker, &cfg, &fixture_reason()).0,
+            0,
+            "a name with no captured history must not report success"
+        );
+    }
+
+    #[test]
+    fn executes_own_provider_uri_retains_history_so_a_mutation_is_recoverable() {
+        // `?history=true` on the URI `execute` builds is what makes the restore
+        // verbs possible at all, and it is invisible from their side: seeding a
+        // fixture through a history-enabled handle leaves enough history for
+        // `destroy` and `restore` to pass even when `execute` itself retains
+        // nothing. What that combination actually produces is a `delete` that
+        // discards the value with no capture behind it — irrecoverable loss
+        // rather than a missing feature — so the retention is asserted on the
+        // entry *`execute` itself* writes.
+        let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_vault, cfg) = execute_fixture();
+        fixture_secrets(&cfg)
+            .set("ALPHA", Some("a1".into()))
+            .unwrap(); // sequence 1
+
+        let count_entries = || -> i64 {
+            rusqlite::Connection::open(cfg.vault.join("secrets.db"))
+                .unwrap()
+                .query_row("SELECT count(*) FROM entries", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(count_entries(), 1);
+
+        let mut broker = broker_op("source-delete");
+        broker.name = Some("ALPHA".into());
+        assert_eq!(execute(&broker, &cfg, &fixture_reason()).0, 0);
+
+        assert_eq!(
+            count_entries(),
+            2,
+            "a mutation made through `execute` must leave a history entry behind it"
+        );
+
+        // And the value really is recoverable from the entry that preceded it,
+        // which is the property the retention exists for.
+        let mut restore = broker_op("source-restore");
+        restore.name = Some("ALPHA".into());
+        restore.to = Some("1".into());
+        assert_eq!(execute(&restore, &cfg, &fixture_reason()).0, 0);
+        assert_eq!(live_value(&cfg, "ALPHA").as_deref(), Some("a1"));
+    }
+
+    #[test]
+    fn the_restore_verbs_refuse_a_vault_with_no_history_database() {
+        // rc 2 rather than a panic or a silent success: an absent `secrets.db`
+        // means the vault was never migrated, which is a broken install, not an
+        // empty history.
+        let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_vault, cfg) = execute_fixture();
+
+        let mut broker = broker_op("source-restore");
+        broker.name = Some("ALPHA".into());
+        broker.to = Some("1".into());
+
+        assert_ne!(execute(&broker, &cfg, &fixture_reason()).0, 0);
+    }
 }
