@@ -1286,13 +1286,22 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                     // The tombstone marks the row; this removes the bytes it
                     // used to carry. Blobs are keyed per item, so nothing
                     // another name depends on can be reached from here. The
-                    // live-digest guard matters only for a name destroyed and
-                    // later re-set to the same value: that value is live again
-                    // by the operator's own action, so its blob stays.
+                    // live guard matters only for a name destroyed and later
+                    // re-set to the same value: that value is live again by
+                    // the operator's own action, so its blob stays.
+                    //
+                    // Selecting `live_blob_id` rather than a digest is what
+                    // makes the guard exact — it is NULL for every tombstone
+                    // by construction, so a destroyed snapshot cannot vouch
+                    // for bytes. `IS NOT NULL` in the subquery is required,
+                    // not tidiness: a single NULL makes `NOT IN` never true
+                    // and this statement would silently delete nothing.
+                    // `ON DELETE RESTRICT` is the backstop if it ever does
+                    // get this wrong.
                     if let Err(e) = conn.execute(
-                        "DELETE FROM value_blobs WHERE item = ?1 AND value_sha256 NOT IN \
-                         (SELECT value_sha256 FROM captured_values \
-                          WHERE item = ?1 AND destroyed_by IS NULL)",
+                        "DELETE FROM value_blobs WHERE item = ?1 AND blob_id NOT IN \
+                         (SELECT live_blob_id FROM captured_values \
+                          WHERE item = ?1 AND live_blob_id IS NOT NULL)",
                         rusqlite::params![item],
                     ) {
                         eprintln!("broker: cannot remove destroyed history values: {e}");
@@ -1330,17 +1339,20 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                 // full address and so never matched, while `--all` fed full
                 // addresses back into `set` as if they were names.
                 let captured: Vec<(String, Vec<u8>)> = {
-                    // Filtering on `destroyed_by IS NULL` rather than on the
-                    // presence of bytes keeps the tombstone authoritative. The
-                    // two agreed when every row carried its own blob; with
-                    // blobs shared across an item's snapshots they can differ,
-                    // and a destroyed row must never restore even when an
-                    // identical value was later re-set under the same name.
+                    // Joining on `live_blob_id` is what keeps the tombstone
+                    // authoritative, and it needs no companion filter: the
+                    // column is NULL for every destroyed row, so those rows
+                    // cannot join at all. Matching on `(item, value_sha256)`
+                    // instead — the shape this replaced — let a destroyed
+                    // snapshot restore again as soon as an identical value was
+                    // re-set under the same name, because the recreated blob
+                    // matched the tombstone's digest. It took a `destroyed_by
+                    // IS NULL` filter to hold that shut, and mutation testing
+                    // showed the filter could be deleted with the suite green.
                     let mut stmt = match conn.prepare(
                         "SELECT cv.item, b.value_blob FROM captured_values cv \
-                         JOIN value_blobs b \
-                           ON b.item = cv.item AND b.value_sha256 = cv.value_sha256 \
-                         WHERE cv.sequence = ?1 AND cv.destroyed_by IS NULL",
+                         JOIN value_blobs b ON b.blob_id = cv.live_blob_id \
+                         WHERE cv.sequence = ?1",
                     ) {
                         Ok(stmt) => stmt,
                         Err(e) => {
@@ -2413,12 +2425,18 @@ BETA = { description = "second", required = false }
     #[test]
     fn a_destroyed_snapshot_stays_unrestorable_once_the_same_value_is_set_again() {
         // The one case where "has readable bytes" and "was not destroyed"
-        // disagree. Blobs are keyed `(item, value_sha256)` and shared across an
-        // item's snapshots, so re-setting a destroyed name to the value it used
-        // to hold recreates the very blob `destroy` deleted. A restore that
-        // decided what is recoverable by joining `value_blobs` would then hand
-        // back a tombstoned snapshot -- undestroying it. Only
-        // `destroyed_by IS NULL` keeps the tombstone authoritative.
+        // disagree. Re-setting a destroyed name to the value it used to hold
+        // writes back a byte-identical blob under the same `(item,
+        // value_sha256)`, so a restore that decided what is recoverable by
+        // matching on the digest would hand back a tombstoned snapshot --
+        // undestroying it.
+        //
+        // Restore joins on `live_blob_id` instead, which is NULL for every
+        // tombstone, so the destroyed row cannot join at all. The recreated
+        // blob carries a *new* `blob_id`, and the tombstone's own `blob_id`
+        // still names the one that was deleted. This used to need an explicit
+        // `destroyed_by IS NULL` filter, and mutation testing showed that
+        // filter could be deleted with the whole suite green.
         let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (_vault, cfg) = execute_fixture();
         let secrets = fixture_secrets(&cfg);

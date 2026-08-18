@@ -33,6 +33,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A destroyed history snapshot can no longer become restorable again. Setting a
+  secret back to a value it previously held recreated the exact stored copy
+  `destroy` had removed, and because snapshots referred to their bytes by
+  content, the destroyed snapshot matched that copy and could be restored.
+  Snapshots now refer to a specific stored copy rather than to whatever
+  currently matches, so a destroyed one refers to something that no longer
+  exists and stays destroyed. The database upgrades itself in place on first
+  open; no action is required, and `restore`, `destroy` and history
+  verification are otherwise unchanged. An upgrade refuses, and reports which
+  snapshot is at fault, if it finds a destroyed snapshot that still holds its
+  plaintext or a live one whose bytes are missing, rather than guessing which
+  of the two records is right.
+- History rows can no longer be deleted, and a destroyed snapshot cannot be
+  re-attributed to a different event once recorded.
 - The vault stores each distinct captured value once instead of repeating its
   plaintext in every history snapshot. History captures every secret on every
   operation, so the stored copies previously grew with entries x secrets. The
