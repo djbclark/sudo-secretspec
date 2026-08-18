@@ -84,6 +84,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The protected config records the installer's `version`. Configs written by
   earlier installers parse unchanged; until the first install that writes it,
   `doctor` reports no upgrade rather than guessing at one.
+- A hash-chained history store (`broker-history.sqlite3`) behind the privilege
+  boundary in the vault, recording pre-mutation snapshots of the manifest and
+  secret values. Entries chain over metadata and per-value SHA-256 digests
+  rather than raw secret bytes, allowing individual values to be destroyed
+  later while keeping the history chain verifiable and tamper-evident. The
+  store shares the audit ledger's hardening (0600 mode, ownership verification,
+  and inode swap detection).
+- The broker now archives pre-mutation copies of the manifest and dotenv into
+  the vault history store on every mutation (`set`, `add`, `delete`,
+  `undeclare`) instead of deleting them on commit. If archiving fails after a
+  mutation commits, the operation succeeds and rollback copies are preserved
+  in the vault for recovery and reported by `doctor`. History listings verify
+  the hash chain on read and report entry metadata without exposing secret
+  values or digests.
 
 ### Added
 
@@ -259,6 +273,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restores the document byte for byte.
 
 ### Fixed
+
+- `sudo-secretspec undeclare` now captures a rollback copy of the vault manifest
+  before rewriting it, matching the protection `set`, `add`, and `delete`
+  already have. Previously, `undeclare` was missing from the broker's mutating
+  operations set, so an interrupted write could leave the vault manifest
+  corrupt without a rollback copy to recover from.
 
 - The refusal `sudo-secretspec install` prints when it is run from the
   installed boundary itself no longer tells the operator to re-run the command
