@@ -12,19 +12,29 @@ created_at: 2026-08-18T19:13:20-0400
 writer: claude-code
 ---
 
-# Handoff — the merge got reviewed and grew conditions; two live bugs fell out
+# Handoff — the merge got reviewed and grew conditions; both "live bugs" died
+
+(The filename says `two-live-bugs`; it is kept for link stability but is
+**wrong**. One of the two did not exist and the other was overstated. This
+document's own review is the reason we know that.)
 
 ## The Goal
 
 Resume from `ccbb` and execute its stated next action: the two-database file
 layout (`secrets.db` alone | new `broker.sqlite3` taking both broker ledgers).
 
-**No code was written, on purpose.** The design review found enough that
-implementing first would have been wrong. The session produced: a corrected
-understanding of the merge's failure mode, four conditions on whether to do it
-at all, and **two live bugs in shipped `0.19.1-sudo.22` that have nothing to do
-with the merge**. The operator then redirected to shipping those two first,
-alone.
+**No code survives from this session, on purpose.** The design review found
+enough that implementing the merge first would have been wrong. It produced a
+corrected understanding of the merge's failure mode and four conditions on
+whether to do it at all.
+
+**Read the Evidence & Data section before acting on anything here.** The review
+reported two "live bugs"; on verification **one did not exist and the other was
+overstated**. The `busy_timeout` fix was written, mutation-tested, found to be a
+no-op, and reverted. Net code change this session: **none**. That retraction is
+the single most useful thing in this document — it is a worked example of the
+error class this project keeps hitting, caught by the discipline the project
+already mandates.
 
 ## Where We Are
 
@@ -52,9 +62,19 @@ Test baseline, re-derived and green: **`cargo test -p sudo-secretspec-cli` =
   caught it. `devenv 2.2.1` is now installed via
   `nix profile install --accept-flake-config nixpkgs#devenv`.
 
-- **Claimed the `head`-table collision "fails loudly — better than I feared."
-  That was wrong and is the most important correction in this document.** See
-  Key Decisions; the operational failure is silent.
+- **Claimed the `head`-table collision "fails loudly — better than I feared."**
+  Wrong; the operational failure is silent. See Key Decisions.
+
+- **Relayed both reviewers' `busy_timeout` finding as verified, and it was
+  false.** Wrote the fix, wrote a contention test, ran it green — then the
+  mutation survived, which exposed the line as a no-op. rusqlite has set a 5s
+  timeout on every open since forever. **Reverted.** The mutation step is the
+  only thing between this and shipping a fix for a bug that never existed with a
+  comment confidently explaining the bug.
+
+- **Stated the manifest chain is "never verified in production."** Overstated:
+  `capture` verifies it on every append (`history.rs:387`). Only the at-rest
+  `drift`/`doctor` check is missing.
 
 - **Proposed "my tables missing = empty" as the fix for F5. Both reviewers
   independently rejected it** and produced a better design (single-owner
@@ -63,11 +83,18 @@ Test baseline, re-derived and green: **`cargo test -p sudo-secretspec-cli` =
   finding for the caller to report*, and `audit.rs:1122-1142`
   (`read_only_verify_does_not_create_the_schema`) pins that behavior.
 
-- **One of four reviews produced nothing.** `gpt-5.6-sol-xhigh` exited rc=0
-  having written a single byte. `cursor-grok-4.6-xhigh` was still running when
-  this was written. So the conclusions rest on **two** substantive reviews
-  (`gpt-5.3-codex-xhigh` and a Fable 5 xhigh agent), not four. Do not cite "four
-  reviewers" downstream.
+- **Two of four reviews produced nothing.** `gpt-5.6-sol-xhigh` and
+  `cursor-grok-4.6-xhigh` both exited rc=0 having written a **single byte**.
+  Conclusions rest on **two** substantive reviews (`gpt-5.3-codex-xhigh` and a
+  Fable 5 xhigh agent). Do not cite "four reviewers" downstream. Note the
+  invocation used `cursor-agent --print --mode plan --model <m>`; a 1-byte rc=0
+  result is a silent failure mode worth checking for (`wc -c`) rather than
+  assuming a review happened.
+
+- **And the two that did respond were both wrong on their shared P0.** Diversity
+  of models did not help here: they agreed with each other, and agreement read
+  as corroboration. What actually caught it was mutation testing against the
+  code, not a third opinion.
 
 ## Key Decisions
 
@@ -119,27 +146,45 @@ Test baseline, re-derived and green: **`cargo test -p sudo-secretspec-cli` =
 
 ## Evidence & Data
 
-**LIVE BUG 1 — no `busy_timeout` anywhere in the CLI crate.** `grep -rn
-"busy_timeout\|busy_handler" sudo-secretspec-cli/src/` → **nothing**. The
-provider has one (`secretspec/src/provider/sqlite.rs:158`, 5s); neither ledger
-connection does, so `SQLITE_BUSY` returns immediately. `open_connection`
-(`audit.rs:431-529`) sets five pragmas and no busy timeout. Aggravator: every
-append takes `BEGIN IMMEDIATE` and re-walks the **entire chain under the lock**
-(`verify_rows`, `audit.rs:932` / `history.rs:387`), re-hashing every
-`manifest_blob` (up to 16MB each, `history.rs:23`). Today the two O(n) lock
-holds are in separate files; **the merge serializes them onto one lock.**
-Failure modes, all verified in source: busy attempt → rc 2 denial
-(`broker.rs:706-709`); busy terminal → **rc 126, outcome permanently
-unrecorded, unterminated attempt left in the ledger** (`broker.rs:763-773`);
-busy capture → swallowed warning, op reports success (`broker.rs:428-443`).
+**RETRACTED — "LIVE BUG 1: no `busy_timeout`" DOES NOT EXIST.** Both reviewers
+asserted it and I relayed it as verified. It is false. **rusqlite 0.31.0 calls
+`sqlite3_busy_timeout(db, 5000)` unconditionally on every `Connection::open`**
+(`~/.cargo/registry/src/index.crates.io-*/rusqlite-0.31.0/src/inner_connection.rs:121`).
+Every ledger connection therefore already has a 5s busy timeout, and the
+provider's explicit `busy_timeout(5s)` (`provider/sqlite.rs:158`) merely
+restates the library default rather than changing anything.
 
-**LIVE BUG 2 — the manifest chain is never verified in production.**
-`drift.rs:1036` verifies only `audit::verify_read_only`; there is no history
-equivalent anywhere. Every caller of `history::verify` is at `broker.rs:1805`,
-`1832`, `1855`, and `#[cfg(test)]` starts at `broker.rs:1560` — **all three are
-test-only.** `history::verify_read_only` and `history::list` have zero
-production callers. The manifest chain can rot, be truncated, or be tampered
-with and nothing in `drift`, `doctor`, or any command path notices.
+*How the error was made, because it is the reusable lesson:* `grep -rn
+busy_timeout sudo-secretspec-cli/src/` returns nothing, which is true — and I
+reported that grep result as a behavioral fact. **Absence of an explicit call is
+not absence of the behavior when a library sets a default.** Same class as the
+`sudo -n -l` and Android-`sqlite3` errors in `0adc`/`1acd`.
+
+*Caught by mutation testing, which is the only reason it was caught.* A test was
+written asserting an append waits for a competing writer; it passed. Removing
+`conn.busy_timeout(BUSY_TIMEOUT)?` left it **still passing** — a surviving
+mutation, i.e. a false CAUGHT. That survival was the evidence that the line
+changed nothing. The change was reverted; the tree is clean.
+
+*Consequence for the merge:* the reviewers' P0 contention argument is
+substantially defanged. Merging does not produce instant `SQLITE_BUSY`. The
+residual question is only whether a chain walk under `BEGIN IMMEDIATE` could
+ever exceed 5s as chains grow — a latency budget to **measure**, not a live bug.
+The three broker failure modes remain correctly described and are real *if* the
+timeout is ever exhausted: rc 2 denial (`broker.rs:706-709`), rc 126 with the
+outcome unrecorded (`broker.rs:763-773`), swallowed capture (`broker.rs:428-443`).
+
+**CORRECTED — "LIVE BUG 2" was overstated.** The manifest chain is **not**
+"never verified in production": `capture` calls `verify_rows` before every
+append (`history.rs:387`), exactly symmetric with audit (`audit.rs:932`). So a
+tampered or truncated manifest chain **is** caught — on the next mutation, which
+it then blocks. The real, much narrower gap: **`drift`/`doctor` never verifies
+the manifest chain at rest.** `drift.rs:1036` calls `audit::verify_read_only`
+with no history equivalent, and `history::verify_read_only` / `history::list`
+have no production callers (the three `history::verify` calls at
+`broker.rs:1805/1832/1855` are all after `#[cfg(test)]` at `broker.rs:1560`).
+Worth fixing — a deliberate integrity check should not be asymmetric between two
+ledgers of equal standing — but it is a detection-at-rest gap, not silent rot.
 
 **F1-F5 verdicts** (F1/F2/F3/F5 confirmed by both reviewers; F4 downgraded):
 
@@ -211,16 +256,19 @@ if not (split-brain from an old binary appending after the copy).
 
 ## Where We're Going
 
-1. **THE NEXT ACTION — fix the missing `busy_timeout`.** Set it on the
-   connections `open_connection` returns (`audit.rs:431-529`), which serves
-   **both** ledgers via `open_protected_db`. Match the provider's 5s
-   (`secretspec/src/provider/sqlite.rs:158`) unless there's reason to differ.
-   This is a live gap in shipped `0.19.1-sudo.22` under concurrent agents, and
-   it is a named precondition for the merge. Mutation-verify the test.
-2. **Wire the manifest chain into production verification.** Add a
-   `history::verify_read_only` call beside `drift.rs:1036`'s audit check, with
-   its own finding code (e.g. `HISTORY_VERIFY_FAILED`). Today the manifest chain
-   is verified only by test code.
+1. **THE NEXT ACTION — make `doctor`/`drift` verify the manifest chain at rest.**
+   Add a `history::verify_read_only` call beside `drift.rs:1036`'s audit check
+   with its own finding code (e.g. `HISTORY_VERIFY_FAILED`). This is the only
+   surviving item of the two originally reported; it is a detection-at-rest gap,
+   **not** silent rot (the chain is verified on every capture,
+   `history.rs:387`). Scope it honestly in the commit message.
+   **Do NOT add a `busy_timeout` call — see the retraction in Evidence & Data.
+   rusqlite already sets 5s on every open; such a line is a no-op and a
+   mutation test will (correctly) refuse to catch its removal.**
+2. **Before trusting any "X is missing" finding, prove the behavior, not the
+   grep.** Two of this session's three headline findings died on this. The
+   working method that caught it: write the test, then *remove the fix* — if the
+   test still passes, the fix changed nothing.
 3. **Then re-open the merge go/no-go** against the four conditions: (a)
    `busy_timeout` landed, (b) single-owner `broker_db` with atomic create+stamp
    replacing both `ensure_schema`s, (c) the both-present recovery rule
