@@ -104,6 +104,26 @@ pub use config::{
 };
 pub use error::{Result, SecretSpecError};
 pub use provider::{DiscoveryContext, ProducedValuePersistence, Provider};
+
+/// Re-exported so callers sharing a database with the `sqlite` provider bind
+/// to the same `rusqlite` this crate compiled against. Passing a `Connection`
+/// across the crate boundary only type-checks while both sides agree, and a
+/// version skew would otherwise surface as a confusing mismatch far from its
+/// cause.
+#[cfg(feature = "sqlite")]
+pub use rusqlite;
+
+/// The parts of the `sqlite` provider's history chain that a caller holding
+/// its own connection to the same database legitimately needs.
+///
+/// Deliberately narrow: the provider module stays private, and only chain
+/// *append* is shared. It exists so a second writer cannot end up with its own
+/// copy of the hashing rules — two implementations of one chain is how a
+/// ledger stops being provable.
+#[cfg(feature = "sqlite")]
+pub mod sqlite_history {
+    pub use crate::provider::sqlite::capture_history;
+}
 pub use report::{
     RESOLUTION_REPORT_SCHEMA_VERSION, ResolutionReport, ResolutionStatus, SecretResolution,
 };

@@ -1178,21 +1178,27 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                 // The bool matters. The provider only captures an entry when it
                 // actually removed a row, so `Ok(false)` — a name already
                 // source-deleted — means no new sequence exists. `MAX(sequence)`
-                // below would then return whatever unrelated entry sits at the
-                // tip and stamp *that* as the destroyer. The value would still be
-                // destroyed, but the ledger would name the wrong event, and a
-                // wrong answer in the record this project exists to make
-                // trustworthy is worse than a refusal.
+                // would then return whatever unrelated entry sits at the tip and
+                // stamp *that* as the destroyer: the value would be destroyed,
+                // but the ledger would name the wrong event.
+                //
+                // Rather than refuse (which left captured copies of an
+                // already-deleted name undestroyable), append a real entry for
+                // this destroy using the provider's own chain code. That keeps
+                // hashing in exactly one place, which was the objection to
+                // synthesising an entry here.
                 match secrets.delete(name) {
                     Ok(true) => {}
                     Ok(false) => {
-                        eprintln!(
-                            "broker: '{name}' has no live value, so there is no destroy event to \
-                             attribute its captured copies to. Its earlier deletion is already in \
-                             history; destroying copies of an already-deleted name needs a \
-                             history entry this verb cannot create."
-                        );
-                        return (2, vec![name.into()]);
+                        if let Err(e) =
+                            secretspec::sqlite_history::capture_history(&conn, "source-destroy")
+                        {
+                            eprintln!(
+                                "broker: '{name}' has no live value and a history entry to \
+                                 attribute its destruction to could not be appended: {e}"
+                            );
+                            return (2, vec![name.into()]);
+                        }
                     }
                     Err(e) => {
                         eprintln!("broker: {e}");
@@ -1262,8 +1268,8 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                 let mut tombstoned = 0usize;
                 for item in targets {
                     match conn.execute(
-                        "UPDATE captured_values SET value_blob = NULL, destroyed_by = ?1 \
-                         WHERE item = ?2 AND value_blob IS NOT NULL",
+                        "UPDATE captured_values SET destroyed_by = ?1 \
+                         WHERE item = ?2 AND destroyed_by IS NULL",
                         rusqlite::params![seq, item],
                     ) {
                         Ok(updated) => tombstoned += updated,
@@ -1271,6 +1277,22 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                             eprintln!("broker: cannot update history tombstones: {e}");
                             return (2, vec![name.into()]);
                         }
+                    }
+
+                    // The tombstone marks the row; this removes the bytes it
+                    // used to carry. Blobs are keyed per item, so nothing
+                    // another name depends on can be reached from here. The
+                    // live-digest guard matters only for a name destroyed and
+                    // later re-set to the same value: that value is live again
+                    // by the operator's own action, so its blob stays.
+                    if let Err(e) = conn.execute(
+                        "DELETE FROM value_blobs WHERE item = ?1 AND value_sha256 NOT IN \
+                         (SELECT value_sha256 FROM captured_values \
+                          WHERE item = ?1 AND destroyed_by IS NULL)",
+                        rusqlite::params![item],
+                    ) {
+                        eprintln!("broker: cannot remove destroyed history values: {e}");
+                        return (2, vec![name.into()]);
                     }
                 }
                 if tombstoned == 0 {
@@ -1304,9 +1326,17 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                 // full address and so never matched, while `--all` fed full
                 // addresses back into `set` as if they were names.
                 let captured: Vec<(String, Vec<u8>)> = {
+                    // Filtering on `destroyed_by IS NULL` rather than on the
+                    // presence of bytes keeps the tombstone authoritative. The
+                    // two agreed when every row carried its own blob; with
+                    // blobs shared across an item's snapshots they can differ,
+                    // and a destroyed row must never restore even when an
+                    // identical value was later re-set under the same name.
                     let mut stmt = match conn.prepare(
-                        "SELECT item, value_blob FROM captured_values \
-                         WHERE sequence = ?1 AND value_blob IS NOT NULL",
+                        "SELECT cv.item, b.value_blob FROM captured_values cv \
+                         JOIN value_blobs b \
+                           ON b.item = cv.item AND b.value_sha256 = cv.value_sha256 \
+                         WHERE cv.sequence = ?1 AND cv.destroyed_by IS NULL",
                     ) {
                         Ok(stmt) => stmt,
                         Err(e) => {
@@ -2291,7 +2321,8 @@ BETA = { description = "second", required = false }
 
         let conn = rusqlite::Connection::open(cfg.vault.join("secrets.db")).unwrap();
         conn.execute(
-            "UPDATE captured_values SET value_blob = ?1 WHERE sequence = 1",
+            "UPDATE value_blobs SET value_blob = ?1 WHERE (item, value_sha256) IN \
+             (SELECT item, value_sha256 FROM captured_values WHERE sequence = 1)",
             rusqlite::params![&[0xff_u8, 0xfe][..]],
         )
         .unwrap();
@@ -2336,8 +2367,10 @@ BETA = { description = "second", required = false }
         let conn = rusqlite::Connection::open(cfg.vault.join("secrets.db")).unwrap();
         let readable: i64 = conn
             .query_row(
-                "SELECT count(*) FROM captured_values \
-                 WHERE item LIKE '%/ALPHA' AND value_blob IS NOT NULL",
+                "SELECT count(*) FROM captured_values cv \
+                 JOIN value_blobs b \
+                   ON b.item = cv.item AND b.value_sha256 = cv.value_sha256 \
+                 WHERE cv.item LIKE '%/ALPHA'",
                 [],
                 |row| row.get(0),
             )
@@ -2362,8 +2395,10 @@ BETA = { description = "second", required = false }
 
         let beta_readable: i64 = conn
             .query_row(
-                "SELECT count(*) FROM captured_values \
-                 WHERE item LIKE '%/BETA' AND value_blob IS NOT NULL",
+                "SELECT count(*) FROM captured_values cv \
+                 JOIN value_blobs b \
+                   ON b.item = cv.item AND b.value_sha256 = cv.value_sha256 \
+                 WHERE cv.item LIKE '%/BETA'",
                 [],
                 |row| row.get(0),
             )
@@ -2464,12 +2499,17 @@ BETA = { description = "second", required = false }
     }
 
     #[test]
-    fn destroying_an_already_deleted_name_refuses_rather_than_misattributing_it() {
+    fn destroying_an_already_deleted_name_attributes_it_to_a_new_entry() {
         // The provider captures a history entry only when it actually removed a
         // row, so a name already source-deleted produces none. Taking
         // MAX(sequence) anyway stamped whatever unrelated entry sat at the tip as
         // the destroyer: the value is gone either way, but the ledger names the
         // wrong event, and this ledger's whole purpose is to be believable.
+        //
+        // This used to refuse, which kept the ledger honest but left captured
+        // copies of an already-deleted name undestroyable. It now appends a real
+        // entry for the destroy — so the tombstone points at the event that
+        // actually caused it, which is what the refusal was protecting.
         let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (_vault, cfg) = execute_fixture();
 
@@ -2487,15 +2527,36 @@ BETA = { description = "second", required = false }
         broker.name = Some("ALPHA".into());
         assert_eq!(
             execute(&broker, &cfg, &fixture_reason()).0,
-            2,
-            "destroying a name with no live value must refuse"
+            0,
+            "destroying captured copies of an already-deleted name must succeed"
         );
 
         let conn = rusqlite::Connection::open(cfg.vault.join("secrets.db")).unwrap();
         let tip_after: i64 = conn
             .query_row("SELECT MAX(sequence) FROM entries", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(tip_before, tip_after, "the refusal must not append history");
+        assert_eq!(
+            tip_after,
+            tip_before + 1,
+            "the destroy must append its own entry rather than borrow one"
+        );
+
+        // The original point of this test, preserved: every tombstone names the
+        // entry that destroyed it, never an unrelated one that happened to sit
+        // at the tip.
+        let misattributed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM captured_values \
+                 WHERE destroyed_by IS NOT NULL AND destroyed_by != ?1",
+                rusqlite::params![tip_after],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            misattributed, 0,
+            "no tombstone may name an entry other than the destroy that caused it"
+        );
+
         let tombstoned: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM captured_values WHERE destroyed_by IS NOT NULL",
@@ -2503,10 +2564,19 @@ BETA = { description = "second", required = false }
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(
-            tombstoned, 0,
-            "nothing may be stamped destroyed_by an unrelated entry"
-        );
+        assert!(tombstoned > 0, "the captured copies must actually be gone");
+
+        let readable: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM captured_values cv \
+                 JOIN value_blobs b \
+                   ON b.item = cv.item AND b.value_sha256 = cv.value_sha256 \
+                 WHERE cv.item LIKE '%/ALPHA'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(readable, 0, "and their bytes must be unreachable");
     }
 
     #[test]

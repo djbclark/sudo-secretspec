@@ -14,10 +14,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wildcard that also matched `--all`, so a whole-vault restore ran with no
   prompt even though `--force` restores already required one. `--all` now
   goes through the same auth-gated verb `--force` does.
-- `source-destroy` now refuses a name that has no live value instead of
-  tombstoning its captured copies against an unrelated history entry. The copies
-  were destroyed either way, but the ledger recorded the wrong event as having
-  destroyed them.
+- `source-destroy` can now destroy the captured copies of a name that has no
+  live value left. It previously refused, to avoid tombstoning those copies
+  against an unrelated history entry — the copies were destroyed either way,
+  but the ledger recorded the wrong event as having destroyed them. It now
+  appends a history entry for the destroy itself, so the tombstones name the
+  event that actually caused them.
+
+### Changed
+
+- The vault stores each distinct captured value once instead of repeating its
+  plaintext in every history snapshot. History captures every secret on every
+  operation, so the stored copies previously grew with entries x secrets. The
+  database upgrades itself in place on first open and is stamped with a schema
+  version; no action is required, and `restore`, `destroy` and history
+  verification are unaffected. Values are kept separately per secret name, so
+  destroying one name never reaches another name's history even when the two
+  hold the same value.
 - `source-restore`, `source-restore-force` and `source-destroy` no longer create
   an empty `secrets.db` when the vault has none. They refuse as before, but on
   the way out they used to leave a schema-less database behind.

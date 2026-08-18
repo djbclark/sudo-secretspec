@@ -178,29 +178,7 @@ impl SqliteProvider {
              ) STRICT;",
         );
         if self.config.history {
-            init_sql.push_str(
-                "CREATE TABLE IF NOT EXISTS entries (\
-                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,\
-                     timestamp_ns INTEGER NOT NULL,\
-                     operation TEXT NOT NULL,\
-                     previous_hash TEXT NOT NULL,\
-                     entry_hash TEXT NOT NULL UNIQUE\
-                 ) STRICT;\
-                 CREATE TABLE IF NOT EXISTS captured_values (\
-                     sequence INTEGER NOT NULL REFERENCES entries(sequence),\
-                     item TEXT NOT NULL,\
-                     value_blob BLOB,\
-                     value_sha256 TEXT NOT NULL,\
-                     destroyed_by INTEGER REFERENCES entries(sequence),\
-                     PRIMARY KEY (sequence, item),\
-                     CHECK ((value_blob IS NULL) = (destroyed_by IS NOT NULL))\
-                 ) STRICT;\
-                 CREATE TABLE IF NOT EXISTS head (\
-                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),\
-                     sequence INTEGER NOT NULL,\
-                     entry_hash TEXT NOT NULL\
-                 ) STRICT;",
-            );
+            init_sql.push_str(HISTORY_SCHEMA);
         }
         conn.execute_batch(&init_sql).map_err(|error| {
             operation_error(format!(
@@ -208,6 +186,9 @@ impl SqliteProvider {
                 self.config.path.display()
             ))
         })?;
+        if self.config.history {
+            migrate_history(&conn)?;
+        }
         Self::restrict_file(&self.config.path)?;
         Ok(conn)
     }
@@ -366,8 +347,181 @@ fn operation_error(message: impl Into<String>) -> SecretSpecError {
 
 const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
+/// Bumped whenever the on-disk history shape changes. Stamped into
+/// `PRAGMA user_version`, which starts life at 0 on every SQLite database —
+/// so 0 doubles as "pre-versioning", exactly the databases that need
+/// migrating.
+const SCHEMA_VERSION: i64 = 1;
+
+/// Version 1 stores each distinct value once in `value_blobs` instead of
+/// repeating the plaintext in every `captured_values` row.
+///
+/// `value_blobs` is keyed by `(item, value_sha256)` rather than by the digest
+/// alone. Global content-addressing would dedup marginally better, but it
+/// lets two *different* names share one blob, and then `destroy --name` has no
+/// correct move: keeping the blob leaves the name's plaintext readable, and
+/// removing it erases another live name's history. Keying per item means a
+/// blob is never shared across names, so destroy-by-name keeps the same
+/// meaning it had when every row carried its own copy — and no reference
+/// counting is required to get there.
+const HISTORY_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS entries (\
+         sequence INTEGER PRIMARY KEY AUTOINCREMENT,\
+         timestamp_ns INTEGER NOT NULL,\
+         operation TEXT NOT NULL,\
+         previous_hash TEXT NOT NULL,\
+         entry_hash TEXT NOT NULL UNIQUE\
+     ) STRICT;\
+     CREATE TABLE IF NOT EXISTS value_blobs (\
+         item TEXT NOT NULL,\
+         value_sha256 TEXT NOT NULL,\
+         value_blob BLOB NOT NULL,\
+         PRIMARY KEY (item, value_sha256)\
+     ) STRICT;\
+     CREATE TABLE IF NOT EXISTS captured_values (\
+         sequence INTEGER NOT NULL REFERENCES entries(sequence),\
+         item TEXT NOT NULL,\
+         value_sha256 TEXT NOT NULL,\
+         destroyed_by INTEGER REFERENCES entries(sequence),\
+         PRIMARY KEY (sequence, item)\
+     ) STRICT;\
+     CREATE TABLE IF NOT EXISTS head (\
+         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),\
+         sequence INTEGER NOT NULL,\
+         entry_hash TEXT NOT NULL\
+     ) STRICT;";
+
 fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
+}
+
+/// Brings an existing history database up to [`SCHEMA_VERSION`].
+///
+/// The schema above is created with `CREATE TABLE IF NOT EXISTS`, which is
+/// silent about tables that already exist in an older shape — so without this
+/// an upgraded binary would keep writing against a v0 layout and never say so.
+fn migrate_history(conn: &Connection) -> Result<()> {
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|e| operation_error(e.to_string()))?;
+
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    // A v0 database is only distinguishable from a freshly created one by
+    // whether the legacy column is still there: both report user_version 0,
+    // because the tables above were created before this function stamped
+    // anything.
+    if version == 0 && has_legacy_value_blob(conn)? {
+        migrate_v0_to_v1(conn)?;
+    }
+
+    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
+        .map_err(|e| operation_error(e.to_string()))
+}
+
+fn has_legacy_value_blob(conn: &Connection) -> Result<bool> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM pragma_table_info('captured_values')")
+        .map_err(|e| operation_error(e.to_string()))?;
+    let mut rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| operation_error(e.to_string()))?;
+    while let Some(row) = rows.next() {
+        if row.map_err(|e| operation_error(e.to_string()))? == "value_blob" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Lifts per-row plaintext into `value_blobs` and drops the column.
+///
+/// Destroyed rows are deliberately skipped by the `value_blob IS NOT NULL`
+/// filter: their bytes are already gone and must stay gone. They keep their
+/// `value_sha256`, which is what makes a tombstone auditable.
+fn migrate_v0_to_v1(conn: &Connection) -> Result<()> {
+    // SQLite's documented recipe for rebuilding a table: foreign keys off for
+    // the duration, since the rename below would otherwise be seen against a
+    // half-built table. `foreign_keys` is a no-op inside a transaction, so it
+    // has to be set on either side of one.
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")
+        .map_err(|e| operation_error(e.to_string()))?;
+
+    let rebuild = || -> Result<()> {
+        // Real newlines rather than `\` continuations: a continuation also
+        // eats the next line's indentation, which silently welded
+        // `captured_values` onto `WHERE` here and produced a syntax error a
+        // long way from its cause.
+        conn.execute_batch(
+            r#"
+BEGIN IMMEDIATE;
+
+CREATE TABLE IF NOT EXISTS value_blobs (
+    item         TEXT NOT NULL,
+    value_sha256 TEXT NOT NULL,
+    value_blob   BLOB NOT NULL,
+    PRIMARY KEY (item, value_sha256)
+) STRICT;
+
+INSERT OR IGNORE INTO value_blobs (item, value_sha256, value_blob)
+    SELECT item, value_sha256, value_blob FROM captured_values
+    WHERE value_blob IS NOT NULL;
+
+CREATE TABLE captured_values_v1 (
+    sequence     INTEGER NOT NULL REFERENCES entries(sequence),
+    item         TEXT NOT NULL,
+    value_sha256 TEXT NOT NULL,
+    destroyed_by INTEGER REFERENCES entries(sequence),
+    PRIMARY KEY (sequence, item)
+) STRICT;
+
+INSERT INTO captured_values_v1 (sequence, item, value_sha256, destroyed_by)
+    SELECT sequence, item, value_sha256, destroyed_by FROM captured_values;
+
+DROP TABLE captured_values;
+ALTER TABLE captured_values_v1 RENAME TO captured_values;
+
+COMMIT;
+"#,
+        )
+        .map_err(|e| operation_error(format!("history migration failed: {e}")))
+    };
+
+    let mut outcome = rebuild().and_then(|()| {
+        // Verifying inside the migration, not in a test only: a rebuild that
+        // silently dropped a reference would leave the ledger unprovable.
+        let violations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check('captured_values')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| operation_error(e.to_string()))?;
+        if violations > 0 {
+            return Err(operation_error(format!(
+                "history migration left {violations} dangling entry reference(s); \
+                 refusing to continue"
+            )));
+        }
+        Ok(())
+    });
+
+    if outcome.is_err() {
+        // `execute_batch` stops at the first failing statement, so a failure
+        // anywhere after `BEGIN` leaves the transaction open on a connection
+        // this provider is about to hand out.
+        if let Err(rollback) = conn.execute_batch("ROLLBACK;") {
+            outcome = outcome.and(Err(operation_error(format!(
+                "history migration failed and could not be rolled back: {rollback}"
+            ))));
+        }
+    }
+
+    conn.execute_batch("PRAGMA foreign_keys=ON;")
+        .map_err(|e| operation_error(e.to_string()))?;
+
+    outcome
 }
 
 #[derive(Debug)]
@@ -424,7 +578,16 @@ fn compute_entry_hash(previous_hash: &str, entry: &Entry) -> String {
     sha256_hex(format!("{previous_hash}\n{canonical}").as_bytes())
 }
 
-fn capture_history(conn: &Connection, operation: &str) -> Result<()> {
+/// Appends one entry to the history chain, snapshotting every live secret.
+///
+/// Public so callers that hold their own connection to the same database can
+/// advance the chain without restating how it is computed. `destroy` needs
+/// exactly that: tombstones reference the entry that destroyed them, so a name
+/// with no live value left to delete has nothing to point at, and the verb used
+/// to refuse rather than attribute the tombstone to an unrelated entry at the
+/// tip. Reusing this keeps hashing in one place, which was the reason for that
+/// refusal in the first place.
+pub fn capture_history(conn: &Connection, operation: &str) -> Result<()> {
     let mut count: i64 = 0;
     let mut previous_hash = ZERO_HASH.to_string();
 
@@ -497,10 +660,22 @@ fn capture_history(conn: &Connection, operation: &str) -> Result<()> {
     .map_err(|e| operation_error(e.to_string()))?;
 
     for (val, (_, plain)) in entry.values.iter().zip(pairs.iter()) {
+        // `OR IGNORE` is the dedup: the second and later captures of an
+        // unchanged value find the blob already present and store only the
+        // reference below. This is the whole point of the table — history
+        // snapshots every secret on every operation, so without it the
+        // plaintext count grows with entries x secrets.
         conn.execute(
-            "INSERT INTO captured_values (sequence, item, value_blob, value_sha256, destroyed_by) \
-             VALUES (?1, ?2, ?3, ?4, NULL)",
-            params![entry.sequence, val.item, plain.as_bytes(), val.value_sha256,],
+            "INSERT OR IGNORE INTO value_blobs (item, value_sha256, value_blob) \
+             VALUES (?1, ?2, ?3)",
+            params![val.item, val.value_sha256, plain.as_bytes()],
+        )
+        .map_err(|e| operation_error(e.to_string()))?;
+
+        conn.execute(
+            "INSERT INTO captured_values (sequence, item, value_sha256, destroyed_by) \
+             VALUES (?1, ?2, ?3, NULL)",
+            params![entry.sequence, val.item, val.value_sha256],
         )
         .map_err(|e| operation_error(e.to_string()))?;
     }
@@ -792,13 +967,21 @@ mod tests {
 
         // And prove it actually bites, rather than merely being reported on.
         let orphan = conn.execute(
-            "INSERT INTO captured_values (sequence, item, value_blob, value_sha256) \
-             VALUES (99999, 'x', X'00', 'd')",
+            "INSERT INTO captured_values (sequence, item, value_sha256) \
+             VALUES (99999, 'x', 'd')",
             [],
         );
+        // Asserting the *reason*, not just `is_err()`. This insert once named
+        // a `value_blob` column; when that column moved to `value_blobs` the
+        // statement still failed — with "no such column" — and the weaker
+        // assertion kept passing while testing nothing.
+        let error = orphan.expect_err("a captured value referencing no entry must be refused");
         assert!(
-            orphan.is_err(),
-            "a captured value referencing no entry must be refused"
+            matches!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::ConstraintViolation)
+            ),
+            "must be refused by the foreign key, got: {error}"
         );
     }
 
@@ -835,5 +1018,266 @@ mod tests {
             .query_row("SELECT count(*) FROM entries", [], |row| row.get(0))
             .unwrap();
         assert_eq!(entries_after_delete, 2);
+    }
+
+    /// The v0 schema, verbatim, so the migration is exercised against the
+    /// shape that is actually on disk rather than a paraphrase of it.
+    const LEGACY_SCHEMA_V0: &str = "CREATE TABLE entries (\
+             sequence INTEGER PRIMARY KEY AUTOINCREMENT,\
+             timestamp_ns INTEGER NOT NULL,\
+             operation TEXT NOT NULL,\
+             previous_hash TEXT NOT NULL,\
+             entry_hash TEXT NOT NULL UNIQUE\
+         ) STRICT;\
+         CREATE TABLE captured_values (\
+             sequence INTEGER NOT NULL REFERENCES entries(sequence),\
+             item TEXT NOT NULL,\
+             value_blob BLOB,\
+             value_sha256 TEXT NOT NULL,\
+             destroyed_by INTEGER REFERENCES entries(sequence),\
+             PRIMARY KEY (sequence, item),\
+             CHECK ((value_blob IS NULL) = (destroyed_by IS NOT NULL))\
+         ) STRICT;\
+         CREATE TABLE head (\
+             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),\
+             sequence INTEGER NOT NULL,\
+             entry_hash TEXT NOT NULL\
+         ) STRICT;";
+
+    /// Builds a v0 database holding the interesting cases at once: one value
+    /// repeated across snapshots (the dedup win), two *different* names
+    /// sharing one value (the reason blobs are keyed per item), and a
+    /// destroyed row whose bytes are already gone.
+    fn legacy_v0_database(path: &std::path::Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(LEGACY_SCHEMA_V0).unwrap();
+        for seq in 1..=3 {
+            conn.execute(
+                "INSERT INTO entries (sequence, timestamp_ns, operation, previous_hash, entry_hash) \
+                 VALUES (?1, ?2, 'source-set', 'prev', ?3)",
+                params![seq, seq * 1000, format!("hash{seq}")],
+            )
+            .unwrap();
+        }
+
+        let repeated = b"same-every-time";
+        let repeated_digest = sha256_hex(repeated);
+        for seq in 1..=3 {
+            conn.execute(
+                "INSERT INTO captured_values (sequence, item, value_blob, value_sha256, destroyed_by) \
+                 VALUES (?1, 'p/prod/STABLE', ?2, ?3, NULL)",
+                params![seq, repeated, repeated_digest],
+            )
+            .unwrap();
+        }
+
+        // Two names, one value — global content-addressing would collapse
+        // these into a single blob and make destroy-by-name unanswerable.
+        let shared = b"shared-between-two-names";
+        let shared_digest = sha256_hex(shared);
+        for item in ["p/prod/ALPHA", "p/prod/BETA"] {
+            conn.execute(
+                "INSERT INTO captured_values (sequence, item, value_blob, value_sha256, destroyed_by) \
+                 VALUES (1, ?1, ?2, ?3, NULL)",
+                params![item, shared, shared_digest],
+            )
+            .unwrap();
+        }
+
+        // Already destroyed under v0: blob NULL, digest retained.
+        conn.execute(
+            "INSERT INTO captured_values (sequence, item, value_blob, value_sha256, destroyed_by) \
+             VALUES (2, 'p/prod/GONE', NULL, 'deadbeef', 3)",
+            [],
+        )
+        .unwrap();
+
+        conn
+    }
+
+    fn open_migrated(path: &std::path::Path) -> rusqlite::Connection {
+        let provider = SqliteProvider::new(SqliteConfig {
+            path: path.to_path_buf(),
+            history: true,
+        });
+        provider.connection().unwrap()
+    }
+
+    #[test]
+    fn migration_dedups_blobs_without_resurrecting_destroyed_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("secrets.db");
+        drop(legacy_v0_database(&db_path));
+
+        let conn = open_migrated(&db_path);
+
+        // Every row survives — the migration moves bytes, it does not drop
+        // history.
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM captured_values", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 6, "all captured rows must survive the migration");
+
+        // 3 snapshots of one value collapse to 1 blob; the shared value is
+        // stored once per name, not once globally; the destroyed row
+        // contributes nothing.
+        let blobs: i64 = conn
+            .query_row("SELECT count(*) FROM value_blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(blobs, 3, "expected STABLE + ALPHA + BETA, deduped");
+
+        let destroyed_blob: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM value_blobs WHERE item = 'p/prod/GONE'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            destroyed_blob, 0,
+            "destroyed bytes must not come back from the dead"
+        );
+
+        // The tombstone itself is untouched: digest retained, destroyer named.
+        let (digest, destroyed_by): (String, i64) = conn
+            .query_row(
+                "SELECT value_sha256, destroyed_by FROM captured_values WHERE item = 'p/prod/GONE'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(digest, "deadbeef");
+        assert_eq!(destroyed_by, 3);
+
+        // The legacy column is gone and the version is stamped.
+        assert!(!has_legacy_value_blob(&conn).unwrap());
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_keeps_identical_values_separate_per_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("secrets.db");
+        drop(legacy_v0_database(&db_path));
+
+        let conn = open_migrated(&db_path);
+
+        // Same bytes, same digest, two names: two blob rows. Collapsing these
+        // is what would leave `destroy ALPHA` unable to remove ALPHA's
+        // plaintext without also erasing BETA's live history.
+        let shared: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM value_blobs WHERE item IN ('p/prod/ALPHA', 'p/prod/BETA')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(shared, 2, "a blob must never be shared across names");
+
+        let distinct_digests: i64 = conn
+            .query_row(
+                "SELECT count(DISTINCT value_sha256) FROM value_blobs \
+                 WHERE item IN ('p/prod/ALPHA', 'p/prod/BETA')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(distinct_digests, 1, "and they are genuinely the same value");
+    }
+
+    #[test]
+    fn migration_is_idempotent_and_preserves_readability() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("secrets.db");
+        drop(legacy_v0_database(&db_path));
+
+        drop(open_migrated(&db_path));
+        let conn = open_migrated(&db_path);
+
+        let blobs: i64 = conn
+            .query_row("SELECT count(*) FROM value_blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(blobs, 3, "a second open must not re-run the migration");
+
+        // The bytes are still reachable by the join the restore path uses.
+        let value: Vec<u8> = conn
+            .query_row(
+                "SELECT b.value_blob FROM captured_values cv \
+                 JOIN value_blobs b ON b.item = cv.item AND b.value_sha256 = cv.value_sha256 \
+                 WHERE cv.sequence = 1 AND cv.item = 'p/prod/STABLE'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, b"same-every-time");
+    }
+
+    #[test]
+    fn a_fresh_database_is_created_already_at_the_current_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("secrets.db");
+        let provider = SqliteProvider::new(SqliteConfig {
+            path: db_path.clone(),
+            history: true,
+        });
+        provider
+            .set(convention("APP_SECRET"), &SecretString::new("v".into()))
+            .unwrap();
+
+        let conn = provider.connection().unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(!has_legacy_value_blob(&conn).unwrap());
+    }
+
+    #[test]
+    fn repeated_captures_of_one_value_store_its_bytes_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("secrets.db");
+        let provider = SqliteProvider::new(SqliteConfig {
+            path: db_path.clone(),
+            history: true,
+        });
+
+        // Setting a second, unrelated secret re-snapshots the first one, which
+        // is exactly how history grows with entries x secrets.
+        provider
+            .set(convention("APP_SECRET"), &SecretString::new("held".into()))
+            .unwrap();
+        for i in 0..4 {
+            provider
+                .set(
+                    convention(&format!("OTHER_{i}")),
+                    &SecretString::new("x".into()),
+                )
+                .unwrap();
+        }
+
+        let conn = provider.connection().unwrap();
+        let captured: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM captured_values WHERE item = ?1",
+                params!["project/production/APP_SECRET"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let blobs: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM value_blobs WHERE item = ?1",
+                params!["project/production/APP_SECRET"],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(
+            captured > 1,
+            "the value should be captured in several snapshots, got {captured}"
+        );
+        assert_eq!(blobs, 1, "but its bytes should be stored exactly once");
     }
 }
