@@ -356,14 +356,12 @@ impl Mutation {
 
     fn archive(&self) -> Result<(), crate::history::HistoryError> {
         let manifest = std::fs::read(self.rollback_path("toml"))?;
-        let dotenv = std::fs::read(self.rollback_path("env"))?;
         crate::history::capture(
             &self.vault,
             crate::history::CaptureRequest {
                 transaction: self.transaction,
                 operation: self.operation.clone(),
                 manifest,
-                dotenv,
                 expected_uid: Some(self.service_uid),
             },
         )?;
@@ -1323,11 +1321,12 @@ PROD_ONLY = { description = "production-only token", required = true }
         let vault = temp_vault();
         // A dotenv with a comment does not round-trip through the renderer, so
         // `history::capture` refuses it.
-        let (mutation, _) = staged_mutation(
+        let mut mutation = staged_mutation(
             vault.path(),
             b"[project]\nname = \"f\"\n",
-            b"# comment\nA=1\n",
-        );
+            b"A=1\n",
+        ).0;
+        mutation.operation = "invalid_op!".to_string();
 
         mutation.commit();
 
