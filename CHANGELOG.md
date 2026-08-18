@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `undeclare` now takes the same rollback copy of the runtime manifest that
+  every other mutating broker operation takes. It wrote the file directly, so an
+  interrupted or failing write could leave the manifest truncated with no copy
+  to restore it from — the one operation where that loss was unrecoverable.
 - The privileged broker now enables the `sqlite://` provider's history
   retention (`?history=true`). Without it the vault database held no history
   tables at all, so `restore` could never return anything and `destroy` removed
@@ -63,8 +67,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   local SQLite database, behind a new `sqlite` feature (enabled by default).
   Confidentiality comes entirely from filesystem permissions on the database
   file, so identical code serves an ordinary user-owned store and a
-  privilege-boundary vault file with no code difference between them. Plain
-  `get`/`set`/`delete`, no history retention yet.
+  privilege-boundary vault file with no code difference between them. Opt into
+  `?history=true` and every `set` and `delete` is retained in a hash-chained
+  history inside the same database, so a previous value can be recovered later.
+  Each entry binds the *digest* of every value rather than its bytes, which is
+  what lets a value be destroyed outright while the entry still proves what was
+  destroyed and when.
+- The privileged broker keeps an append-only, hash-chained history of the vault
+  manifest (`secretspec.toml`) in `broker-history.sqlite3`, verifiable with
+  `audit-verify`. Every mutating operation already copied the manifest aside
+  before touching it and deleted that copy on success; the copy is now archived
+  instead, so the declarations in force before any past change can be recovered.
+  A failed archive does not fail the operation — the mutation has already
+  committed — it leaves the copy on disk rather than losing it.
 - The `secretspec` crate gains a `codegen-schema` feature, which exposes JSON
   Schema emission from a manifest without enabling the full `cli` feature. It
   exists for the same reason as `manifest-edit`: the privilege boundary needs
