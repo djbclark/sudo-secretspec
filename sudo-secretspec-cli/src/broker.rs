@@ -1295,20 +1295,15 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                     for (n, _) in &items_to_restore {
                         if let Ok(secretspec::NamedResolution::Resolved(secret)) =
                             secrets.resolve_named(n)
+                            && secret.value.is_some()
                         {
-                            if secret.value.is_some() {
-                                eprintln!(
-                                    "broker: {} still holds a value; cannot restore without --force",
-                                    n
-                                );
-                                return (
-                                    1,
-                                    items_to_restore
-                                        .into_iter()
-                                        .map(|(name, _)| name.into())
-                                        .collect(),
-                                );
-                            }
+                            eprintln!(
+                                "broker: {n} still holds a value; cannot restore without --force"
+                            );
+                            return (
+                                1,
+                                items_to_restore.into_iter().map(|(name, _)| name).collect(),
+                            );
                         }
                     }
                 }
@@ -1319,7 +1314,7 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
                         eprintln!("broker: cannot restore {n}: {e}");
                         return (1, restored_names);
                     }
-                    restored_names.push(n.into());
+                    restored_names.push(n);
                 }
 
                 (0, restored_names)
