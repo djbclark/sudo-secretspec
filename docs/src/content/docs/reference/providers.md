@@ -47,6 +47,25 @@ replaces the convention path with a relative path beneath `ROOT`.
 **Security**: No encryption. New files use mode `0600` on Unix; traversal and
 symbolic links inside the configured store are rejected.
 
+## SQLite Provider (0.20+)
+
+:::caution[Version compatibility]
+The `sqlite` provider is added in SecretSpec 0.20.
+:::
+
+**URI**: `sqlite:PATH[?history=true]` - Stores secrets as rows in a local SQLite database
+
+```text
+sqlite:./secrets.db                      # Relative to secretspec.toml
+sqlite:///var/lib/myapp/secrets.db       # Absolute path
+sqlite:~/.local/share/myapp/secrets.db   # Home-relative path
+sqlite:./secrets.db?history=true         # With hash-chained history enabled
+```
+
+**Features**: Read/write/delete, project and profile isolation, optional hash-chained history (`?history=true`), atomic transactions
+**Storage**: Row with primary key `{project}/{profile}/{key}` in the `secrets` table. A `ref.item` selects a custom key.
+**Security**: No encryption. New files and existing databases are restricted to mode `0600` on Unix; parent directories to mode `0700`.
+
 ## Environment Provider
 
 **URI**: `env://` - Read-only access to system environment variables
@@ -684,6 +703,7 @@ $ export SECRETSPEC_PROVIDER="dotenv:///config/.env"
 |----------|------------|------------------|----------------|
 | Dotenv | ❌ Plain text | Local filesystem | ❌ No |
 | File (0.19+) | ❌ Plain text | Local filesystem | ❌ No |
+| SQLite (0.20+) | ❌ Plain text | Local filesystem | ❌ No |
 | Environment | ❌ Plain text | Process memory | ❌ No |
 | Null (0.19+) | N/A — no stored value | None | ❌ No |
 | systemd Credential (0.17+) | Depends on unit source | systemd-managed runtime memory | ❌ No |
