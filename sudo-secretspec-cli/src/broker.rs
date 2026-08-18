@@ -78,6 +78,15 @@ pub(crate) struct Broker {
     /// of `--optional`.
     #[arg(long)]
     pub(crate) required: bool,
+
+    #[arg(long)]
+    pub(crate) to: Option<String>,
+
+    #[arg(long)]
+    pub(crate) force: bool,
+
+    #[arg(long)]
+    pub(crate) all: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -102,9 +111,9 @@ pub fn dispatch(raw: &[OsString]) -> Result<(), i32> {
 // Environment validation
 // ---------------------------------------------------------------------------
 
-fn require_root() -> Result<(), i32> {
-    if unsafe { libc::geteuid() } != 0 {
-        eprintln!("broker: must run as root");
+fn require_service_user(service_uid: u32) -> Result<(), i32> {
+    if unsafe { libc::geteuid() } != service_uid {
+        eprintln!("broker: must run as service user");
         return Err(2);
     }
     Ok(())
@@ -255,7 +264,7 @@ impl Mutation {
     ) -> Result<Self, i32> {
         let vault = cfg.vault.clone();
         let manifest = vault.join("secretspec.toml");
-        let dotenv = vault.join(".env");
+        let dotenv = vault.join("secrets.db");
 
         let m = Self {
             vault,
@@ -267,16 +276,23 @@ impl Mutation {
         };
 
         // Create rollback copies
-        for (src, suffix) in [(&m.manifest, "toml"), (&m.dotenv, "env")] {
+        for (src, suffix) in [(&m.manifest, "toml"), (&m.dotenv, "db")] {
             let dst = m.rollback_path(suffix);
             if dst.exists() {
                 eprintln!("broker: rollback path collision: {}", dst.display());
                 return Err(2);
             }
-            std::fs::copy(src, &dst).map_err(|e| {
-                eprintln!("broker: cannot create rollback copy: {e}");
-                2
-            })?;
+            match std::fs::copy(src, &dst) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // File doesn't exist yet (e.g. first run for secrets.db), nothing to backup
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("broker: cannot create rollback copy: {e}");
+                    return Err(2);
+                }
+            }
             // `fs::copy` carries the mode across but *not* the owner, so a copy
             // made by this root process lands root-owned inside a vault owned by
             // the service user. `drift` checks the vault entry by entry, and a
@@ -308,7 +324,7 @@ impl Mutation {
     /// the state beside them.
     fn restore(&self) -> bool {
         let mut ok = true;
-        for (dest, suffix) in [(&self.manifest, "toml"), (&self.dotenv, "env")] {
+        for (dest, suffix) in [(&self.manifest, "toml"), (&self.dotenv, "db")] {
             let backup = self.rollback_path(suffix);
             if backup.is_file() {
                 if std::fs::copy(&backup, dest).is_err() {
@@ -390,6 +406,9 @@ pub const SOURCE_OPS: &[&str] = &[
     "source-export",
     "source-template-check",
     "source-schema",
+    "source-restore",
+    "source-restore-force",
+    "source-destroy",
 ];
 
 /// Whether an operation writes to the vault, and so needs a rollback copy.
@@ -404,6 +423,7 @@ pub fn mutates_vault(operation: &str) -> bool {
     matches!(
         operation,
         "source-set" | "source-add" | "source-undeclare" | "source-delete"
+            | "source-restore" | "source-restore-force" | "source-destroy"
     )
 }
 
@@ -552,9 +572,9 @@ fn run(broker: &Broker) -> Result<(), i32> {
     match broker.operation.as_str() {
         "audit-verify" => run_audit_verify(broker),
         op if SOURCE_OPS.contains(&op) => {
-            require_root()?;
             let cfg = load_config()?;
             let service_uid = require_boundary(&cfg)?;
+            require_service_user(service_uid)?;
             // The group the vault itself carries, not the one named in the
             // config: `audit::open_connection` already reassigns the ledger to
             // the vault's own gid, and rollback backups must land beside it
@@ -684,8 +704,12 @@ fn run(broker: &Broker) -> Result<(), i32> {
 }
 
 fn run_audit_verify(_broker: &Broker) -> Result<(), i32> {
-    require_root()?;
     let cfg = load_config()?;
+    let expected_uid = uid_for_user(&cfg.service_user).ok_or_else(|| {
+        eprintln!("broker: unknown service user {}", cfg.service_user);
+        2
+    })?;
+    require_service_user(expected_uid)?;
     // Assert who the ledger must belong to, but deliberately *without*
     // `require_boundary`. This is the one command whose job is to prove the
     // ledger is intact, and running the full boundary check first would mean a
@@ -694,10 +718,6 @@ fn run_audit_verify(_broker: &Broker) -> Result<(), i32> {
     // `None` here, though, skipped the owner comparison in both
     // `check_protected_dir` and `check_ledger_metadata`, so "verified" said
     // nothing about ownership at all.
-    let expected_uid = uid_for_user(&cfg.service_user).ok_or_else(|| {
-        eprintln!("broker: unknown service user {}", cfg.service_user);
-        2
-    })?;
     match audit::verify(&cfg.vault, Some(expected_uid)) {
         Ok(result) => {
             println!("audit-verify: {} events, tip {}", result.count, result.hash);
@@ -767,10 +787,8 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
     // The ambient environment was purged in `run` before dispatch; see
     // `purge_ambient_env`.
     let manifest = cfg.vault.join("secretspec.toml");
-    let dotenv = cfg.vault.join(".env");
-    // Pin dotenv provider to the protected vault file — never cwd-relative `.env`.
-    // Absolute paths need the dotenv:/// form.
-    let provider = format!("dotenv://{}", dotenv.display());
+    let db = cfg.vault.join("secrets.db");
+    let provider = format!("sqlite://{}", db.display());
     let secrets = match secretspec::Secrets::load_from(&manifest) {
         Ok(mut s) => {
             s.set_provider(provider);
@@ -979,6 +997,125 @@ fn execute(broker: &Broker, cfg: &Config, reason_hash: &str) -> (u8, Vec<String>
             Err(e) => {
                 eprintln!("broker: {e}");
                 (1, vec![name.into()])
+            }
+        },
+        "source-restore" | "source-restore-force" | "source-destroy" => {
+            let op = broker.operation.as_str();
+            
+            let db_path = cfg.vault.join("secrets.db");
+            let conn = match rusqlite::Connection::open(&db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("broker: cannot open secrets.db: {e}");
+                    return (2, vec![]);
+                }
+            };
+            
+            if op == "source-destroy" {
+                let name = match broker.name.as_deref() {
+                    Some(n) => n,
+                    None => {
+                        eprintln!("broker: --name is required for destroy");
+                        return (2, vec![]);
+                    }
+                };
+                
+                // First delete from active secrets, which will capture a new history entry
+                if let Err(e) = secrets.delete(name) {
+                    eprintln!("broker: {e}");
+                    return (1, vec![name.into()]);
+                }
+                
+                // The new sequence just created by delete
+                let seq: i64 = conn.query_row("SELECT MAX(sequence) FROM entries", [], |row| row.get(0)).unwrap_or(0);
+                
+                if let Err(e) = conn.execute(
+                    "UPDATE captured_values SET value_blob = NULL, destroyed_by = ?1 WHERE item = ?2 AND value_blob IS NOT NULL",
+                    rusqlite::params![seq, name],
+                ) {
+                    eprintln!("broker: cannot update history tombstones: {e}");
+                    return (2, vec![name.into()]);
+                }
+                
+                println!("destroyed {}", name);
+                (0, vec![name.into()])
+            } else {
+                let to_str = match &broker.to {
+                    Some(t) => t,
+                    None => {
+                        eprintln!("broker: --to is required for restore");
+                        return (2, vec![]);
+                    }
+                };
+                let seq: i64 = match to_str.parse() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        eprintln!("broker: --to must be a sequence integer");
+                        return (2, vec![]);
+                    }
+                };
+                
+                let mut items_to_restore = Vec::new();
+                if broker.all {
+                    let mut stmt = match conn.prepare("SELECT item, value_blob FROM captured_values WHERE sequence = ?1 AND value_blob IS NOT NULL") {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("broker: {e}");
+                            return (2, vec![]);
+                        }
+                    };
+                    let rows: Result<Vec<(String, Vec<u8>)>, _> = stmt.query_map(rusqlite::params![seq], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().collect();
+                    for (item, blob) in rows.unwrap_or_default() {
+                        let val_str = String::from_utf8(blob).unwrap_or_default();
+                        items_to_restore.push((item, val_str));
+                    }
+                } else if let Some(n) = broker.name.as_deref() {
+                    let mut stmt = match conn.prepare("SELECT value_blob FROM captured_values WHERE sequence = ?1 AND item = ?2 AND value_blob IS NOT NULL") {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("broker: {e}");
+                            return (2, vec![n.into()]);
+                        }
+                    };
+                    let blob_opt: Option<Vec<u8>> = stmt.query_row(rusqlite::params![seq, n], |row| row.get(0)).ok();
+                    if let Some(blob) = blob_opt {
+                        let val_str = String::from_utf8(blob).unwrap_or_default();
+                        items_to_restore.push((n.to_string(), val_str));
+                    } else {
+                        eprintln!("broker: sequence {} does not contain a value for {}", seq, n);
+                        return (1, vec![n.into()]);
+                    }
+                } else {
+                    eprintln!("broker: restore requires either --name or --all");
+                    return (2, vec![]);
+                }
+                
+                if items_to_restore.is_empty() {
+                    eprintln!("broker: nothing to restore");
+                    return (1, vec![]);
+                }
+                
+                if op == "source-restore" {
+                    for (n, _) in &items_to_restore {
+                        if let Ok(secretspec::NamedResolution::Resolved(secret)) = secrets.resolve_named(n) {
+                            if secret.value.is_some() {
+                                eprintln!("broker: {} still holds a value; cannot restore without --force", n);
+                                return (1, items_to_restore.into_iter().map(|(name, _)| name.into()).collect());
+                            }
+                        }
+                    }
+                }
+                
+                let mut restored_names = Vec::new();
+                for (n, val) in items_to_restore {
+                    if let Err(e) = secrets.set(&n, Some(val)) {
+                        eprintln!("broker: cannot restore {n}: {e}");
+                        return (1, restored_names);
+                    }
+                    restored_names.push(n.into());
+                }
+                
+                (0, restored_names)
             }
         },
         // `no_prompt: true`. With prompting enabled this reports missing

@@ -113,6 +113,22 @@ enum Cmd {
         #[arg(last = true, required = true)]
         command: Vec<OsString>,
     },
+    Restore {
+        name: Option<String>,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        reason: String,
+    },
+    Destroy {
+        name: String,
+        #[arg(long)]
+        reason: String,
+    },
     /// Install or adopt the privileged boundary.
     ///
     /// Typical short form:
@@ -272,6 +288,14 @@ fn main() {
         Cmd::Export { reason } => lifecycle("export", "", &reason),
         Cmd::TemplateCheck { reason } => lifecycle("template-check", "", &reason),
         Cmd::Schema { reason } => lifecycle("schema", "", &reason),
+        Cmd::Restore {
+            name,
+            to,
+            force,
+            all,
+            reason,
+        } => lifecycle_restore(name, &to, force, all, &reason),
+        Cmd::Destroy { name, reason } => lifecycle_destroy(&name, &reason),
         Cmd::Run { reason, command } => run_target(&reason, &command),
         Cmd::Install {
             declarations,
@@ -720,6 +744,17 @@ fn exit_from_broker(code: i32) -> ! {
     std::process::exit(code);
 }
 
+fn get_service_user() -> String {
+    let config_path = std::path::PathBuf::from(CONFIG_PATH);
+    if let Ok(layout) = sudo_secretspec_cli::load_config(&config_path) {
+        layout.service_user
+    } else {
+        // Fallback to the default if config is missing or unparseable.
+        // It shouldn't get here because we only call this when installed.
+        "_sudo_secretspec".to_string()
+    }
+}
+
 /// `add` is `lifecycle` plus the declaration's description.
 ///
 /// Kept separate rather than widening `lifecycle` with an `Option`: `add` is
@@ -731,6 +766,7 @@ fn lifecycle_add(name: &str, description: &str, optional: bool, required: bool, 
         std::process::exit(2);
     }
     let mut command = Command::new(SUDO);
+    command.arg("-u").arg(get_service_user());
     command
         .arg("-n")
         .arg(privileged_broker())
@@ -761,6 +797,8 @@ fn lifecycle_add(name: &str, description: &str, optional: bool, required: bool, 
 
 fn audit_verify() {
     let status = Command::new(SUDO)
+        .arg("-u")
+        .arg(get_service_user())
         .arg("-n")
         .arg(privileged_broker())
         .arg("__broker")
@@ -777,7 +815,9 @@ fn audit_verify() {
 
 fn lifecycle(op: &str, name: &str, reason: &str) {
     let mut cmd = Command::new(SUDO);
-    cmd.arg("-n")
+    cmd.arg("-u")
+        .arg(get_service_user())
+        .arg("-n")
         .arg(privileged_broker())
         .arg("__broker")
         .arg(format!("source-{op}"))
@@ -790,6 +830,73 @@ fn lifecycle(op: &str, name: &str, reason: &str) {
     }
     // `status`, not `output`: `get` streams the secret value straight to the
     // caller's stdout, and capturing it here would put a copy in this process.
+    let status = cmd.status().unwrap_or_else(|e| {
+        eprintln!("cannot invoke broker: {e}");
+        std::process::exit(2);
+    });
+    if !status.success() {
+        exit_from_broker(status.code().unwrap_or(1));
+    }
+}
+
+fn lifecycle_restore(name: Option<String>, to: &str, force: bool, all: bool, reason: &str) {
+    let mut cmd = Command::new(SUDO);
+    cmd.arg("-u").arg(get_service_user());
+    
+    // Non-forced specific restore is allowed for agents, others require operator sudo
+    if !force && !all {
+        cmd.arg("-n");
+    }
+    
+    cmd.arg(privileged_broker())
+        .arg("__broker");
+        
+    if force {
+        cmd.arg("source-restore-force");
+    } else {
+        cmd.arg("source-restore");
+    }
+    
+    cmd.arg("--client")
+        .arg(detect_client())
+        .arg("--reason-sha256")
+        .arg(reason_digest_or_exit(reason))
+        .arg("--to")
+        .arg(to);
+        
+    if let Some(n) = name {
+        cmd.arg("--name").arg(n);
+    }
+    if force {
+        cmd.arg("--force");
+    }
+    if all {
+        cmd.arg("--all");
+    }
+    
+    let status = cmd.status().unwrap_or_else(|e| {
+        eprintln!("cannot invoke broker: {e}");
+        std::process::exit(2);
+    });
+    if !status.success() {
+        exit_from_broker(status.code().unwrap_or(1));
+    }
+}
+
+fn lifecycle_destroy(name: &str, reason: &str) {
+    let mut cmd = Command::new(SUDO);
+    // Destroy is operator-only, don't use -n
+    cmd.arg("-u").arg(get_service_user());
+    cmd.arg(privileged_broker())
+        .arg("__broker")
+        .arg("source-destroy")
+        .arg("--client")
+        .arg(detect_client())
+        .arg("--reason-sha256")
+        .arg(reason_digest_or_exit(reason))
+        .arg("--name")
+        .arg(name);
+        
     let status = cmd.status().unwrap_or_else(|e| {
         eprintln!("cannot invoke broker: {e}");
         std::process::exit(2);
@@ -826,6 +933,8 @@ fn run_target(reason: &str, command: &[OsString]) {
     }
 
     let output = Command::new(SUDO)
+        .arg("-u")
+        .arg(get_service_user())
         .arg("-n")
         .arg(privileged_broker())
         .arg("__broker")
@@ -931,6 +1040,14 @@ fn doctor(
         let broker = privileged_broker();
         let elevated = |with_hints: bool| {
             let mut cmd = Command::new(SUDO);
+            let user = if let Some(cfg_path) = &config {
+                sudo_secretspec_cli::load_config(cfg_path)
+                    .map(|l| l.service_user)
+                    .unwrap_or_else(|_| "_sudo_secretspec".to_string())
+            } else {
+                get_service_user()
+            };
+            cmd.arg("-u").arg(user);
             cmd.arg("-n").arg(&broker).arg("doctor");
             if json {
                 cmd.arg("--json");
