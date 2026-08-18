@@ -453,16 +453,19 @@ fn migrate_v0_to_v1(conn: &Connection) -> Result<()> {
         // eats the next line's indentation, which silently welded
         // `captured_values` onto `WHERE` here and produced a syntax error a
         // long way from its cause.
+        //
+        // No `CREATE TABLE value_blobs` here: `connection()` executes
+        // `HISTORY_SCHEMA` before it calls `migrate_history`, so the table
+        // always exists by now. The `CREATE TABLE IF NOT EXISTS` that used to
+        // sit here was therefore unreachable -- a second copy of the schema
+        // that no test could catch drifting from the real one, which is exactly
+        // how mutation testing found it (mutating its primary key changed
+        // nothing). If a future SCHEMA_VERSION reshapes `value_blobs`, this
+        // ordering needs revisiting: the migration would then be filling a
+        // table `HISTORY_SCHEMA` had already created in the *newer* shape.
         conn.execute_batch(
             r#"
 BEGIN IMMEDIATE;
-
-CREATE TABLE IF NOT EXISTS value_blobs (
-    item         TEXT NOT NULL,
-    value_sha256 TEXT NOT NULL,
-    value_blob   BLOB NOT NULL,
-    PRIMARY KEY (item, value_sha256)
-) STRICT;
 
 INSERT OR IGNORE INTO value_blobs (item, value_sha256, value_blob)
     SELECT item, value_sha256, value_blob FROM captured_values

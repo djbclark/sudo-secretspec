@@ -2407,6 +2407,78 @@ BETA = { description = "second", required = false }
     }
 
     #[test]
+    fn a_destroyed_snapshot_stays_unrestorable_once_the_same_value_is_set_again() {
+        // The one case where "has readable bytes" and "was not destroyed"
+        // disagree. Blobs are keyed `(item, value_sha256)` and shared across an
+        // item's snapshots, so re-setting a destroyed name to the value it used
+        // to hold recreates the very blob `destroy` deleted. A restore that
+        // decided what is recoverable by joining `value_blobs` would then hand
+        // back a tombstoned snapshot -- undestroying it. Only
+        // `destroyed_by IS NULL` keeps the tombstone authoritative.
+        let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_vault, cfg) = execute_fixture();
+        let secrets = fixture_secrets(&cfg);
+
+        secrets.set("ALPHA", Some("recurring".into())).unwrap(); // sequence 1
+
+        let mut destroy = broker_op("source-destroy");
+        destroy.name = Some("ALPHA".into());
+        let (code, _) = execute(&destroy, &cfg, &fixture_reason()); // sequence 2
+        assert_eq!(code, 0, "destroy must succeed");
+
+        // The same value comes back under the same name, so the blob destroy
+        // deleted is written again -- byte-identical, same digest, same item.
+        secrets.set("ALPHA", Some("recurring".into())).unwrap(); // sequence 3
+        secrets.delete("ALPHA").unwrap(); // sequence 4; clears the live value
+
+        let conn = rusqlite::Connection::open(cfg.vault.join("secrets.db")).unwrap();
+
+        // Anti-vacuity: unless the tombstoned row really does resolve to live
+        // bytes right now, this test would pass no matter how restore filters.
+        let joinable: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM captured_values cv \
+                 JOIN value_blobs b \
+                   ON b.item = cv.item AND b.value_sha256 = cv.value_sha256 \
+                 WHERE cv.sequence = 1 AND cv.item LIKE '%/ALPHA'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            joinable, 1,
+            "precondition: the destroyed snapshot must currently join to a \
+             recreated blob, or this test proves nothing"
+        );
+        let destroyed_by: Option<i64> = conn
+            .query_row(
+                "SELECT destroyed_by FROM captured_values \
+                 WHERE sequence = 1 AND item LIKE '%/ALPHA'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            destroyed_by.is_some(),
+            "precondition: sequence 1 must still be tombstoned"
+        );
+
+        let mut restore = broker_op("source-restore");
+        restore.name = Some("ALPHA".into());
+        restore.to = Some("1".into());
+
+        let (code, names) = execute(&restore, &cfg, &fixture_reason());
+
+        assert_eq!(code, 1, "a destroyed snapshot must never restore");
+        assert_eq!(names, vec!["ALPHA".to_string()]);
+        assert_eq!(
+            live_value(&cfg, "ALPHA"),
+            None,
+            "the destroyed value must not be written back"
+        );
+    }
+
+    #[test]
     fn destroy_requires_a_name_and_refuses_one_with_no_history() {
         let _guard = EXECUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (_vault, cfg) = execute_fixture();
