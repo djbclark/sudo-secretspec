@@ -791,24 +791,42 @@ pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
     let mut findings = Vec::new();
 
     // Config file itself.
-    check_protected_file(&layout.config, "root", "wheel", 0o444, &mut findings);
+    check_protected_file(
+        &layout.config,
+        &layout.service_user,
+        &layout.service_group,
+        0o444,
+        &mut findings,
+    );
     check_ancestor_chain(&layout.config, &mut findings);
 
     // Installed binaries / shared assets.
-    let mut artifacts = vec![
+    let root_artifacts = vec![
         (&layout.client, 0o755),
+        (&layout.sudoers, 0o440),
+    ];
+    let mut service_artifacts = vec![
         (&layout.broker, 0o755),
         (&layout.engine, 0o755),
         (&layout.retired, 0o444),
         (&layout.guidance, 0o444),
         (&layout.source_manifest, 0o444),
-        (&layout.sudoers, 0o440),
     ];
     if let Some(decl) = &layout.declarations {
-        artifacts.push((decl, 0o444));
+        service_artifacts.push((decl, 0o444));
     }
-    for (path, mode) in artifacts {
+    for (path, mode) in root_artifacts {
         check_protected_file(path, "root", "wheel", mode, &mut findings);
+        check_ancestor_chain(path, &mut findings);
+    }
+    for (path, mode) in service_artifacts {
+        check_protected_file(
+            path,
+            &layout.service_user,
+            &layout.service_group,
+            mode,
+            &mut findings,
+        );
         check_ancestor_chain(path, &mut findings);
     }
 
@@ -926,6 +944,14 @@ pub fn inspect(layout: &Layout, opts: &InspectOptions) -> Report {
         "broker-audit.sqlite3-wal",
         "broker-audit.sqlite3-shm",
         "broker-audit.sqlite3-journal",
+        "broker-history.sqlite3",
+        "broker-history.sqlite3-wal",
+        "broker-history.sqlite3-shm",
+        "broker-history.sqlite3-journal",
+        "secrets.db",
+        "secrets.db-wal",
+        "secrets.db-shm",
+        "secrets.db-journal",
     ];
     if let Ok(entries) = fs::read_dir(&layout.vault) {
         for entry in entries.flatten() {
