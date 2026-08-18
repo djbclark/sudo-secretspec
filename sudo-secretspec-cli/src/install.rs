@@ -823,6 +823,18 @@ fn version_transition(previous: Option<&str>) -> String {
 /// load-bearing depends on a platform default this project does not own; the
 /// broker also pins `HOME` in-process (`broker::purge_ambient_env`), so the
 /// guarantee does not rest on the policy alone.
+///
+/// `source-restore --*` is deliberately narrower than the wildcard reads: it
+/// grants NOPASSWD only for the plain `source-restore` verb, never for
+/// `source-restore-force`. That second verb has no line here at all, so it
+/// falls through to the operator's ordinary interactive sudo (Touch ID),
+/// exactly like `install`/`uninstall` do. The client sends `--all` restores
+/// through `source-restore-force` for the same reason it sends `--force`
+/// ones there: sudoers argument matching is a glob, so a NOPASSWD grant on
+/// `source-restore --*` would also match `source-restore --all`, making a
+/// mass, unattended restore of the whole vault indistinguishable — to
+/// sudoers — from the single-name, forward-safe restore the NOPASSWD grant
+/// exists for. See `main.rs`'s `lifecycle_restore`.
 pub fn sudoers_text(operator: &str, service_user: &str) -> String {
     format!(
         "Defaults!{prefix}/libexec/sudo-secretspec env_reset,env_keep-=\"HOME\",secure_path=/usr/bin:/bin:/usr/sbin:/sbin,umask=0077,always_set_home\n\
@@ -1427,6 +1439,29 @@ mod tests {
             create_fresh_runtime_files(&vault, &declarations).expect("fresh install must succeed");
         assert_eq!(fs::read(&manifest_rt).unwrap(), body);
         assert_eq!(fs::read(&env_rt).unwrap(), b"", ".env starts empty");
+    }
+
+    #[test]
+    fn source_restore_force_has_no_nopasswd_grant() {
+        // Finding 1 of the ultra review: sudoers argument matching is a glob,
+        // so a NOPASSWD grant on `source-restore --*` also matches
+        // `source-restore --all` -- an unattended, whole-vault restore, not
+        // the single-name forward-safe one the grant exists for. The client
+        // (`main.rs::lifecycle_restore`) now routes both `--force` and
+        // `--all` through `source-restore-force`, so pin both halves here:
+        // the plain verb keeps its NOPASSWD grant for agents, and the force
+        // verb has no grant at all, falling through to interactive sudo.
+        let text = sudoers_text("alice", "_svc");
+        assert!(
+            text.contains(&format!(
+                "NOPASSWD: {PREFIX}/libexec/sudo-secretspec __broker source-restore --*\n"
+            )),
+            "plain source-restore must keep its NOPASSWD grant for agents:\n{text}"
+        );
+        assert!(
+            !text.contains("source-restore-force"),
+            "source-restore-force must have no sudoers grant at all, NOPASSWD or otherwise:\n{text}"
+        );
     }
 
     #[test]

@@ -839,6 +839,24 @@ fn lifecycle(op: &str, name: &str, reason: &str) {
     }
 }
 
+/// Which broker verb a restore request must use.
+///
+/// `source-restore-force` is also the auth-gated verb for `--all`, not just
+/// `--force`: the sudoers grant for plain `source-restore` (in
+/// `install::sudoers_text`) is a `--*` wildcard, which matches a `--all`
+/// invocation just as well as a named one. Routing `--all` through the plain
+/// verb would make that NOPASSWD grant, not the `-n`/interactive split below,
+/// the real authorization gate -- silently permitting an unattended
+/// whole-vault restore. Named and tested on its own rather than inlined,
+/// since this exact confusion is what finding 1 of the 2026-08-18 review was.
+fn restore_verb(force: bool, all: bool) -> &'static str {
+    if force || all {
+        "source-restore-force"
+    } else {
+        "source-restore"
+    }
+}
+
 fn lifecycle_restore(name: Option<String>, to: &str, force: bool, all: bool, reason: &str) {
     let mut cmd = Command::new(SUDO);
     cmd.arg("-u").arg(get_service_user());
@@ -848,13 +866,9 @@ fn lifecycle_restore(name: Option<String>, to: &str, force: bool, all: bool, rea
         cmd.arg("-n");
     }
 
-    cmd.arg(privileged_broker()).arg("__broker");
-
-    if force {
-        cmd.arg("source-restore-force");
-    } else {
-        cmd.arg("source-restore");
-    }
+    cmd.arg(privileged_broker())
+        .arg("__broker")
+        .arg(restore_verb(force, all));
 
     cmd.arg("--client")
         .arg(detect_client())
@@ -1159,5 +1173,35 @@ fn print_finding(label: &str, finding: &sudo_secretspec_cli::Finding) {
             finding.code, path, finding.detail
         ),
         None => eprintln!("- [{label}] {}: {}", finding.code, finding.detail),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_without_force_still_uses_the_auth_gated_verb() {
+        // The defect: only `force` selected `source-restore-force`, so a bare
+        // `--all` restore went out over `source-restore`, which sudoers grants
+        // NOPASSWD via a `--*` wildcard that also matches `--all`.
+        assert_eq!(restore_verb(false, true), "source-restore-force");
+    }
+
+    #[test]
+    fn force_alone_still_uses_the_auth_gated_verb() {
+        assert_eq!(restore_verb(true, false), "source-restore-force");
+    }
+
+    #[test]
+    fn force_and_all_together_still_use_the_auth_gated_verb() {
+        assert_eq!(restore_verb(true, true), "source-restore-force");
+    }
+
+    #[test]
+    fn a_plain_named_restore_uses_the_nopasswd_verb() {
+        // This is the one case agents may run unattended: a single named,
+        // non-forced restore that refuses rather than overwrites a live value.
+        assert_eq!(restore_verb(false, false), "source-restore");
     }
 }
