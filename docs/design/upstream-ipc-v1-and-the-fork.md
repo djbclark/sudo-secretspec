@@ -50,8 +50,62 @@ secretspec speaks JSON-RPC to a process that can. No upstream patching, and no
 privilege code upstream. Upstream also ships conformance cases to test against:
 `conformance/ipc/cases/provider-{lifecycle,operations,errors,reconnect,session-isolation}.json`.
 
-**Prototype in progress:** worktree `/Users/djbclark/src/ss-ipc-proto`, branch
-`proto/privileged-endpoint`, from `upstream/feat/ipc-v1`. Tracking issue:
+**4. The prototype exists and passes. The claim is no longer an assertion.**
+Worktree `/Users/djbclark/src/ss-ipc-proto`, branch `proto/privileged-endpoint`,
+commit `a204898`, crate `privileged-endpoint-proto/` (its own README carries the
+detail). Built 2026-08-18 against `a393a27`.
+
+- **No upstream patching, demonstrated mechanically.** The crate declares its
+  own `[workspace]` table, so it is not a member of the upstream workspace and
+  depends on `secretspec-ipc` by path through public API only. After a full
+  build, test, and conformance run, `git diff` in the checkout is **empty** and
+  `git status` shows exactly one untracked directory.
+- **`provider.lifecycle` passes**, driven by upstream's own checked-in
+  `conformance/ipc/cases/provider-lifecycle.json` through
+  `ipc-provider-conformance-driver`. Transcript: `initialized`, `cancelled`,
+  `deadline_exceeded`, `terminal`, `closed`.
+- **Verified by mutation, not by a green result.** Replacing the `__BLOCK__`
+  branch in `get` with `if false` fails the case with *"provider cancellation
+  did not produce one cancelled terminal"*, so the pass depends on the behavior
+  it claims to test.
+- **"A first endpoint is three methods" holds.** `capabilities`, `initialize`,
+  `resolve_address`, plus `get`. Framing, version negotiation, capability
+  gating, per-request deadlines, cancellation, and shutdown are all
+  `serve_provider`'s.
+
+Four findings came out of it, recorded in full in the crate's README:
+
+1. **Upstream's conformance suite cannot be built on macOS at all.**
+   `libsecretspec-ipc/src/process_posix.c:237` calls `sigtimedwait` under a
+   plain `#ifndef _WIN32`. That function is absent from every Darwin SDK header
+   *and* from `libSystem` — a link failure as well as a compile error, not a
+   strict-mode warning. A portable `sigpending` + `sigwait` fix is kept as
+   `upstream-macos-sigtimedwait.patch` rather than applied, so the no-patching
+   claim stays literally true. **Worth offering on #362** — same lane as #377.
+2. **The client→broker text channel cannot distinguish "missing" from
+   "denied".** The broker exits 1 for *has no value*, *is not resolved*, and a
+   resolve error alike (`broker.rs:960-978`), and a `sudo -n` denial also
+   surfaces as 1. The endpoint therefore collapses every non-zero exit to one
+   opaque `OperationFailed`: mapping 1 to `Missing` would tell a caller a
+   secret does not exist when it was actually denied. Consequence, accepted
+   deliberately: the endpoint currently can never report a genuinely absent
+   secret.
+3. **The same channel loses a trailing newline** — the broker prints with
+   `println!` (`broker.rs:962`), so exactly one `\n` is framing.
+4. **Upstream bounds an address key at 4096 bytes and nothing else**
+   (`Address::validate`, `protocol.rs:737`), so a caller may send `--help` or
+   `-n` as a key. Nothing reaches a shell, but the fork's own `clap` would
+   parse it. An endpoint author bridging to a CLI needs their own name guard.
+
+Findings 2 and 3 are the sharpest argument yet for next action 3 below: on
+`secretspec.provider/1` the failure is a structured `ErrorKind` and the value is
+a byte-exact JSON string, so both defects *disappear* rather than being decoded.
+
+Not yet done: wiring `--client` to the live vault end to end. It is implemented,
+including killing the privileged child when a request is cancelled, but it has
+not been run against the live boundary.
+
+Tracking issue:
 [frdminc/sudo-secretspec#2](https://github.com/frdminc/sudo-secretspec/issues/2).
 Companion (upstreaming the sqlite provider):
 [djbclark/secretspec-sqlite#1](https://github.com/djbclark/secretspec-sqlite/issues/1).
@@ -185,9 +239,11 @@ Two risks worth naming rather than dismissing:
    **POSTED 2026-08-17**: https://github.com/cachix/secretspec/pull/362#issuecomment-5316998149
    (text preserved at `docs/design/pr362-comment.md`). Watch for a maintainer
    reply.
-2. Prototype the provider endpoint against `feat/ipc-v1` in a scratch worktree.
-   It is a small shim, and it proves the "no upstream patching" claim rather
-   than asserting it.
+2. ~~Prototype the provider endpoint against `feat/ipc-v1` in a scratch
+   worktree.~~ **DONE 2026-08-18** — see STATUS item 4 above. It is a small
+   shim, and it now proves the "no upstream patching" claim rather than
+   asserting it. Remaining: wire `--client` to the live vault end to end, and
+   offer the macOS `sigtimedwait` fix upstream on #362.
 3. Plan the 0.20 rebase: adopt `secretspec-ipc` types for the fork's own
    client↔broker hop over time, keeping `sudo` as the authority mechanism.
 4. Leave #370/#371 as filed; offer the PRs once #362 settles.
