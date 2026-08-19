@@ -9,6 +9,55 @@ untracked for a full session: it was visible only as a one-line pointer in a
 comment on #64. Recorded here so a future session does not have to rediscover
 the analysis, and so the ledger entry has something to point at.
 
+---
+
+## STATUS 2026-08-18 — READ THIS FIRST
+
+Verified against `upstream/feat/ipc-v1` at **`a393a27`** (the branch has moved
+since this doc was written). Three things a future session needs before
+anything else here:
+
+**1. One protocol was renamed. The gate was not.**
+The northbound protocol is now **`secretspec.resolver/1`**, not
+`secretspec.client/1` — that rename *is* the branch tip commit `a393a27`
+("name the northbound protocol after the resolver, add a blocking client").
+Evidence: `secretspec-ipc/src/blocking.rs:1`, `lifecycle.rs:249`.
+**`secretspec.provider/1` is unchanged** (`lifecycle.rs:95`), so the gate this
+fork depends on is intact. The table below has been corrected.
+
+**2. The "small shim" claim is now verified, not asserted.**
+The endpoint-author API is two items in `secretspec-ipc/src/provider.rs`:
+`pub trait ProviderHandler` (line 43) and `pub async fn serve_provider` (line
+357). **Only `resolve_address` is mandatory**, plus `capabilities` and
+`initialize`. Every other method — `get`, `set`, `delete`, `exists`,
+`get_many`, `set_expiring`, `clear`, `check_writable`, `check_deletable`,
+`describe_write_target` — defaults to
+`RpcError::new(ErrorKind::CapabilityRequired)`. A first endpoint is three
+methods. `SecretValue` already wraps `Zeroizing<String>` (`provider.rs:20-27`).
+
+**3. The endpoint shape is exactly what privilege separation needs.**
+Upstream's reference endpoint
+(`conformance/ipc/runner/src/bin/ipc-provider-endpoint-rust.rs`, 494 lines)
+serves over **stdio**:
+
+```rust
+serve_provider(tokio::io::stdin(), tokio::io::stdout(), handler, config)
+```
+
+A stdio child process means **`sudo` launching that process as the service user
+*is* the privilege mechanism**. The calling user never opens the vault files;
+secretspec speaks JSON-RPC to a process that can. No upstream patching, and no
+privilege code upstream. Upstream also ships conformance cases to test against:
+`conformance/ipc/cases/provider-{lifecycle,operations,errors,reconnect,session-isolation}.json`.
+
+**Prototype in progress:** worktree `/Users/djbclark/src/ss-ipc-proto`, branch
+`proto/privileged-endpoint`, from `upstream/feat/ipc-v1`. Tracking issue:
+[frdminc/sudo-secretspec#2](https://github.com/frdminc/sudo-secretspec/issues/2).
+Companion (upstreaming the sqlite provider):
+[djbclark/secretspec-sqlite#1](https://github.com/djbclark/secretspec-sqlite/issues/1).
+
+---
+
 ## What #362 actually is
 
 "SecretSpec IPC v1 for 0.20+": two application protocols over one framed
@@ -16,7 +65,7 @@ JSON-RPC wire/session layer.
 
 | Boundary | Protocol | Purpose |
 |---|---|---|
-| Application / SDK → SecretSpec broker | `secretspec.client/1` | Resolve one exact declared name as a value or leased file |
+| Application / SDK → SecretSpec broker | `secretspec.resolver/1` (renamed from `secretspec.client/1` in `a393a27`) | Resolve one exact declared name as a value or leased file |
 | SecretSpec → external provider endpoint | `secretspec.provider/1` | Naming, reads, presence, writes, expiry, deletion, preflight, reflection |
 
 Plus `secretspec broker --stdio`, broker-owned file leases, trusted
